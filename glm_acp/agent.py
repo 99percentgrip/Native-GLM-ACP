@@ -19,6 +19,7 @@ from acp.interfaces import Client
 from acp.schema import (
     AgentCapabilities,
     CloseSessionResponse,
+    ForkSessionResponse,
     Implementation,
     InitializeResponse,
     ListSessionsResponse,
@@ -32,6 +33,7 @@ from acp.schema import (
     SessionCloseCapabilities,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
+    SessionForkCapabilities,
     SessionInfo,
     SessionInfoUpdate,
     SessionListCapabilities,
@@ -64,7 +66,7 @@ from .tools import TOOL_DEFINITIONS, TOOL_KINDS, Sandbox, ToolError, execute_too
 
 logger = logging.getLogger("glm_acp")
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT_TEMPLATE = """\
 You are an expert software engineer working inside the user's editor via ACP.
 You have tools to read, write, and edit files, search code, and run commands.
 
@@ -82,7 +84,57 @@ Planning:
 finished ones 'completed'.
 - The plan helps the user track your progress — keep it accurate.
 - For simple questions or single-step tasks, skip the plan.
+
+Project context:
+{project_context}
 """
+
+def build_system_prompt(cwd: str) -> str:
+    """Build the system prompt with auto-detected project context."""
+    context_parts: list[str] = []
+
+    # Detect language / framework
+    cwd_path = Path(cwd)
+    files = {f.name for f in cwd_path.iterdir() if f.is_file()} if cwd_path.exists() else set()
+
+    if "pyproject.toml" in files:
+        context_parts.append("- Python project (pyproject.toml detected)")
+    elif "setup.py" in files or "setup.cfg" in files:
+        context_parts.append("- Python project (setup.py detected)")
+    elif "package.json" in files:
+        try:
+            pkg = json.loads((cwd_path / "package.json").read_text())
+            lang = "TypeScript" if "typescript" in json.dumps(pkg.get("devDependencies", {})) else "JavaScript"
+            framework = pkg.get("dependencies", {})
+            if "next" in framework: context_parts.append(f"- {lang} project (Next.js)")
+            elif "react" in framework: context_parts.append(f"- {lang} project (React)")
+            elif "vue" in framework: context_parts.append(f"- {lang} project (Vue)")
+            else: context_parts.append(f"- {lang} project (Node.js)")
+        except (json.JSONDecodeError, OSError):
+            context_parts.append("- Node.js project (package.json)")
+    elif "Cargo.toml" in files:
+        context_parts.append("- Rust project (Cargo.toml)")
+    elif "go.mod" in files:
+        context_parts.append("- Go project (go.mod)")
+    elif "Gemfile" in files:
+        context_parts.append("- Ruby project (Gemfile)")
+    elif "pom.xml" in files or "build.gradle" in files:
+        context_parts.append("- Java project (Maven/Gradle)")
+
+    # Detect package manager
+    if "uv.lock" in files: context_parts.append("- Package manager: uv")
+    elif "poetry.lock" in files: context_parts.append("- Package manager: Poetry")
+    elif "yarn.lock" in files: context_parts.append("- Package manager: Yarn")
+    elif "pnpm-lock.yaml" in files: context_parts.append("- Package manager: pnpm")
+    elif "package-lock.json" in files: context_parts.append("- Package manager: npm")
+
+    # Detect git
+    git_dir = cwd_path / ".git"
+    if git_dir.exists():
+        context_parts.append("- Version control: git")
+
+    project_context = "\n".join(context_parts) if context_parts else "(no project files detected)"
+    return SYSTEM_PROMPT_TEMPLATE.format(project_context=project_context)
 
 MODE_LIST = [
     SessionMode(id="ask", name="Ask", description="Answer questions and read files without making changes"),
@@ -117,12 +169,15 @@ class Session:
         # Current task plan — list of PlanEntry-like dicts
         self.plan: list[dict[str, str]] = []
         self.messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt(cwd)},
         ]
         # Token tracking — updated after each API call
         self.context_size: int = CONTEXT_WINDOW_TOKENS.get(self.model, 1_000_000)
         self.estimated_tokens: int = 0
         self.last_reported_tokens: int = -1
+        # Cumulative cost tracking per session
+        self.total_input_tokens: int = 0
+        self.total_output_tokens: int = 0
 
     # ------------------------------------------------------------------
     # Serialization for persistence across process restarts
@@ -198,6 +253,7 @@ class GlmAcpAgent(acp.Agent):
                     list=SessionListCapabilities(),
                     resume=SessionResumeCapabilities(),
                     close=SessionCloseCapabilities(),
+                    fork=SessionForkCapabilities(),
                     additional_directories=SessionAdditionalDirectoriesCapabilities(),
                 ),
             ),
@@ -382,6 +438,56 @@ class GlmAcpAgent(acp.Agent):
         self._store.delete(session_id)
         return CloseSessionResponse()
 
+    async def fork_session(
+        self,
+        cwd: str,
+        session_id: str,
+        additional_directories: list[str] | None = None,
+        mcp_servers: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Fork a session — copy all state to a new session ID.
+
+        The new session gets a copy of the conversation history, plan,
+        and config so the user can experiment with a different approach.
+        """
+        from acp.schema import ForkSessionResponse
+        parent = self._sessions.get(session_id)
+        if not parent:
+            raise RuntimeError(f"Cannot fork: session {session_id} not found")
+
+        new_session = Session(str(uuid4()), cwd, additional_directories)
+        # Copy all state from parent
+        new_session.model = parent.model
+        new_session.thought_level = parent.thought_level
+        new_session.mode = parent.mode
+        new_session.api_endpoint = parent.api_endpoint
+        new_session.permission_mode = parent.permission_mode
+        new_session.plan = [dict(e) for e in parent.plan]  # deep copy plan entries
+        new_session.messages = [dict(m) for m in parent.messages]  # shallow copy messages
+        new_session.context_size = parent.context_size
+        new_session.total_input_tokens = parent.total_input_tokens
+        new_session.total_output_tokens = parent.total_output_tokens
+
+        self._sessions[new_session.id] = new_session
+        self._store.save(new_session.id, new_session.to_dict())
+
+        config_options = [
+            self._build_model_option(new_session),
+            self._build_thought_option(new_session),
+            self._build_api_endpoint_option(new_session),
+            self._build_permission_option(new_session),
+        ]
+
+        return ForkSessionResponse(
+            session_id=new_session.id,
+            modes=SessionModeState(
+                current_mode_id=new_session.mode,
+                available_modes=MODE_LIST,
+            ),
+            config_options=config_options,
+        )
+
     async def set_config_option(
         self,
         config_id: str,
@@ -464,8 +570,21 @@ class GlmAcpAgent(acp.Agent):
         if images:
             saved_paths = await self._save_images(session, images)
             if is_vision_model:
-                # Vision model: pass image data inline so the model can see it
-                content = (content or "") + self._format_image_prompt(images, saved_paths)
+                # Vision model: store image data inline in the message as
+                # multipart content blocks so the API can process them.
+                content_blocks: list[dict[str, Any]] = []
+                if content:
+                    content_blocks.append({"type": "text", "text": content})
+                for img in images:
+                    mime = img.get("mime_type", "image/png")
+                    content_blocks.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{img['data']}"},
+                    })
+                session.messages.append({
+                    "role": "user",
+                    "content": content_blocks,
+                })
             else:
                 # Text-only model: save to disk, tell the user
                 file_note = (
@@ -483,8 +602,9 @@ class GlmAcpAgent(acp.Agent):
                     f"_{session.model} is text-only — switch to a Vision model "
                     f"or use the Vision MCP Server to analyze images._\n",
                 )
-
-        session.messages.append({"role": "user", "content": content})
+                session.messages.append({"role": "user", "content": content})
+        else:
+            session.messages.append({"role": "user", "content": content})
 
         # Derive a title from any text in the prompt.
         text_only = self._extract_text(prompt)
@@ -506,7 +626,11 @@ class GlmAcpAgent(acp.Agent):
             self._store.save(session.id, session.to_dict())
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
-        pass
+        """Cancel the currently running turn for this session."""
+        session = self._sessions.get(session_id)
+        if session and hasattr(session, "_active_client"):
+            session._active_client.cancel()
+            logger.info("Cancellation requested for session %s", session_id)
 
     async def _run_turn(self, session: Session) -> str:
         """Execute the full model-turn loop: stream → tool calls → repeat."""
@@ -520,13 +644,22 @@ class GlmAcpAgent(acp.Agent):
             reasoning_effort=thought_config.get("reasoning_effort"),
             base_url=base_url,
         )
+        session._active_client = client  # for cancel support
         tools = TOOL_DEFINITIONS if session.mode == "code" else [
             t for t in TOOL_DEFINITIONS
             if t["function"]["name"] in ("read_file", "list_directory", "search_files", "grep", "update_plan")
         ]
 
         try:
-            for _ in range(50):
+            for turn_iter in range(50):
+                # --- Check for cancellation ---
+                if client.cancelled:
+                    await self._send_message(
+                        session.id,
+                        "\n\n_⏹ Generation cancelled by user._\n",
+                    )
+                    return "end_turn"
+
                 # --- Compaction check before each API call ---
                 await self._maybe_compact(session, client)
 
@@ -603,6 +736,15 @@ class GlmAcpAgent(acp.Agent):
                         "tool_call_id": tc_id,
                         "content": output,
                     })
+            else:
+                # Loop exhausted without break — hit the 50-iteration cap
+                await self._send_message(
+                    session.id,
+                    "\n\n⚠️ **Reached the maximum number of tool-call iterations (50).** "
+                    "The conversation will continue, but the current task may be incomplete. "
+                    "Ask me to continue if needed.\n",
+                )
+                logger.warning("Turn ended: 50-iteration limit reached")
         finally:
             await client.aclose()
 
@@ -618,25 +760,33 @@ class GlmAcpAgent(acp.Agent):
 
         Accounts for message content, tool call arguments, tool result
         content, and per-message structural overhead (role tags, etc.).
+        Uses a conservative 3.5 chars/token ratio (code is denser than
+        natural language, which averages ~4 chars/token).
         """
+        chars_per_token = 3.5
         total_chars = 0
         for msg in messages:
-            content = msg.get("content", "") or ""
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Vision content blocks — estimate by serialized size
+                content = json.dumps(content)
+            else:
+                content = content or ""
             total_chars += len(content)
-            # Tool call arguments + names
             for tc in msg.get("tool_calls", []):
                 fn = tc.get("function", {})
                 total_chars += len(fn.get("name", ""))
                 total_chars += len(fn.get("arguments", ""))
-            # Per-message overhead (role, delimiters, etc.) ~ 4 tokens
-            total_chars += CHARS_PER_TOKEN * 4
-        return total_chars // CHARS_PER_TOKEN
+            total_chars += int(chars_per_token * 4)  # per-message overhead
+        return int(total_chars // chars_per_token)
 
     @staticmethod
     def _update_usage(session: Session, usage: dict[str, int] | None) -> None:
         """Update estimated token count. Prefer API-reported values."""
         if usage and usage.get("input_tokens"):
             session.estimated_tokens = usage["input_tokens"]
+            session.total_input_tokens += usage.get("input_tokens", 0)
+            session.total_output_tokens += usage.get("output_tokens", 0)
         else:
             session.estimated_tokens = GlmAcpAgent._estimate_tokens(session.messages)
 
@@ -794,6 +944,10 @@ class GlmAcpAgent(acp.Agent):
                 description="Clear all conversation history and start fresh (keeps current model/plan settings)",
             ),
             AvailableCommand(
+                name="diff",
+                description="Show a git diff of all changes made during this session",
+            ),
+            AvailableCommand(
                 name="status",
                 description="Show current model, plan, API endpoint, permission mode, and context usage",
             ),
@@ -840,11 +994,37 @@ class GlmAcpAgent(acp.Agent):
             session.messages = [system_msg] if system_msg else []
             session.plan = []
             session.estimated_tokens = 0
+            session.total_input_tokens = 0
+            session.total_output_tokens = 0
             session.last_reported_tokens = -1
             await self._send_plan(session)
             await self._report_usage(session)
             self._store.save(session.id, session.to_dict())
             return "🧹 Conversation history cleared."
+
+        elif command == "/diff":
+            import subprocess
+            try:
+                result = subprocess.run(
+                    ["git", "diff", "--stat"],
+                    capture_output=True, text=True, timeout=10,
+                    cwd=session.cwd,
+                )
+                if result.returncode != 0:
+                    return "❌ Not a git repository or git error."
+                output = result.stdout.strip()
+                if not output:
+                    return "✅ No uncommitted changes in the working tree."
+                # Get full diff too
+                result_full = subprocess.run(
+                    ["git", "diff"],
+                    capture_output=True, text=True, timeout=10,
+                    cwd=session.cwd,
+                )
+                summary = result_full.stdout.strip()[:4000]
+                return f"\n📝 **Git diff**\n\n```\n{output}\n```\n\n<details><summary>Full diff</summary>\n\n```diff\n{summary}\n```\n\n</details>"
+            except Exception as e:
+                return f"❌ Error running git diff: {e}"
 
         elif command == "/status":
             n_msgs = len(session.messages)
@@ -858,10 +1038,12 @@ class GlmAcpAgent(acp.Agent):
                 f"({session.estimated_tokens * 100 // max(session.context_size, 1)}%)\n"
                 f"- **Messages:** {n_msgs}\n"
                 f"- **Plan tasks:** {len(session.plan)}\n"
+                f"- **Total usage:** {session.total_input_tokens:,} input + "
+                f"{session.total_output_tokens:,} output tokens\n"
             )
 
         else:
-            return f"Unknown command: {command}\nAvailable commands: /compact, /clear-plan, /clear-history, /status"
+            return f"Unknown command: {command}\nAvailable commands: /compact, /clear-plan, /clear-history, /diff, /status"
 
     # ------------------------------------------------------------------
     # Context compaction
@@ -1066,10 +1248,11 @@ class GlmAcpAgent(acp.Agent):
     def _format_image_prompt(
         images: list[dict[str, str]], saved_paths: list[str]
     ) -> str:
-        """Build a content string for vision models that includes image URLs.
+        """Build a content string for vision models referencing saved images.
 
-        Vision models accept image_url content blocks in the messages API.
-        We reference the saved file paths so the model can access them.
+        The actual image data is sent via a special message format in the
+        API call (see _build_vision_messages).  This text is just a
+        human-readable annotation for the model.
         """
         parts = ["\n\n[The user shared the following images:]"]
         for path in saved_paths:

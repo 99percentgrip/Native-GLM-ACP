@@ -14,6 +14,52 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+
+def _load_gitignore_patterns(root: Path) -> list[str]:
+    """Load .gitignore patterns from the workspace root.
+
+    Returns a list of glob patterns.  Simple implementation — handles
+    directory names, file globs, and wildcards.
+    """
+    patterns: list[str] = []
+    gitignore = root / ".gitignore"
+    if not gitignore.exists():
+        return patterns
+    try:
+        for line in gitignore.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            patterns.append(line)
+    except OSError:
+        pass
+    return patterns
+
+
+def _is_ignored(rel_path: str, patterns: list[str]) -> bool:
+    """Check if a relative path matches any gitignore pattern."""
+    for pattern in patterns:
+        # Normalize: remove leading /
+        pat = pattern.lstrip("/")
+        # If pattern ends with /, it matches directories and everything inside
+        if pat.endswith("/"):
+            pat = pat[:-1]
+        # Direct exact match
+        if rel_path == pat:
+            return True
+        # Match as a parent directory: pat is a prefix of rel_path
+        if rel_path.startswith(pat + "/"):
+            return True
+        # Wildcard glob match on the full relative path
+        if fnmatch.fnmatch(rel_path, pat):
+            return True
+        # Match any path component (e.g. */pat or pat/*)
+        if fnmatch.fnmatch(rel_path, f"*/{pat}") or fnmatch.fnmatch(rel_path, f"{pat}/*"):
+            return True
+        if fnmatch.fnmatch(rel_path, f"*/{pat}/*"):
+            return True
+    return False
+
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -288,11 +334,17 @@ async def _list_directory(args: dict[str, Any], sandbox: Sandbox) -> str:
 async def _search_files(args: dict[str, Any], sandbox: Sandbox) -> str:
     pattern = args["pattern"]
     root = sandbox.resolve(args.get("path", "."))
+    gitignore_patterns = _load_gitignore_patterns(root)
+    # Always ignore common non-project directories
+    always_ignore = [".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".eggs"]
     matches = []
     for p in root.rglob("*"):
         rel = p.relative_to(root)
-        if fnmatch.fnmatch(str(rel), pattern) and p.is_file():
-            matches.append(str(rel))
+        rel_str = str(rel)
+        if p.is_file() and fnmatch.fnmatch(rel_str, pattern):
+            if _is_ignored(rel_str, gitignore_patterns) or _is_ignored(rel_str, always_ignore):
+                continue
+            matches.append(rel_str)
     matches.sort()
     return "\n".join(matches[:200]) if matches else "No files found"
 
@@ -302,11 +354,16 @@ async def _grep(args: dict[str, Any], sandbox: Sandbox) -> str:
     root = sandbox.resolve(args.get("path", "."))
     include = args.get("include")
     regex = re.compile(pattern)
+    gitignore_patterns = _load_gitignore_patterns(root)
+    always_ignore = [".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".eggs"]
     results = []
     for p in root.rglob("*"):
         if not p.is_file():
             continue
         rel = p.relative_to(root)
+        rel_str = str(rel)
+        if _is_ignored(rel_str, gitignore_patterns) or _is_ignored(rel_str, always_ignore):
+            continue
         if include and not fnmatch.fnmatch(p.name, include):
             continue
         try:

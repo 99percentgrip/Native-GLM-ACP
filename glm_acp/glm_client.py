@@ -21,10 +21,21 @@ from .config import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TIMEOUT,
     MAX_AUTO_CONTINUATIONS,
+    MAX_RETRIES,
+    RETRY_BASE_DELAY,
+    RETRYABLE_STATUS_CODES,
     MAX_TOKENS_BY_MODEL,
     VISION_MODELS,
     get_api_key,
 )
+
+
+class GlmApiError(RuntimeError):
+    """Raised when the Z.ai API returns a non-200 status code."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        self.status_code = status_code
+        super().__init__(f"GLM API error {status_code}: {message}")
 
 
 @dataclass
@@ -54,12 +65,21 @@ class GlmClient:
         self.model = model
         self.thought_level = thought_level
         self.reasoning_effort = reasoning_effort
+        self._cancelled = False
         self._api_key = get_api_key()
         self._client = httpx.AsyncClient(
             base_url=base_url or os.environ.get("ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4"),
             headers={"Authorization": f"Bearer {self._api_key}"},
             timeout=httpx.Timeout(DEFAULT_TIMEOUT, read=DEFAULT_TIMEOUT),
         )
+
+    def cancel(self) -> None:
+        """Signal that the current operation should be aborted."""
+        self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
 
     async def stream_completion(
         self,
@@ -79,6 +99,9 @@ class GlmClient:
         working_messages = list(messages)
 
         for _ in range(MAX_AUTO_CONTINUATIONS):
+            if self._cancelled:
+                break
+
             await self._do_stream_request(
                 working_messages, tools, result,
                 on_reasoning, on_content, on_tool_call_started,
@@ -122,11 +145,20 @@ class GlmClient:
         # Vision models don't support the thinking parameter
         if self.model not in VISION_MODELS:
             body["thinking"] = {"type": "disabled"}
-        resp = await self._client.post("/chat/completions", json=body)
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"GLM API error during summarization {resp.status_code}: {resp.text[:500]}"
-            )
+
+        # Retry with exponential backoff
+        import asyncio
+        last_error: Exception | None = None
+        for attempt in range(MAX_RETRIES + 1):
+            resp = await self._client.post("/chat/completions", json=body)
+            if resp.status_code == 200:
+                break
+            last_error = GlmApiError(resp.status_code, resp.text[:500])
+            if resp.status_code not in RETRYABLE_STATUS_CODES or attempt == MAX_RETRIES:
+                raise last_error
+            delay = RETRY_BASE_DELAY * (2 ** attempt)
+            await asyncio.sleep(delay)
+
         data = resp.json()
         choices = data.get("choices", [])
         if not choices:
@@ -179,6 +211,8 @@ class GlmClient:
             "messages": messages,
             "stream": True,
             "max_tokens": max_tokens,
+            # Request usage in the stream so we get real token counts
+            "stream_options": {"include_usage": True},
         }
         # Thinking / reasoning_effort only applies to text reasoning models,
         # not vision models.
@@ -190,17 +224,57 @@ class GlmClient:
         if tools:
             body["tools"] = tools
 
+        # --- Retry with exponential backoff on transient errors ---
+        last_error: Exception | None = None
+        for attempt in range(MAX_RETRIES + 1):
+            if self._cancelled:
+                return
+
+            try:
+                await self._execute_stream(body, result, on_reasoning, on_content, on_tool_call_started)
+                return  # success
+            except GlmApiError as e:
+                last_error = e
+                if e.status_code not in RETRYABLE_STATUS_CODES or attempt == MAX_RETRIES:
+                    raise
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                import logging
+                logging.getLogger("glm_acp").warning(
+                    "API error %d, retrying in %.1fs (attempt %d/%d)",
+                    e.status_code, delay, attempt + 1, MAX_RETRIES,
+                )
+                import asyncio
+                await asyncio.sleep(delay)
+            except httpx.TransportError as e:
+                last_error = e
+                if attempt == MAX_RETRIES:
+                    raise RuntimeError(f"Network error after {MAX_RETRIES} retries: {e}")
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                import asyncio
+                await asyncio.sleep(delay)
+
+    async def _execute_stream(
+        self,
+        body: dict[str, Any],
+        result: StreamResult,
+        on_reasoning: Any,
+        on_content: Any,
+        on_tool_call_started: Any,
+    ) -> None:
+        """Execute a single streaming request (no retry logic)."""
         tool_accs: dict[int, ToolCallAccumulator] = {}
         announced: set[int] = set()
 
         async with self._client.stream("POST", "/chat/completions", json=body) as resp:
             if resp.status_code != 200:
                 text = await resp.aread()
-                raise RuntimeError(
-                    f"GLM API error {resp.status_code}: {text.decode()[:500]}"
-                )
+                raise GlmApiError(resp.status_code, text.decode()[:500])
 
             async for line in resp.aiter_lines():
+                if self._cancelled:
+                    result.finish_reason = "cancelled"
+                    return
+
                 if not line or not line.startswith("data:"):
                     continue
 

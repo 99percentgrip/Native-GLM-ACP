@@ -10,6 +10,11 @@ DEFAULT_TIMEOUT = 180
 DEFAULT_MAX_TOKENS = 128_000
 MAX_AUTO_CONTINUATIONS = 20
 
+# Retry configuration for transient API errors (429, 500, 502, 503, 504)
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 1.0  # seconds, exponential: 1s, 2s, 4s
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
 # Per-model max_tokens limits.  Models not listed here fall back to
 # DEFAULT_MAX_TOKENS.
 MAX_TOKENS_BY_MODEL: dict[str, int] = {}
