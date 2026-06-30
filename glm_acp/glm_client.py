@@ -18,7 +18,6 @@ from .config import (
     COMPACTION_SUMMARY_MAX_TOKENS,
     COMPACTION_SYSTEM_PROMPT,
     COMPACTION_USER_PREFIX,
-    DEFAULT_BASE_URL,
     DEFAULT_MAX_TOKENS,
     DEFAULT_TIMEOUT,
     MAX_AUTO_CONTINUATIONS,
@@ -50,13 +49,13 @@ class StreamResult:
 class GlmClient:
     """Low-level streaming client for the Z.ai BigModel API."""
 
-    def __init__(self, model: str = "glm-4.6", thought_level: str = "enabled", reasoning_effort: str | None = None):
+    def __init__(self, model: str = "glm-4.6", thought_level: str = "enabled", reasoning_effort: str | None = None, base_url: str | None = None):
         self.model = model
         self.thought_level = thought_level
         self.reasoning_effort = reasoning_effort
         self._api_key = get_api_key()
         self._client = httpx.AsyncClient(
-            base_url=os.environ.get("ZAI_BASE_URL", DEFAULT_BASE_URL),
+            base_url=base_url or os.environ.get("ZAI_BASE_URL", DEFAULT_BASE_URL),
             headers={"Authorization": f"Bearer {self._api_key}"},
             timeout=httpx.Timeout(DEFAULT_TIMEOUT, read=DEFAULT_TIMEOUT),
         )

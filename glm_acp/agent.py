@@ -43,12 +43,14 @@ from acp.schema import (
 )
 
 from .config import (
+    API_ENDPOINTS,
     CHARS_PER_TOKEN,
     COMPACTION_KEEP_RECENT,
     COMPACTION_THRESHOLD,
     CONTEXT_WINDOW_TOKENS,
-    DESTRUCTIVE_TOOLS,
+    DEFAULT_API_ENDPOINT,
     DEFAULT_MODEL,
+    DESTRUCTIVE_TOOLS,
     MODELS,
     THOUGHT_LEVELS,
     thought_levels_for_model,
@@ -97,6 +99,7 @@ class Session:
         self.model = DEFAULT_MODEL
         self.thought_level = "enabled"
         self.mode = "code"
+        self.api_endpoint = DEFAULT_API_ENDPOINT
         self.title: str | None = None
         # Permission mode: "ask" (approve destructive tools), "bypass" (auto-approve), "read" (read-only)
         self.permission_mode = "ask"
@@ -120,6 +123,7 @@ class Session:
             "model": self.model,
             "thought_level": self.thought_level,
             "mode": self.mode,
+            "api_endpoint": self.api_endpoint,
             "title": self.title,
             "permission_mode": self.permission_mode,
             "messages": self.messages,
@@ -138,6 +142,7 @@ class Session:
         session.model = data.get("model", DEFAULT_MODEL)
         session.thought_level = data.get("thought_level", "enabled")
         session.mode = data.get("mode", "code")
+        session.api_endpoint = data.get("api_endpoint", DEFAULT_API_ENDPOINT)
         session.title = data.get("title")
         session.permission_mode = data.get("permission_mode", "ask")
         messages = data.get("messages")
@@ -201,6 +206,7 @@ class GlmAcpAgent(acp.Agent):
         config_options = [
             self._build_model_option(session),
             self._build_thought_option(session),
+            self._build_api_endpoint_option(session),
             self._build_permission_option(session),
         ]
 
@@ -252,6 +258,7 @@ class GlmAcpAgent(acp.Agent):
         config_options = [
             self._build_model_option(session),
             self._build_thought_option(session),
+            self._build_api_endpoint_option(session),
             self._build_permission_option(session),
         ]
 
@@ -315,6 +322,7 @@ class GlmAcpAgent(acp.Agent):
         config_options = [
             self._build_model_option(session),
             self._build_thought_option(session),
+            self._build_api_endpoint_option(session),
             self._build_permission_option(session),
         ]
 
@@ -353,6 +361,8 @@ class GlmAcpAgent(acp.Agent):
                 session.thought_level = "enabled" if "enabled" in thought_levels_for_model(session.model) else "disabled"
         elif config_id == "thought_level":
             session.thought_level = str(value)
+        elif config_id == "api_endpoint":
+            session.api_endpoint = str(value)
         elif config_id == "permission_mode":
             session.permission_mode = str(value)
 
@@ -362,6 +372,7 @@ class GlmAcpAgent(acp.Agent):
             config_options=[
                 self._build_model_option(session),
                 self._build_thought_option(session),
+                self._build_api_endpoint_option(session),
                 self._build_permission_option(session),
             ],
         )
@@ -438,10 +449,14 @@ class GlmAcpAgent(acp.Agent):
     async def _run_turn(self, session: Session) -> str:
         """Execute the full model-turn loop: stream → tool calls → repeat."""
         thought_config = THOUGHT_LEVELS.get(session.thought_level, {})
+        base_url = API_ENDPOINTS.get(session.api_endpoint, {}).get(
+            "base_url", API_ENDPOINTS[DEFAULT_API_ENDPOINT]["base_url"]
+        )
         client = GlmClient(
             session.model,
             thought_level=thought_config.get("thinking_type", "enabled"),
             reasoning_effort=thought_config.get("reasoning_effort"),
+            base_url=base_url,
         )
         tools = TOOL_DEFINITIONS if session.mode == "code" else [
             t for t in TOOL_DEFINITIONS
@@ -946,21 +961,21 @@ class GlmAcpAgent(acp.Agent):
             ],
         )
 
-        levels = thought_levels_for_model(session.model)
+    def _build_api_endpoint_option(self, session: Session) -> SessionConfigOptionSelect:
         return SessionConfigOptionSelect(
-            id="thought_level",
-            name="Reasoning",
-            description="Live reasoning trace level",
-            category="thought_level",
+            id="api_endpoint",
+            name="API Plan",
+            description="Z.ai API plan / endpoint",
+            category="api_endpoint",
             type="select",
-            current_value=session.thought_level,
+            current_value=session.api_endpoint,
             options=[
                 SessionConfigSelectOption(
-                    value=level_id,
+                    value=endpoint_id,
                     name=info["name"],
                     description=info["description"],
                 )
-                for level_id, info in levels.items()
+                for endpoint_id, info in API_ENDPOINTS.items()
             ],
         )
 

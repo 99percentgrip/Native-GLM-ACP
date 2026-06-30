@@ -4,20 +4,36 @@ from __future__ import annotations
 
 import os
 
-DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 DEFAULT_MODEL = "glm-5.2"
 DEFAULT_TIMEOUT = 180
 DEFAULT_MAX_TOKENS = 128_000
 MAX_AUTO_CONTINUATIONS = 20
 
-# Vision models have lower max_tokens limits than text models.
-# Keyed by model id; vision models served from the same Coding Plan endpoint.
-VISION_MODELS = {"glm-5v-turbo", "glm-4.6v", "glm-4.5v"}
-MAX_TOKENS_BY_MODEL: dict[str, int] = {
-    "glm-5v-turbo": 8_192,
-    "glm-4.6v": 32_768,
-    "glm-4.5v": 16_384,
+# Per-model max_tokens limits.  Models not listed here fall back to
+# DEFAULT_MAX_TOKENS.
+MAX_TOKENS_BY_MODEL: dict[str, int] = {}
+
+# --- API endpoints (plans) ---
+# The user can switch between these from the chat dropdown so they're not
+# locked into a single plan.  Each maps to a different Z.ai base URL.
+API_ENDPOINTS: dict[str, dict[str, str]] = {
+    "coding": {
+        "name": "Coding Plan",
+        "description": "Z.ai Coding Plan — GLM-5.2, GLM-5-Turbo, GLM-4.7 (default)",
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+    },
+    "standard": {
+        "name": "Standard API",
+        "description": "Z.ai standard API — pay-as-you-go, broader model access incl. vision",
+        "base_url": "https://api.z.ai/api/paas/v4",
+    },
+    "bigmodel": {
+        "name": "BigModel (CN)",
+        "description": "BigModel open platform (China) — Chinese mainland endpoint",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    },
 }
+DEFAULT_API_ENDPOINT = "coding"
 
 # --- Token estimation (heuristic) ---
 CHARS_PER_TOKEN = 4  # ~4 chars per token for mixed English/code content

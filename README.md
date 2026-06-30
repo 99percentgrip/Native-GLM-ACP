@@ -16,6 +16,7 @@ features. This ACP agent does:
 - **Model selector** — switch between GLM models in the panel (config option, `model` category)
 - **Deep Thinking** — GLM-5.2 supports Deep · High and Deep · Max reasoning levels via `reasoning_effort` (config option, `thought_level` category)
 - **Permission modes** — Ask (approve edits/commands before they run), Read Only (block all writes), or Bypass (auto-approve everything) (config option, `permissions` category)
+- **API plan switcher** — switch between Coding Plan, Standard API, and BigModel endpoints from the chat dropdown (config option, `api_endpoint` category)
 
 ## Install
 
@@ -132,6 +133,20 @@ server's `env` block in Zed's `settings.json`. Get a key at https://z.ai/.
 | GLM-5.2 (Flagship) | 1M | Maximum reasoning, coding, and long-horizon agentic tasks (default) |
 | GLM-5-Turbo | 1M | Flagship model optimized for speed — complex tasks with lower latency |
 | GLM-4.7 | 1M | Balanced model for daily development and routine tasks |
+
+## API Plans
+
+Switch from the chat dropdown (**API Plan** selector):
+
+| Plan | Endpoint | Notes |
+|---|---|---|
+| Coding Plan (default) | `api.z.ai/api/coding/paas/v4` | Included with GLM Coding Plan subscription — GLM-5.2, 5-Turbo, 4.7 |
+| Standard API | `api.z.ai/api/paas/v4` | Pay-as-you-go — broader model access including vision models |
+| BigModel (CN) | `open.bigmodel.cn/api/paas/v4` | Chinese mainland endpoint |
+
+The plan determines which models and features are available. Vision model
+support (glm-4.5v, etc.) requires the Standard API or BigModel plan with
+sufficient balance.
 
 ## Tools
 
