@@ -19,6 +19,7 @@ from acp.schema import (
     AgentCapabilities,
     Implementation,
     InitializeResponse,
+    LoadSessionResponse,
     NewSessionResponse,
     PromptCapabilities,
     PromptResponse,
@@ -111,7 +112,7 @@ class GlmAcpAgent(acp.Agent):
         return InitializeResponse(
             protocol_version=protocol_version,
             agent_capabilities=AgentCapabilities(
-                load_session=False,
+                load_session=True,
                 prompt_capabilities=PromptCapabilities(
                     image=True,
                     audio=False,
@@ -142,6 +143,37 @@ class GlmAcpAgent(acp.Agent):
 
         return NewSessionResponse(
             session_id=session.id,
+            modes=SessionModeState(
+                current_mode_id=session.mode,
+                available_modes=MODE_LIST,
+            ),
+            config_options=config_options,
+        )
+
+    async def load_session(
+        self,
+        cwd: str,
+        session_id: str,
+        additional_directories: list[str] | None = None,
+        mcp_servers: Any = None,
+        **kwargs: Any,
+    ) -> LoadSessionResponse:
+        """Recreate a session so Zed can resume displaying a previous chat.
+
+        The previous message history is not persisted across process
+        restarts (the agent runs as a stateless subprocess), so we start
+        fresh.  Returning a valid LoadSessionResponse tells Zed the session
+        was accepted — the user can continue the conversation from here.
+        """
+        session = Session(session_id, cwd, additional_directories)
+        self._sessions[session.id] = session
+
+        config_options = [
+            self._build_model_option(session),
+            self._build_thought_option(session),
+        ]
+
+        return LoadSessionResponse(
             modes=SessionModeState(
                 current_mode_id=session.mode,
                 available_modes=MODE_LIST,
