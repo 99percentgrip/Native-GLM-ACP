@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import sys
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -385,13 +386,37 @@ class GlmAcpAgent(acp.Agent):
         **kwargs: Any,
     ) -> PromptResponse:
         session = self._sessions[session_id]
-        user_text = self._extract_text(prompt)
-        session.messages.append({"role": "user", "content": user_text})
 
-        # Derive a session title from the first user message if we don't
-        # have one yet, and tell Zed so it shows up in the history sidebar.
+        # Extract images and text from the ACP prompt blocks.
+        content, images = self._extract_prompt_parts(prompt)
+
+        # GLM-5.2 / GLM-4.7 are text-only models on the Coding Plan.  The
+        # Coding Plan does NOT include direct vision model API access.
+        # When the user pastes a screenshot, save it to disk so it's
+        # preserved and the model (or Vision MCP Server) can reference it.
+        if images:
+            saved_paths = await self._save_images(session, images)
+            file_note = (
+                f"\n\n[The user shared {len(images)} screenshot"
+                f"{'s' if len(images) > 1 else ''}. "
+                f"Saved to: {', '.join(saved_paths)}. "
+                f"Note: GLM-5.2 is a text-only model and cannot view images "
+                f"directly. To analyze screenshots, enable the Z.ai Vision MCP "
+                f"Server or describe the screenshot in text.]"
+            )
+            content = (content or "") + file_note
+            await self._send_message(
+                session.id,
+                f"\n\n📸 Screenshot saved to: {', '.join(saved_paths)}\n"
+                f"_GLM-5.2 is text-only — use the Vision MCP Server to analyze images._\n",
+            )
+
+        session.messages.append({"role": "user", "content": content})
+
+        # Derive a title from any text in the prompt.
+        text_only = self._extract_text(prompt)
         if not session.title:
-            session.title = user_text[:60].strip() or "New Chat"
+            session.title = text_only[:60].strip() or "New Chat"
             await self._send_session_info(session)
 
         try:
@@ -692,6 +717,83 @@ class GlmAcpAgent(acp.Agent):
                 if text:
                     parts.append(text)
         return "\n".join(parts) if parts else ""
+
+    def _extract_prompt_parts(
+        self, prompt: list[Any]
+    ) -> tuple[str, list[dict[str, str]]]:
+        """Extract text and image data from an ACP prompt list.
+
+        Returns ``(text, images)`` where ``images`` is a list of dicts
+        with ``data`` (base64) and ``mime_type`` keys.
+        """
+        text_parts: list[str] = []
+        images: list[dict[str, str]] = []
+
+        for block in prompt:
+            btype = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+
+            if btype == "text":
+                txt = getattr(block, "text", None) or (block.get("text", "") if isinstance(block, dict) else "")
+                if txt:
+                    text_parts.append(txt)
+            elif btype == "image":
+                data = getattr(block, "data", None) or (block.get("data") if isinstance(block, dict) else None)
+                mime = getattr(block, "mime_type", None) or (
+                    block.get("mime_type") if isinstance(block, dict) else None
+                ) or "image/png"
+                if data:
+                    images.append({"data": data, "mime_type": mime})
+            elif btype == "resource":
+                if isinstance(block, dict):
+                    res = block.get("resource", {})
+                    uri = res.get("uri", "")
+                    rtext = res.get("text", "")
+                    text_parts.append(f"[File: {uri}]\n{rtext}")
+                else:
+                    res = getattr(block, "resource", None)
+                    if res:
+                        text_parts.append(f"[File: {getattr(res, 'uri', '')}]\n{getattr(res, 'text', '')}")
+            elif isinstance(block, str):
+                text_parts.append(block)
+            else:
+                txt = getattr(block, "text", None)
+                if txt:
+                    text_parts.append(txt)
+
+        return "\n".join(text_parts) if text_parts else "", images
+
+    async def _save_images(
+        self, session: Session, images: list[dict[str, str]]
+    ) -> list[str]:
+        """Save pasted images to a temp directory inside the workspace.
+
+        Returns the list of saved file paths.
+        """
+        import base64
+        from datetime import datetime
+
+        img_dir = Path(session.cwd) / ".glm-acp-images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        saved: list[str] = []
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        for i, img in enumerate(images):
+            ext = "png"
+            mime = img.get("mime_type", "image/png")
+            if "jpeg" in mime or "jpg" in mime:
+                ext = "jpg"
+            elif "webp" in mime:
+                ext = "webp"
+            elif "gif" in mime:
+                ext = "gif"
+
+            filename = f"screenshot_{timestamp}_{i}.{ext}"
+            filepath = img_dir / filename
+            filepath.write_bytes(base64.b64decode(img["data"]))
+            saved.append(str(filepath))
+            logger.info("Saved pasted image to %s", filepath)
+
+        return saved
 
     async def _send_thought(self, session_id: str, text: str) -> None:
         chunk = acp.update_agent_thought_text(text)

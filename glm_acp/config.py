@@ -10,6 +10,15 @@ DEFAULT_TIMEOUT = 180
 DEFAULT_MAX_TOKENS = 128_000
 MAX_AUTO_CONTINUATIONS = 20
 
+# Vision models have lower max_tokens limits than text models.
+# Keyed by model id; vision models served from the same Coding Plan endpoint.
+VISION_MODELS = {"glm-5v-turbo", "glm-4.6v", "glm-4.5v"}
+MAX_TOKENS_BY_MODEL: dict[str, int] = {
+    "glm-5v-turbo": 8_192,
+    "glm-4.6v": 32_768,
+    "glm-4.5v": 16_384,
+}
+
 # --- Token estimation (heuristic) ---
 CHARS_PER_TOKEN = 4  # ~4 chars per token for mixed English/code content
 

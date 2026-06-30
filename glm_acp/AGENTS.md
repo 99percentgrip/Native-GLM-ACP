@@ -85,6 +85,26 @@ session's `permission_mode`:
 
 Permission state is stored per-session and persisted to disk.
 
+### Image / screenshot handling
+
+GLM-5.2, GLM-5-Turbo, and GLM-4.7 are **text-only models** — the Z.ai
+Coding Plan API endpoint rejects image content with error 1210/1213.
+Direct vision model access (GLM-5V-Turbo) is not included in the Coding
+Plan API.
+
+When a user pastes a screenshot from the clipboard:
+1. `_extract_prompt_parts()` separates image data from text in the ACP
+   prompt blocks
+2. `_save_images()` writes each image to `.glm-acp-images/` inside the
+   session's workspace root
+3. The user message sent to the model includes the saved file paths and a
+   note that GLM-5.2 cannot view images directly
+4. The user is notified in the panel where the screenshot was saved
+
+This prevents the "prompt parameter was not received normally" (1213)
+crash and preserves the screenshot for use with the Z.ai Vision MCP Server
+or manual inspection.
+
 ### Sandbox
 
 All file tool operations validate paths against the session `cwd` and

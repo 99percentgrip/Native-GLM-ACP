@@ -22,6 +22,7 @@ from .config import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TIMEOUT,
     MAX_AUTO_CONTINUATIONS,
+    MAX_TOKENS_BY_MODEL,
     get_api_key,
 )
 
@@ -105,6 +106,10 @@ class GlmClient:
         request for simplicity (no tool calls, no thinking).
         """
         transcript = self._format_transcript(messages)
+        max_tokens = min(
+            COMPACTION_SUMMARY_MAX_TOKENS,
+            MAX_TOKENS_BY_MODEL.get(self.model, DEFAULT_MAX_TOKENS),
+        )
         body = {
             "model": self.model,
             "messages": [
@@ -112,7 +117,7 @@ class GlmClient:
                 {"role": "user", "content": COMPACTION_USER_PREFIX + transcript},
             ],
             "stream": False,
-            "max_tokens": COMPACTION_SUMMARY_MAX_TOKENS,
+            "max_tokens": max_tokens,
             "thinking": {"type": "disabled"},
         }
         resp = await self._client.post("/chat/completions", json=body)
@@ -166,11 +171,12 @@ class GlmClient:
         on_content: Any,
         on_tool_call_started: Any,
     ) -> None:
+        max_tokens = MAX_TOKENS_BY_MODEL.get(self.model, DEFAULT_MAX_TOKENS)
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": True,
-            "max_tokens": DEFAULT_MAX_TOKENS,
+            "max_tokens": max_tokens,
             "thinking": {"type": self.thought_level},
         }
         if self.reasoning_effort:
