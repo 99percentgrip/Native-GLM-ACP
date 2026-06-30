@@ -233,6 +233,13 @@ class GlmAcpAgent(acp.Agent):
 
         self._sessions[session.id] = session
 
+        # The ACP load_session / resume_session responses only carry config
+        # options and modes — NOT the message history.  To make the previous
+        # conversation visible in the editor UI we must *replay* it back via
+        # session_update notifications (user_message_chunk /
+        # agent_message_chunk), the same channel used during a live prompt.
+        await self._replay_history(session)
+
         config_options = [
             self._build_model_option(session),
             self._build_thought_option(session),
@@ -291,6 +298,9 @@ class GlmAcpAgent(acp.Agent):
             logger.info("No saved state for session %s — starting fresh", session_id)
 
         self._sessions[session.id] = session
+
+        # Replay the conversation history so it shows up in the UI.
+        await self._replay_history(session)
 
         config_options = [
             self._build_model_option(session),
@@ -592,6 +602,36 @@ class GlmAcpAgent(acp.Agent):
             title=session.title,
         )
         await self._conn.session_update(session_id=session.id, update=update)
+
+    async def _replay_history(self, session: Session) -> None:
+        """Replay persisted messages as session_update notifications.
+
+        ACP's ``session/load`` and ``session/resume`` responses only carry
+        config options and modes — never the message history.  For the
+        previous conversation to appear in the editor UI the agent must
+        re-send every user/assistant turn via ``user_message_chunk`` /
+        ``agent_message_chunk`` notifications, the same channel used during
+        a live ``prompt``.
+
+        System messages and tool-call internal bookkeeping are skipped —
+        only human-visible turns are replayed.  Each message is sent as a
+        single complete chunk (no streaming) so it appears instantly.
+        """
+        for msg in session.messages:
+            role = msg.get("role")
+            content = msg.get("content", "") or ""
+            if role == "user":
+                if not content:
+                    continue
+                chunk = acp.update_user_message_text(content)
+            elif role == "assistant":
+                if not content:
+                    continue
+                chunk = acp.update_agent_message_text(content)
+            else:
+                # Skip system messages, tool results, and internal entries.
+                continue
+            await self._conn.session_update(session_id=session.id, update=chunk)
 
     async def _start_tool(self, session_id: str, tool_call_id: str, name: str) -> None:
         kind = TOOL_KINDS.get(name, "other")

@@ -11,10 +11,11 @@ streaming, 1M context, and auto-continuation for long generations.
 ## Ownership
 
 - **Entry point**: `__main__.py` → `agent.py:run()`
-- **ACP protocol**: `agent.py` — implements `acp.Agent` (initialize, new_session, prompt, set_config_option, set_session_mode)
+- **ACP protocol**: `agent.py` — implements `acp.Agent` (initialize, new_session, load_session, resume_session, close_session, list_sessions, prompt, set_config_option, set_session_mode)
 - **GLM API client**: `glm_client.py` — SSE streaming, reasoning/content separation, tool_call assembly, auto-continuation
 - **Tools**: `tools.py` — file/shell operations sandboxed to workspace roots
 - **Config**: `config.py` — model registry, API key, constants
+- **Persistence**: `session_store.py` — JSON file store for conversation state in `~/.glm-acp/sessions/`
 
 ## Local Contracts
 
@@ -67,6 +68,23 @@ Session config options advertised to the client:
 
 All file tool operations validate paths against the session `cwd` and
 `additional_directories`. Paths outside workspace roots raise `ToolError`.
+
+### Session persistence & history replay
+
+Conversation state (messages, model, mode, title) is persisted to disk
+(`~/.glm-acp/sessions/<id>.json`) after every prompt turn and config change.
+On `session/load` and `session/resume`, the agent rebuilds the `Session` from
+disk via `Session.from_dict`.
+
+**Critical:** The ACP `LoadSessionResponse` and `ResumeSessionResponse` only
+carry `modes`, `config_options`, and `models` — they do **not** include message
+history. To make the restored conversation visible in the editor UI, the agent
+must replay it back via `session_update` notifications. `_replay_history()`
+walks the persisted messages and sends each user turn as a
+`user_message_chunk` and each assistant turn as an `agent_message_chunk`.
+System messages and tool-result entries are skipped (internal bookkeeping).
+The server runs with `use_unstable_protocol=True` to expose
+`session/list`, `session/resume`, and `session/close`.
 
 ## Work Guidance
 
