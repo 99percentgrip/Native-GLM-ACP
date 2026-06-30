@@ -1,8 +1,16 @@
-"""Tests for glm_acp.tools — sandbox, gitignore, tool execution."""
+"""Tests for glm_acp.tools — sandbox, gitignore, tool execution, ToolResult."""
 
 import asyncio
-import os
 import pytest
+
+from glm_acp.tools import (
+    Sandbox,
+    ToolError,
+    ToolResult,
+    execute_tool,
+    _is_ignored,
+    _load_gitignore_patterns,
+)
 from pathlib import Path
 
 from glm_acp.tools import (
@@ -86,7 +94,8 @@ class TestToolExecution:
         f.write_text("hello world")
         sandbox = Sandbox(str(tmp_path))
         result = await execute_tool("read_file", {"path": "test.txt"}, sandbox)
-        assert result == "hello world"
+        assert result.output == "hello world"
+        assert result.file_path is not None
 
     @pytest.mark.asyncio
     async def test_read_file_not_found(self, tmp_path):
@@ -97,20 +106,35 @@ class TestToolExecution:
     @pytest.mark.asyncio
     async def test_write_file(self, tmp_path):
         sandbox = Sandbox(str(tmp_path))
-        await execute_tool("write_file", {"path": "out.txt", "content": "data"}, sandbox)
+        result = await execute_tool("write_file", {"path": "out.txt", "content": "data"}, sandbox)
         assert (tmp_path / "out.txt").read_text() == "data"
+        assert result.file_path is not None
+        assert result.new_text == "data"
+        assert result.old_text is None  # new file
+
+    @pytest.mark.asyncio
+    async def test_write_file_overwrite(self, tmp_path):
+        f = tmp_path / "existing.txt"
+        f.write_text("old")
+        sandbox = Sandbox(str(tmp_path))
+        result = await execute_tool("write_file", {"path": "existing.txt", "content": "new"}, sandbox)
+        assert result.old_text == "old"
+        assert result.new_text == "new"
 
     @pytest.mark.asyncio
     async def test_edit_file(self, tmp_path):
         f = tmp_path / "code.py"
         f.write_text("old line\nnew line")
         sandbox = Sandbox(str(tmp_path))
-        await execute_tool("edit_file", {
+        result = await execute_tool("edit_file", {
             "path": "code.py",
             "old_text": "old line",
             "new_text": "replaced",
         }, sandbox)
         assert f.read_text() == "replaced\nnew line"
+        assert result.file_path is not None
+        assert result.old_text == "old line"
+        assert result.new_text == "replaced"
 
     @pytest.mark.asyncio
     async def test_edit_file_not_found_text(self, tmp_path):
@@ -142,8 +166,8 @@ class TestToolExecution:
         (tmp_path / "subdir").mkdir()
         sandbox = Sandbox(str(tmp_path))
         result = await execute_tool("list_directory", {"path": "."}, sandbox)
-        assert "file.py" in result
-        assert "dir subdir" in result
+        assert "file.py" in result.output
+        assert "dir subdir" in result.output
 
     @pytest.mark.asyncio
     async def test_grep(self, tmp_path):
@@ -151,9 +175,9 @@ class TestToolExecution:
         (tmp_path / "b.py").write_text("print('hello')")
         sandbox = Sandbox(str(tmp_path))
         result = await execute_tool("grep", {"pattern": "import"}, sandbox)
-        assert "a.py" in result
-        assert "import os" in result
-        assert "b.py" not in result
+        assert "a.py" in result.output
+        assert "import os" in result.output
+        assert "b.py" not in result.output
 
     @pytest.mark.asyncio
     async def test_search_files(self, tmp_path):
@@ -161,11 +185,77 @@ class TestToolExecution:
         (tmp_path / "b.txt").write_text("x")
         sandbox = Sandbox(str(tmp_path))
         result = await execute_tool("search_files", {"pattern": "*.py"}, sandbox)
-        assert "a.py" in result
-        assert "b.txt" not in result
+        assert "a.py" in result.output
+        assert "b.txt" not in result.output
 
     @pytest.mark.asyncio
     async def test_unknown_tool(self, tmp_path):
         sandbox = Sandbox(str(tmp_path))
         with pytest.raises(ToolError, match="Unknown tool"):
             await execute_tool("nonexistent", {}, sandbox)
+
+
+class TestToolResultStructure:
+    """Verify ToolResult carries file path and diff info for ACP follow."""
+
+    @pytest.mark.asyncio
+    async def test_read_file_has_path(self, tmp_path):
+        (tmp_path / "main.py").write_text("print('hi')")
+        sandbox = Sandbox(str(tmp_path))
+        result = await execute_tool("read_file", {"path": "main.py"}, sandbox)
+        assert result.file_path is not None
+        assert "main.py" in result.file_path
+        assert result.old_text is None
+        assert result.new_text is None
+
+    @pytest.mark.asyncio
+    async def test_write_file_has_diff(self, tmp_path):
+        sandbox = Sandbox(str(tmp_path))
+        result = await execute_tool("write_file", {"path": "new.py", "content": "x = 1"}, sandbox)
+        assert result.file_path is not None
+        assert result.old_text is None  # new file
+        assert result.new_text == "x = 1"
+
+    @pytest.mark.asyncio
+    async def test_write_file_overwrite_has_old(self, tmp_path):
+        (tmp_path / "existing.py").write_text("old content")
+        sandbox = Sandbox(str(tmp_path))
+        result = await execute_tool("write_file", {"path": "existing.py", "content": "new"}, sandbox)
+        assert result.old_text == "old content"
+        assert result.new_text == "new"
+
+    @pytest.mark.asyncio
+    async def test_edit_file_has_diff(self, tmp_path):
+        (tmp_path / "code.py").write_text("foo\nbar")
+        sandbox = Sandbox(str(tmp_path))
+        result = await execute_tool("edit_file", {
+            "path": "code.py",
+            "old_text": "foo",
+            "new_text": "baz",
+        }, sandbox)
+        assert result.file_path is not None
+        assert result.old_text == "foo"
+        assert result.new_text == "baz"
+
+    @pytest.mark.asyncio
+    async def test_run_command_no_path(self, tmp_path):
+        sandbox = Sandbox(str(tmp_path))
+        result = await execute_tool("run_command", {"command": "echo hello"}, sandbox)
+        assert result.file_path is None
+        assert result.old_text is None
+        assert result.new_text is None
+
+    @pytest.mark.asyncio
+    async def test_read_file_with_line(self, tmp_path):
+        (tmp_path / "f.py").write_text("line1\nline2\nline3")
+        sandbox = Sandbox(str(tmp_path))
+        result = await execute_tool("read_file", {"path": "f.py", "start_line": 2}, sandbox)
+        assert result.line == 2
+
+    def test_tool_result_defaults(self):
+        r = ToolResult(output="test")
+        assert r.output == "test"
+        assert r.file_path is None
+        assert r.line is None
+        assert r.old_text is None
+        assert r.new_text is None

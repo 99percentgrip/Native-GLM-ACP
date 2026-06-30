@@ -10,6 +10,7 @@ import asyncio
 import fnmatch
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -229,6 +230,26 @@ class ToolError(Exception):
     pass
 
 
+@dataclass
+class ToolResult:
+    """Structured result from a tool execution.
+
+    Contains the output string, plus optional metadata for ACP tool call
+    updates: the file path (for 'follow' in Zed) and old/new text (for
+    inline diff rendering).
+    """
+
+    output: str
+    # Relative or absolute path affected (enables Zed "follow" feature)
+    file_path: str | None = None
+    # Line number to scroll to (optional)
+    line: int | None = None
+    # For file edits: the old content before the change (for diff rendering)
+    old_text: str | None = None
+    # For file edits: the new content after the change (for diff rendering)
+    new_text: str | None = None
+
+
 class Sandbox:
     """Validates that paths stay within allowed workspace roots."""
 
@@ -255,8 +276,8 @@ async def execute_tool(
     name: str,
     arguments: dict[str, Any],
     sandbox: Sandbox,
-) -> str:
-    """Execute a tool call and return its output as a string."""
+) -> ToolResult:
+    """Execute a tool call and return a structured result."""
     try:
         if name == "read_file":
             return await _read_file(arguments, sandbox)
@@ -280,7 +301,7 @@ async def execute_tool(
         raise ToolError(str(e))
 
 
-async def _read_file(args: dict[str, Any], sandbox: Sandbox) -> str:
+async def _read_file(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     path = sandbox.resolve(args["path"])
     if not path.is_file():
         raise ToolError(f"File not found: {path}")
@@ -292,17 +313,23 @@ async def _read_file(args: dict[str, Any], sandbox: Sandbox) -> str:
         s = (start - 1) if start else 0
         e = end if end else len(lines)
         text = "".join(lines[s:e])
-    return text
+    return ToolResult(output=text, file_path=str(path), line=start)
 
 
-async def _write_file(args: dict[str, Any], sandbox: Sandbox) -> str:
+async def _write_file(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     path = sandbox.resolve(args["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
+    old_text = path.read_text() if path.exists() else None
     path.write_text(args["content"])
-    return f"Wrote {len(args['content'])} bytes to {path}"
+    return ToolResult(
+        output=f"Wrote {len(args['content'])} bytes to {path}",
+        file_path=str(path),
+        old_text=old_text,
+        new_text=args["content"],
+    )
 
 
-async def _edit_file(args: dict[str, Any], sandbox: Sandbox) -> str:
+async def _edit_file(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     path = sandbox.resolve(args["path"])
     if not path.is_file():
         raise ToolError(f"File not found: {path}")
@@ -314,11 +341,17 @@ async def _edit_file(args: dict[str, Any], sandbox: Sandbox) -> str:
         raise ToolError("old_text not found in file")
     if count > 1:
         raise ToolError(f"old_text appears {count} times — provide more context to make it unique")
-    path.write_text(text.replace(old, new, 1))
-    return f"Edited {path}"
+    new_text = text.replace(old, new, 1)
+    path.write_text(new_text)
+    return ToolResult(
+        output=f"Edited {path}",
+        file_path=str(path),
+        old_text=old,
+        new_text=new,
+    )
 
 
-async def _list_directory(args: dict[str, Any], sandbox: Sandbox) -> str:
+async def _list_directory(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     path = sandbox.resolve(args.get("path", "."))
     if not path.is_dir():
         raise ToolError(f"Not a directory: {path}")
@@ -327,7 +360,7 @@ async def _list_directory(args: dict[str, Any], sandbox: Sandbox) -> str:
     for e in entries:
         prefix = "dir " if e.is_dir() else "    "
         lines.append(f"{prefix}{e.name}")
-    return "\n".join(lines) if lines else "(empty)"
+    return ToolResult(output="\n".join(lines) if lines else "(empty)", file_path=str(path))
 
 
 async def _search_files(args: dict[str, Any], sandbox: Sandbox) -> str:
@@ -345,7 +378,7 @@ async def _search_files(args: dict[str, Any], sandbox: Sandbox) -> str:
                 continue
             matches.append(rel_str)
     matches.sort()
-    return "\n".join(matches[:200]) if matches else "No files found"
+    return ToolResult(output="\n".join(matches[:200]) if matches else "No files found")
 
 
 async def _grep(args: dict[str, Any], sandbox: Sandbox) -> str:
@@ -374,10 +407,10 @@ async def _grep(args: dict[str, Any], sandbox: Sandbox) -> str:
         if len(results) >= 500:
             results.append("... (truncated at 500 matches)")
             break
-    return "\n".join(results) if results else "No matches found"
+    return ToolResult(output="\n".join(results) if results else "No matches found")
 
 
-async def _run_command(args: dict[str, Any], sandbox: Sandbox) -> str:
+async def _run_command(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     command = args["command"]
     timeout = args.get("timeout", 120)
     proc = await asyncio.create_subprocess_shell(
@@ -395,4 +428,4 @@ async def _run_command(args: dict[str, Any], sandbox: Sandbox) -> str:
     output = stdout.decode()
     if stderr:
         output += "\n" + stderr.decode()
-    return output.strip() if output.strip() else "(no output)"
+    return ToolResult(output=output.strip() if output.strip() else "(no output)")

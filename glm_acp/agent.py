@@ -61,7 +61,7 @@ from .config import (
 )
 from .glm_client import GlmClient
 from .session_store import SessionStore
-from .tools import TOOL_DEFINITIONS, TOOL_KINDS, Sandbox, ToolError, execute_tool
+from .tools import TOOL_DEFINITIONS, TOOL_KINDS, Sandbox, ToolError, ToolResult, execute_tool
 
 logger = logging.getLogger("glm_acp")
 
@@ -713,6 +713,9 @@ class GlmAcpAgent(acp.Agent):
                         })
                         continue
 
+                    # Send location update for file tools (enables Zed follow)
+                    await self._start_tool_with_location(session.id, tc_id, tool_name, tool_args)
+
                     await self._update_tool(session.id, tc_id, status="in_progress")
 
                     # --- Permission check ---
@@ -730,8 +733,9 @@ class GlmAcpAgent(acp.Agent):
                         continue
 
                     try:
-                        output = await execute_tool(tool_name, tool_args, session.sandbox)
-                        await self._complete_tool(session.id, tc_id, output)
+                        tool_result = await execute_tool(tool_name, tool_args, session.sandbox)
+                        await self._complete_tool(session.id, tc_id, tool_result)
+                        output = tool_result.output
                     except ToolError as e:
                         error_msg = str(e)
                         output = f"Error: {error_msg}"
@@ -1332,13 +1336,43 @@ class GlmAcpAgent(acp.Agent):
                 continue
             await self._conn.session_update(session_id=session.id, update=chunk)
 
-    async def _start_tool(self, session_id: str, tool_call_id: str, name: str) -> None:
+    async def _start_tool(self, session_id: str, tool_call_id: str, name: str, args: dict[str, Any] | None = None) -> None:
         kind = TOOL_KINDS.get(name, "other")
+        # Extract file path for location-based tools (enables Zed "follow")
+        locations = None
+        if args and name in ("read_file", "write_file", "edit_file", "list_directory"):
+            path = args.get("path")
+            if path:
+                from acp.schema import ToolCallLocation
+                locations = [ToolCallLocation(path=path)]
         chunk = acp.start_tool_call(
             tool_call_id=tool_call_id,
             title=self._tool_title(name),
             kind=kind,
             status="pending",
+            locations=locations,
+        )
+        await self._conn.session_update(session_id=session_id, update=chunk)
+
+    async def _start_tool_with_location(self, session_id: str, tool_call_id: str, name: str, args: dict[str, Any]) -> None:
+        """Send an update with file location when a tool starts executing.
+
+        This fires after the tool call is streamed (we now have the full
+        args) and before execution begins. Zed uses this to open the file.
+        """
+        if name not in ("read_file", "write_file", "edit_file", "list_directory"):
+            return
+        path = args.get("path")
+        if not path:
+            return
+        from acp.schema import ToolCallLocation
+        loc_kwargs: dict[str, Any] = {"path": path}
+        line = args.get("start_line") or args.get("line")
+        if line:
+            loc_kwargs["line"] = line
+        chunk = acp.update_tool_call(
+            tool_call_id=tool_call_id,
+            locations=[ToolCallLocation(**loc_kwargs)],
         )
         await self._conn.session_update(session_id=session_id, update=chunk)
 
@@ -1346,11 +1380,44 @@ class GlmAcpAgent(acp.Agent):
         chunk = acp.update_tool_call(tool_call_id=tool_call_id, status=status)
         await self._conn.session_update(session_id=session_id, update=chunk)
 
-    async def _complete_tool(self, session_id: str, tool_call_id: str, output: str) -> None:
+    async def _complete_tool(self, session_id: str, tool_call_id: str, result: ToolResult | str) -> None:
+        # Build content blocks based on tool result type
+        if isinstance(result, ToolResult):
+            content = []
+            # If this is a file edit with diff info, send a diff block
+            if result.file_path and result.old_text is not None and result.new_text is not None:
+                content.append(acp.tool_diff_content(
+                    path=result.file_path,
+                    new_text=result.new_text[:8000],
+                    old_text=result.old_text[:8000],
+                ))
+            elif result.file_path and result.new_text is not None:
+                # write_file creating a new file (old_text is None)
+                content.append(acp.tool_diff_content(
+                    path=result.file_path,
+                    new_text=result.new_text[:8000],
+                    old_text=None,
+                ))
+            # Always include the text output
+            content.append(acp.tool_content(acp.text_block(result.output[:8000])))
+        else:
+            # Plain string (e.g. plan tool)
+            content = [acp.tool_content(acp.text_block(result[:8000]))]
+
+        # Build locations for follow
+        locations = None
+        if isinstance(result, ToolResult) and result.file_path:
+            from acp.schema import ToolCallLocation
+            loc_kwargs: dict[str, Any] = {"path": result.file_path}
+            if result.line is not None:
+                loc_kwargs["line"] = result.line
+            locations = [ToolCallLocation(**loc_kwargs)]
+
         chunk = acp.update_tool_call(
             tool_call_id=tool_call_id,
             status="completed",
-            content=[acp.tool_content(acp.text_block(output[:8000]))],
+            content=content,
+            locations=locations,
         )
         await self._conn.session_update(session_id=session_id, update=chunk)
 
