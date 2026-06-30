@@ -23,6 +23,7 @@ from acp.schema import (
     ListSessionsResponse,
     LoadSessionResponse,
     NewSessionResponse,
+    PermissionOption,
     PromptCapabilities,
     PromptResponse,
     ResumeSessionResponse,
@@ -45,9 +46,11 @@ from .config import (
     COMPACTION_KEEP_RECENT,
     COMPACTION_THRESHOLD,
     CONTEXT_WINDOW_TOKENS,
+    DESTRUCTIVE_TOOLS,
     DEFAULT_MODEL,
     MODELS,
     THOUGHT_LEVELS,
+    thought_levels_for_model,
 )
 from .glm_client import GlmClient
 from .session_store import SessionStore
@@ -94,6 +97,8 @@ class Session:
         self.thought_level = "enabled"
         self.mode = "code"
         self.title: str | None = None
+        # Permission mode: "ask" (approve destructive tools), "bypass" (auto-approve), "read" (read-only)
+        self.permission_mode = "ask"
         self.messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
         ]
@@ -115,6 +120,7 @@ class Session:
             "thought_level": self.thought_level,
             "mode": self.mode,
             "title": self.title,
+            "permission_mode": self.permission_mode,
             "messages": self.messages,
         }
 
@@ -132,6 +138,7 @@ class Session:
         session.thought_level = data.get("thought_level", "enabled")
         session.mode = data.get("mode", "code")
         session.title = data.get("title")
+        session.permission_mode = data.get("permission_mode", "ask")
         messages = data.get("messages")
         if messages:
             session.messages = messages
@@ -193,6 +200,7 @@ class GlmAcpAgent(acp.Agent):
         config_options = [
             self._build_model_option(session),
             self._build_thought_option(session),
+            self._build_permission_option(session),
         ]
 
         return NewSessionResponse(
@@ -243,6 +251,7 @@ class GlmAcpAgent(acp.Agent):
         config_options = [
             self._build_model_option(session),
             self._build_thought_option(session),
+            self._build_permission_option(session),
         ]
 
         return LoadSessionResponse(
@@ -305,6 +314,7 @@ class GlmAcpAgent(acp.Agent):
         config_options = [
             self._build_model_option(session),
             self._build_thought_option(session),
+            self._build_permission_option(session),
         ]
 
         return ResumeSessionResponse(
@@ -336,8 +346,14 @@ class GlmAcpAgent(acp.Agent):
         if config_id == "model":
             session.model = str(value)
             session.context_size = CONTEXT_WINDOW_TOKENS.get(session.model, 1_000_000)
+            # If the new model doesn't support the current thought level,
+            # fall back to the closest supported level.
+            if session.thought_level not in thought_levels_for_model(session.model):
+                session.thought_level = "enabled" if "enabled" in thought_levels_for_model(session.model) else "disabled"
         elif config_id == "thought_level":
             session.thought_level = str(value)
+        elif config_id == "permission_mode":
+            session.permission_mode = str(value)
 
         self._store.save(session.id, session.to_dict())
 
@@ -345,6 +361,7 @@ class GlmAcpAgent(acp.Agent):
             config_options=[
                 self._build_model_option(session),
                 self._build_thought_option(session),
+                self._build_permission_option(session),
             ],
         )
 
@@ -395,7 +412,12 @@ class GlmAcpAgent(acp.Agent):
 
     async def _run_turn(self, session: Session) -> str:
         """Execute the full model-turn loop: stream → tool calls → repeat."""
-        client = GlmClient(session.model, session.thought_level)
+        thought_config = THOUGHT_LEVELS.get(session.thought_level, {})
+        client = GlmClient(
+            session.model,
+            thought_level=thought_config.get("thinking_type", "enabled"),
+            reasoning_effort=thought_config.get("reasoning_effort"),
+        )
         tools = TOOL_DEFINITIONS if session.mode == "code" else [
             t for t in TOOL_DEFINITIONS
             if t["function"]["name"] in ("read_file", "list_directory", "search_files", "grep")
@@ -440,6 +462,20 @@ class GlmAcpAgent(acp.Agent):
                     tc_id = tc["id"]
 
                     await self._update_tool(session.id, tc_id, status="in_progress")
+
+                    # --- Permission check ---
+                    permitted, deny_reason = await self._check_permission(
+                        session, tc_id, tool_name, tool_args,
+                    )
+                    if not permitted:
+                        output = deny_reason
+                        await self._fail_tool(session.id, tc_id, deny_reason)
+                        session.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": output,
+                        })
+                        continue
 
                     try:
                         output = await execute_tool(tool_name, tool_args, session.sandbox)
@@ -493,6 +529,76 @@ class GlmAcpAgent(acp.Agent):
                 used=used,
             )
             await self._conn.session_update(session_id=session.id, update=update)
+
+    # ------------------------------------------------------------------
+    # Permission system
+    # ------------------------------------------------------------------
+
+    async def _check_permission(
+        self,
+        session: Session,
+        tool_call_id: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Check whether a tool call is permitted under the session's mode.
+
+        Returns ``(True, "")`` if permitted, or ``(False, reason)`` if denied.
+        The reason is sent back to the model as the tool result.
+        """
+        mode = session.permission_mode
+
+        # "bypass" — auto-approve everything
+        if mode == "bypass":
+            return True, ""
+
+        # "read" — only read-only tools
+        if mode == "read":
+            if tool_name in DESTRUCTIVE_TOOLS:
+                msg = (
+                    f"Permission denied: '{tool_name}' is blocked because the "
+                    f"session is in read-only mode. Ask the user to switch to "
+                    f"Ask or Bypass mode to allow file edits and commands."
+                )
+                await self._send_message(session.id, f"\n\n⚠️ {msg}\n")
+                return False, msg
+            return True, ""
+
+        # "ask" — read-only tools auto-approved, destructive tools need approval
+        if tool_name not in DESTRUCTIVE_TOOLS:
+            return True, ""
+
+        # Request permission via ACP request_permission
+        tc_update = acp.update_tool_call(
+            tool_call_id=tool_call_id,
+            status="pending",
+        )
+        opts = [
+            PermissionOption(
+                option_id="allow",
+                kind="allow_once",
+                name=f"Allow {tool_name}",
+            ),
+            PermissionOption(
+                option_id="reject",
+                kind="reject_once",
+                name="Deny",
+            ),
+        ]
+        resp = await self._conn.request_permission(
+            options=opts,
+            session_id=session.id,
+            tool_call=tc_update,
+        )
+
+        outcome = resp.outcome
+        if outcome.outcome == "selected" and outcome.option_id == "allow":
+            return True, ""
+
+        # User denied
+        msg = f"User denied the request to run '{tool_name}'."
+        await self._send_message(session.id, f"\n\n🚫 {msg}\n")
+        return False, msg
 
     # ------------------------------------------------------------------
     # Context compaction
@@ -693,6 +799,7 @@ class GlmAcpAgent(acp.Agent):
         )
 
     def _build_thought_option(self, session: Session) -> SessionConfigOptionSelect:
+        levels = thought_levels_for_model(session.model)
         return SessionConfigOptionSelect(
             id="thought_level",
             name="Reasoning",
@@ -706,7 +813,52 @@ class GlmAcpAgent(acp.Agent):
                     name=info["name"],
                     description=info["description"],
                 )
-                for level_id, info in THOUGHT_LEVELS.items()
+                for level_id, info in levels.items()
+            ],
+        )
+
+    def _build_permission_option(self, session: Session) -> SessionConfigOptionSelect:
+        return SessionConfigOptionSelect(
+            id="permission_mode",
+            name="Permissions",
+            description="Tool execution permission mode",
+            category="permissions",
+            type="select",
+            current_value=session.permission_mode,
+            options=[
+                SessionConfigSelectOption(
+                    value="ask",
+                    name="Ask",
+                    description="Approve file edits and commands before they run",
+                ),
+                SessionConfigSelectOption(
+                    value="read",
+                    name="Read Only",
+                    description="Block all file edits and commands — read-only mode",
+                ),
+                SessionConfigSelectOption(
+                    value="bypass",
+                    name="Bypass",
+                    description="Auto-approve everything — no prompts",
+                ),
+            ],
+        )
+
+        levels = thought_levels_for_model(session.model)
+        return SessionConfigOptionSelect(
+            id="thought_level",
+            name="Reasoning",
+            description="Live reasoning trace level",
+            category="thought_level",
+            type="select",
+            current_value=session.thought_level,
+            options=[
+                SessionConfigSelectOption(
+                    value=level_id,
+                    name=info["name"],
+                    description=info["description"],
+                )
+                for level_id, info in levels.items()
             ],
         )
 

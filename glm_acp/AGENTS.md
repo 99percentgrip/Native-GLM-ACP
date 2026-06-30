@@ -62,7 +62,29 @@ and crashes the turn.
 
 Session config options advertised to the client:
 - `model` (category: `model`) — GLM model selector
-- `thought_level` (category: `thought_level`) — reasoning on/off
+- `model` (category: `model`) — GLM model selector
+- `thought_level` (category: `thought_level`) — reasoning depth: Off / Standard (all models); Deep · High / Deep · Max (GLM-5.2 only, maps to `reasoning_effort: high|max`)
+- `permission_mode` (category: `permissions`) — tool execution permission: Ask / Read Only / Bypass
+
+### Deep Thinking (GLM-5.2)
+
+GLM-5.2 supports `reasoning_effort` as a top-level API parameter (values:
+`"high"`, `"max"`). The `thought_level` config option maps the UI selection to
+both `thinking.type` and `reasoning_effort` in the API request body. When the
+model is switched away from GLM-5.2, deep levels are hidden and the thought
+level falls back to Standard automatically.
+
+### Permission system
+
+Destructive tools (`write_file`, `edit_file`, `run_command`) are gated by the
+session's `permission_mode`:
+- **Ask** — read-only tools run freely; destructive tools trigger a
+  `session/request_permission` round-trip so Zed can show an approval dialog
+- **Read Only** — destructive tools are blocked entirely; the model is told
+  why and can adapt
+- **Bypass** — all tools auto-approved, no prompts
+
+Permission state is stored per-session and persisted to disk.
 
 ### Sandbox
 

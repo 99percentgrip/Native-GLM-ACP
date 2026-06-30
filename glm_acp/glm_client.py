@@ -49,9 +49,10 @@ class StreamResult:
 class GlmClient:
     """Low-level streaming client for the Z.ai BigModel API."""
 
-    def __init__(self, model: str = "glm-4.6", thought_level: str = "enabled"):
+    def __init__(self, model: str = "glm-4.6", thought_level: str = "enabled", reasoning_effort: str | None = None):
         self.model = model
         self.thought_level = thought_level
+        self.reasoning_effort = reasoning_effort
         self._api_key = get_api_key()
         self._client = httpx.AsyncClient(
             base_url=os.environ.get("ZAI_BASE_URL", DEFAULT_BASE_URL),
@@ -172,6 +173,8 @@ class GlmClient:
             "max_tokens": DEFAULT_MAX_TOKENS,
             "thinking": {"type": self.thought_level},
         }
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
         if tools:
             body["tools"] = tools
 

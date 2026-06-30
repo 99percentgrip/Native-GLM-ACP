@@ -14,7 +14,8 @@ features. This ACP agent does:
 - **Context compaction** — auto-summarizes older messages when approaching the context window limit (Claude Code–style compaction), so long conversations don't hit context errors
 - **Usage reporting** — sends live token usage to Zed's context bar via `UsageUpdate` notifications
 - **Model selector** — switch between GLM models in the panel (config option, `model` category)
-- **Reasoning toggle** — turn thinking on/off per session (config option, `thought_level` category)
+- **Deep Thinking** — GLM-5.2 supports Deep · High and Deep · Max reasoning levels via `reasoning_effort` (config option, `thought_level` category)
+- **Permission modes** — Ask (approve edits/commands before they run), Read Only (block all writes), or Bypass (auto-approve everything) (config option, `permissions` category)
 
 ## Install
 

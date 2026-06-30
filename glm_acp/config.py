@@ -90,16 +90,54 @@ MODELS: dict[str, dict[str, str]] = {
     },
 }
 
-THOUGHT_LEVELS: dict[str, dict[str, str]] = {
+from typing import Any
+
+THOUGHT_LEVELS: dict[str, dict[str, Any]] = {
     "disabled": {
         "name": "Off",
         "description": "No reasoning — fast responses for simple tasks",
+        "thinking_type": "disabled",
+        "reasoning_effort": None,
+        "models": None,  # None = all models
     },
     "enabled": {
-        "name": "On",
+        "name": "Standard",
         "description": "Full reasoning traces streamed live",
+        "thinking_type": "enabled",
+        "reasoning_effort": None,
+        "models": None,
+    },
+    "high": {
+        "name": "Deep · High",
+        "description": "Deeper multi-step reasoning for complex tasks (GLM-5.2 only)",
+        "thinking_type": "enabled",
+        "reasoning_effort": "high",
+        "models": ["glm-5.2"],
+    },
+    "max": {
+        "name": "Deep · Max",
+        "description": "Maximum reasoning depth — deepest analysis (GLM-5.2 only)",
+        "thinking_type": "enabled",
+        "reasoning_effort": "max",
+        "models": ["glm-5.2"],
     },
 }
+
+
+def thought_levels_for_model(model: str) -> dict[str, dict[str, Any]]:
+    """Return the subset of thought levels available for the given model."""
+    return {
+        k: v
+        for k, v in THOUGHT_LEVELS.items()
+        if v["models"] is None or model in v["models"]
+    }
+
+
+# Tools that modify the filesystem or execute commands — these require
+# user permission when the session is in "ask" mode and are blocked in
+# "read" mode.
+DESTRUCTIVE_TOOLS = frozenset({"write_file", "edit_file", "run_command"})
+READ_ONLY_TOOLS = frozenset({"read_file", "list_directory", "search_files", "grep"})
 
 
 def get_api_key() -> str:
