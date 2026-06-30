@@ -66,8 +66,9 @@ from .tools import TOOL_DEFINITIONS, TOOL_KINDS, Sandbox, ToolError, execute_too
 logger = logging.getLogger("glm_acp")
 
 SYSTEM_PROMPT_TEMPLATE = """\
-You are an expert software engineer working inside the user's editor via ACP.
-You have tools to read, write, and edit files, search code, and run commands.
+You are {model_name}, an expert software engineer working inside the user's \
+editor via ACP. You have tools to read, write, and edit files, search code, \
+and run commands.
 
 Rules:
 - Read files before editing them. Understand the codebase structure first.
@@ -88,8 +89,10 @@ Project context:
 {project_context}
 """
 
-def build_system_prompt(cwd: str) -> str:
-    """Build the system prompt with auto-detected project context."""
+def build_system_prompt(cwd: str, model: str = DEFAULT_MODEL) -> str:
+    """Build the system prompt with auto-detected project context and model identity."""
+    from .config import MODELS
+    model_name = MODELS.get(model, {}).get("name", model)
     context_parts: list[str] = []
 
     # Detect language / framework
@@ -133,7 +136,7 @@ def build_system_prompt(cwd: str) -> str:
         context_parts.append("- Version control: git")
 
     project_context = "\n".join(context_parts) if context_parts else "(no project files detected)"
-    return SYSTEM_PROMPT_TEMPLATE.format(project_context=project_context)
+    return SYSTEM_PROMPT_TEMPLATE.format(project_context=project_context, model_name=model_name)
 
 MODE_LIST = [
     SessionMode(id="ask", name="Ask", description="Answer questions and read files without making changes"),
@@ -168,7 +171,7 @@ class Session:
         # Current task plan — list of PlanEntry-like dicts
         self.plan: list[dict[str, str]] = []
         self.messages: list[dict[str, Any]] = [
-            {"role": "system", "content": build_system_prompt(cwd)},
+            {"role": "system", "content": build_system_prompt(cwd, self.model)},
         ]
         # Token tracking — updated after each API call
         self.context_size: int = CONTEXT_WINDOW_TOKENS.get(self.model, 1_000_000)
@@ -621,7 +624,8 @@ class GlmAcpAgent(acp.Agent):
             return PromptResponse(stop_reason="cancelled")
         except Exception as e:
             logger.exception("Prompt turn failed")
-            await self._send_message(session.id, f"\n\n**Error:** {e}")
+            friendly = self._friendly_error(e, session)
+            await self._send_message(session.id, f"\n\n**Error:** {friendly}")
             return PromptResponse(stop_reason="end_turn")
         finally:
             # Persist the updated conversation so it survives restarts.
@@ -950,6 +954,10 @@ class GlmAcpAgent(acp.Agent):
                 description="Show a git diff of all changes made during this session",
             ),
             AvailableCommand(
+                name="export",
+                description="Export the conversation as a Markdown file",
+            ),
+            AvailableCommand(
                 name="status",
                 description="Show current model, plan, API endpoint, permission mode, and context usage",
             ),
@@ -1031,6 +1039,43 @@ class GlmAcpAgent(acp.Agent):
             except Exception as e:
                 return f"❌ Error running git diff: {e}"
 
+        elif command == "/export":
+            from datetime import datetime
+            lines: list[str] = [
+                f"# Conversation Export",
+                f"",
+                f"- **Model:** {session.model}",
+                f"- **API Plan:** {API_ENDPOINTS.get(session.api_endpoint, {}).get('name', session.api_endpoint)}",
+                f"- **Exported:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"- **Total usage:** {session.total_input_tokens:,} input + {session.total_output_tokens:,} output tokens",
+                f"",
+                f"---",
+                f"",
+            ]
+            for msg in session.messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                if role == "system":
+                    continue
+                elif role == "user":
+                    lines.append(f"## 👤 User\n\n{content}\n")
+                elif role == "assistant":
+                    if msg.get("tool_calls"):
+                        tc_names = [tc.get("function", {}).get("name", "?") for tc in msg["tool_calls"]]
+                        lines.append(f"## 🤖 Assistant _(tools: {', '.join(tc_names)})_\n\n{content or '*(no text)*'}\n")
+                    else:
+                        lines.append(f"## 🤖 Assistant\n\n{content}\n")
+                elif role == "tool":
+                    lines.append(f"<details><summary>🔧 Tool result</summary>\n\n```\n{content[:2000]}\n```\n\n</details>\n")
+            md_text = "\n".join(lines)
+            export_path = Path(session.cwd) / f"conversation_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+            export_path.write_text(md_text, encoding="utf-8")
+            return f"📄 Conversation exported to: `{export_path}`"
+
         elif command == "/status":
             n_msgs = len(session.messages)
             return (
@@ -1048,7 +1093,7 @@ class GlmAcpAgent(acp.Agent):
             )
 
         else:
-            return f"Unknown command: {command}\nAvailable commands: /compact, /clear-plan, /clear-history, /diff, /status"
+            return f"Unknown command: {command}\nAvailable commands: /compact, /clear-plan, /clear-history, /diff, /export, /status"
 
     # ------------------------------------------------------------------
     # Context compaction
@@ -1316,6 +1361,48 @@ class GlmAcpAgent(acp.Agent):
             content=[acp.tool_content(acp.text_block(error[:2000]))],
         )
         await self._conn.session_update(session_id=session_id, update=chunk)
+
+    def _friendly_error(self, error: Exception, session: Session) -> str:
+        """Convert raw exceptions into user-friendly error messages."""
+        error_str = str(error)
+
+        # GlmApiError with status code
+        if hasattr(error, "status_code"):
+            code = error.status_code
+            if code == 401:
+                return ("🔐 **Authentication failed.** Your API key is invalid or expired. "
+                        "Get a new key at https://z.ai/ and update `ZAI_API_KEY` in Zed settings.")
+            elif code == 429:
+                return ("⏳ **Rate limited.** The API is throttling requests. "
+                        "Wait a moment and try again, or switch to a different model.")
+            elif code == 1301:
+                return ("🚫 **Content filtered.** The Z.ai content filter blocked this request. "
+                        "This is often a false positive — try rephrasing your request.")
+            elif code == 1311:
+                return ("💳 **Plan limitation.** Your subscription doesn't include this model. "
+                        "Switch to a different API plan or model in the dropdown.")
+            elif code >= 500:
+                return (f"🔧 **Z.ai server error ({code}).** This is a temporary issue on Z.ai's side. "
+                        f"The agent already retried — try again in a moment.")
+            else:
+                return f"API error {code}: {error_str[:300]}"
+
+        # Network errors
+        if "timeout" in error_str.lower() or "timed out" in error_str.lower():
+            return ("⏱ **Request timed out.** The API didn't respond in time. "
+                    "Try again, or reduce the complexity of the request.")
+
+        if "connection" in error_str.lower() or "network" in error_str.lower():
+            return ("📡 **Network error.** Could not reach the Z.ai API. "
+                    "Check your internet connection and try again.")
+
+        # API key missing
+        if "ZAI_API_KEY" in error_str:
+            return ("🔑 **No API key.** Set `ZAI_API_KEY` in the agent server's "
+                    "`env` block in Zed settings. Get a key at https://z.ai/.")
+
+        # Fallback — show the raw error but truncated
+        return error_str[:500]
 
     def _tool_title(self, name: str) -> str:
         return {

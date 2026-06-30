@@ -3,21 +3,68 @@
 A native Agent Client Protocol (ACP) server for Z.ai GLM models. Runs as a
 subprocess inside Zed's Agent Panel — no Zed recompilation required.
 
-## What this solves
+## Features
 
-The generic `openai_compatible` provider in Zed doesn't expose GLM's native
-features. This ACP agent does:
+### Core
 
-- **1M context window** — uses the native Z.ai API directly, no context cap
-- **Live reasoning traces** — `reasoning_content` streams into Zed's thinking view via `agent_thought_chunk`
-- **No mid-generation stalls** — auto-continues on `finish_reason=length` so long refactors don't stop halfway
-- **Context compaction** — auto-summarizes older messages when approaching the context window limit (Claude Code–style compaction), so long conversations don't hit context errors
-- **Usage reporting** — sends live token usage to Zed's context bar via `UsageUpdate` notifications
-- **Model selector** — switch between GLM models in the panel (config option, `model` category)
-- **Deep Thinking** — GLM-5.2 supports Deep · High and Deep · Max reasoning levels via `reasoning_effort` (config option, `thought_level` category)
-- **Permission modes** — Ask (approve edits/commands before they run), Read Only (block all writes), or Bypass (auto-approve everything) (config option, `permissions` category)
-- **API plan switcher** — switch between Coding Plan, Standard API, and BigModel endpoints from the chat dropdown (config option, `api_endpoint` category)
-- **Task plans** — the model creates a live todo list for multi-step tasks, visible as a checklist in the panel with pending/in-progress/completed states
+- **1M context window** — native Z.ai API, no context cap
+- **Live reasoning traces** — `reasoning_content` streams into Zed's thinking view
+- **No mid-generation stalls** — auto-continues on `finish_reason=length`
+- **Usage reporting** — live token usage in Zed's context bar
+- **Context compaction** — auto-summarizes older messages at 85% capacity (Claude Code–style)
+- **Persistent sessions** — conversations survive Zed restarts, replayed on load
+- **Multi-root workspaces** — full support for additional workspace directories
+
+### API Resilience
+
+- **Automatic retry** — exponential backoff (1s → 2s → 4s) on 429/500/502/503/504 and network errors
+- **Cost tracking** — cumulative input/output tokens per session, shown in `/status`
+- **Real cancellation** — the Cancel button actually aborts in-flight API requests
+- **Token estimation** — calibrated 3.5 chars/token heuristic, handles vision content blocks
+
+### Chat Dropdown Config Options
+
+All configurable from the Zed agent panel — no restart needed:
+
+| Option | Values | Description |
+|---|---|---|
+| **Model** | GLM-5.2, GLM-5-Turbo, GLM-4.7 (+ vision on Standard/BigModel) | Model list syncs to the selected API plan |
+| **Reasoning** | Off, Standard, Deep · High, Deep · Max | Deep levels are GLM-5.2 exclusive |
+| **API Plan** | Coding Plan, Standard API, BigModel (CN) | Switch endpoints; vision models appear on Standard/BigModel |
+| **Permissions** | Ask, Read Only, Bypass | Gate destructive tools (write/edit/run) |
+
+### Slash Commands
+
+Type these in the chat input:
+
+| Command | Description |
+|---|---|
+| `/compact` | Manually trigger context compaction |
+| `/clear-plan` | Clear the current task plan / todo list |
+| `/clear-history` | Wipe conversation history (keeps settings) |
+| `/diff` | Show git diff of all uncommitted changes |
+| `/export` | Export the conversation as a Markdown file |
+| `/status` | Show model, plan, context usage, cost, message count |
+
+### Task Plans
+
+For any task with 3+ steps, the model automatically creates a live todo list
+visible as a checklist in the panel. Each task shows pending / in-progress /
+completed status with priority indicators.
+
+### Project Context
+
+The system prompt auto-detects your project on session creation:
+
+- **Languages:** Python, JavaScript/TypeScript, Rust, Go, Ruby, Java
+- **Frameworks:** Next.js, React, Vue
+- **Package managers:** uv, Poetry, npm, Yarn, pnpm
+- **VCS:** git detection
+
+### Search Quality
+
+`search_files` and `grep` respect `.gitignore` patterns and always skip
+`.git`, `node_modules`, `__pycache__`, `.venv`, `dist`, `build`.
 
 ## Install
 
@@ -52,21 +99,42 @@ add to `settings.json`:
 Restart Zed, open the Agent Panel, and select **Z.ai GLM** from the agent
 dropdown.
 
+## Models
+
+| Model | Context | Plans | Use case |
+|---|---|---|---|
+| GLM-5.2 (Flagship) | 1M | All | Maximum reasoning, coding, agentic tasks (default) |
+| GLM-5-Turbo | 1M | All | Flagship optimized for speed |
+| GLM-4.7 | 1M | All | Balanced daily development |
+| GLM-4.5V (Vision) | 128K | Standard, BigModel | Screenshots, diagrams, charts |
+| GLM-4.6V (Vision) | 128K | Standard, BigModel | Newer vision model with improved OCR |
+
+## API Plans
+
+| Plan | Endpoint | Notes |
+|---|---|---|
+| Coding Plan (default) | `api.z.ai/api/coding/paas/v4` | Subscription — text models only |
+| Standard API | `api.z.ai/api/paas/v4` | Pay-as-you-go — text + vision models |
+| BigModel (CN) | `open.bigmodel.cn/api/paas/v4` | Chinese mainland endpoint |
+
+Vision model support requires Standard API or BigModel with sufficient balance.
+
 ## Architecture
 
 ```
 glm_acp/
-├── __main__.py    # Entry point — launches the ACP agent over stdio
-├── agent.py       # ACP agent: initialize, session, prompt turn loop
-├── config.py      # Model registry, API key, constants
-├── glm_client.py  # Streaming Z.ai API client (SSE, reasoning, tool calls)
-└── tools.py       # File/shell tools sandboxed to workspace roots
+├── __main__.py      # Entry point — launches the ACP agent over stdio
+├── agent.py         # ACP agent: session lifecycle, prompt loop, slash commands
+├── config.py        # Model registry, API endpoints, constants
+├── glm_client.py    # Streaming Z.ai API client (SSE, retry, reasoning, tools)
+├── session_store.py # Persistent JSON session storage (~/.glm-acp/sessions/)
+└── tools.py         # File/shell/search tools sandboxed to workspace roots
 ```
 
 ### Token flow
 
 ```
-Z.ai API ──SSE──> glm_client.py ──callbacks──> agent.py ──session/update──> Zed
+Z.ai API ──SSE──> glm_client.py ──callbacks──> agent.py ──session_update──> Zed
   │                    │                                       │
   │ reasoning_content  │ on_reasoning()                        │ agent_thought_chunk
   │ content            │ on_content()                          │ agent_message_chunk
@@ -76,90 +144,62 @@ Z.ai API ──SSE──> glm_client.py ──callbacks──> agent.py ──se
   │                    │ ◄── summarize_messages() ─────────────┘ (compaction)
 ```
 
-Reasoning never touches file output — it flows exclusively into
-`agent_thought_chunk` updates, which Zed renders in the collapsible thinking
-view. Code content goes to `agent_message_chunk`. Token usage from the API
-is reported back to Zed via `usage_update`.
-
 ### Context compaction
 
-When estimated token usage exceeds **85%** of the model's context window:
+When token usage exceeds **85%** of the context window:
 
-1. The **system prompt** is preserved verbatim.
-2. The **4 most recent messages** are kept verbatim.
-3. **All older messages** are sent to a dedicated summarization API call
-   (disabled thinking, structured summary prompt).
-4. The summary is wrapped in `<conversation_summary>` tags and inserted as
-   a user message between the system prompt and the preserved recent messages.
+1. System prompt preserved verbatim
+2. 4 most recent messages kept (boundary adjusted to never split tool-call pairs)
+3. Older messages summarized via a dedicated API call
+4. Summary wrapped in `<conversation_summary>` tags
 
-This mirrors Claude Code's compaction strategy: summarize the past, keep
-the present.
+### Session persistence
 
-## Troubleshooting
-
-### Agent crashes with `UsageUpdate` validation error
-
-If you see something like:
-
-```
-Error: 1 validation error for UsageUpdate
-sessionUpdate
-  Field required [type=missing, input_value={'size': 1000000, 'used': 888}, input_type=dict]
-```
-
-This means the `UsageUpdate` model is being constructed without the required
-`session_update` discriminant field. The ACP protocol requires every session
-update to carry a `session_update` field identifying the update type.
-
-**Fix:** Ensure `_report_usage()` in `agent.py` passes
-`session_update="usage_update"` when constructing the `UsageUpdate`:
-
-```python
-update = UsageUpdate(
-    session_update="usage_update",
-    size=session.context_size,
-    used=used,
-)
-```
-
-### Agent crashes on startup (API key)
-
-If the agent fails immediately, make sure `ZAI_API_KEY` is set in the agent
-server's `env` block in Zed's `settings.json`. Get a key at https://z.ai/.
-
-## Models
-
-| Model | Context | Use case |
-|---|---|---|
-| GLM-5.2 (Flagship) | 1M | Maximum reasoning, coding, and long-horizon agentic tasks (default) |
-| GLM-5-Turbo | 1M | Flagship model optimized for speed — complex tasks with lower latency |
-| GLM-4.7 | 1M | Balanced model for daily development and routine tasks |
-
-## API Plans
-
-Switch from the chat dropdown (**API Plan** selector):
-
-| Plan | Endpoint | Notes |
-|---|---|---|
-| Coding Plan (default) | `api.z.ai/api/coding/paas/v4` | Included with GLM Coding Plan subscription — GLM-5.2, 5-Turbo, 4.7 |
-| Standard API | `api.z.ai/api/paas/v4` | Pay-as-you-go — broader model access including vision models |
-| BigModel (CN) | `open.bigmodel.cn/api/paas/v4` | Chinese mainland endpoint |
-
-The plan determines which models and features are available. Vision model
-support (glm-4.5v, etc.) requires the Standard API or BigModel plan with
-sufficient balance.
+- State saved to `~/.glm-acp/sessions/<session-id>.json` after every turn
+- On restart, `load_session` / `resume_session` replays history + plan + config
+- Sessions listed in Zed's history sidebar via `session/list`
+- Fork support: duplicate a session to experiment with different approaches
 
 ## Tools
 
-The agent exposes these tools to the model:
+| Tool | Description |
+|---|---|
+| `read_file` | Read file contents (with optional line range) |
+| `write_file` | Create or overwrite a file |
+| `edit_file` | Find-and-replace a unique text block |
+| `list_directory` | List directory entries |
+| `search_files` | Glob pattern search (`.gitignore`-aware) |
+| `grep` | Regex content search (`.gitignore`-aware) |
+| `run_command` | Shell execution for builds, tests, git |
+| `update_plan` | Create/update the task plan checklist |
 
-- `read_file`, `write_file`, `edit_file` — file operations (sandboxed)
-- `list_directory`, `search_files`, `grep` — code exploration
-- `run_command` — shell execution for builds, tests, git
-- `update_plan` — create/update a task plan (todo checklist) shown in the panel
+All file paths are validated against workspace roots. `update_plan` is
+available in both Ask and Code modes.
 
-All file paths are validated against the session's working directory and
-additional workspace roots.
+## Testing
+
+```bash
+cd /path/to/glm-acp
+.venv/bin/python3 -m pytest tests/ -v
+```
+
+## Troubleshooting
+
+### Agent crashes on startup (API key)
+
+Make sure `ZAI_API_KEY` is set in the agent server's `env` block in Zed's
+`settings.json`. Get a key at https://z.ai/.
+
+### Vision models return content filter errors
+
+The Coding Plan endpoint applies a strict content filter on image inputs.
+Switch to **Standard API** in the API Plan dropdown and ensure you have
+balance on your Z.ai account.
+
+### Rate limit errors (429)
+
+The agent automatically retries with exponential backoff (3 attempts). If
+errors persist, the model will receive the error and can inform the user.
 
 ## License
 

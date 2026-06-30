@@ -202,7 +202,6 @@ def models_for_plan(plan: str) -> dict[str, dict[str, Any]]:
 # user permission when the session is in "ask" mode and are blocked in
 # "read" mode.
 DESTRUCTIVE_TOOLS = frozenset({"write_file", "edit_file", "run_command"})
-READ_ONLY_TOOLS = frozenset({"read_file", "list_directory", "search_files", "grep"})
 
 
 def get_api_key() -> str:
