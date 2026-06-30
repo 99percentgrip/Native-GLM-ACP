@@ -6,7 +6,9 @@ assembly, and automatic continuation when the model hits finish_reason=length.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -36,6 +38,9 @@ class GlmApiError(RuntimeError):
     def __init__(self, status_code: int, message: str) -> None:
         self.status_code = status_code
         super().__init__(f"GLM API error {status_code}: {message}")
+
+
+logger = logging.getLogger("glm_acp")
 
 
 @dataclass
@@ -147,7 +152,6 @@ class GlmClient:
             body["thinking"] = {"type": "disabled"}
 
         # Retry with exponential backoff
-        import asyncio
         last_error: Exception | None = None
         for attempt in range(MAX_RETRIES + 1):
             resp = await self._client.post("/chat/completions", json=body)
@@ -225,7 +229,6 @@ class GlmClient:
             body["tools"] = tools
 
         # --- Retry with exponential backoff on transient errors ---
-        last_error: Exception | None = None
         for attempt in range(MAX_RETRIES + 1):
             if self._cancelled:
                 return
@@ -234,23 +237,28 @@ class GlmClient:
                 await self._execute_stream(body, result, on_reasoning, on_content, on_tool_call_started)
                 return  # success
             except GlmApiError as e:
-                last_error = e
                 if e.status_code not in RETRYABLE_STATUS_CODES or attempt == MAX_RETRIES:
                     raise
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
-                import logging
-                logging.getLogger("glm_acp").warning(
+                logger.warning(
                     "API error %d, retrying in %.1fs (attempt %d/%d)",
                     e.status_code, delay, attempt + 1, MAX_RETRIES,
                 )
-                import asyncio
+                # Clear partial results from the failed attempt so retry
+                # doesn't produce duplicate content
+                result.content = ""
+                result.reasoning = ""
+                result.tool_calls = []
+                result.finish_reason = ""
                 await asyncio.sleep(delay)
             except httpx.TransportError as e:
-                last_error = e
                 if attempt == MAX_RETRIES:
                     raise RuntimeError(f"Network error after {MAX_RETRIES} retries: {e}")
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
-                import asyncio
+                result.content = ""
+                result.reasoning = ""
+                result.tool_calls = []
+                result.finish_reason = ""
                 await asyncio.sleep(delay)
 
     async def _execute_stream(

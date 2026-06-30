@@ -47,7 +47,6 @@ from acp.schema import (
 
 from .config import (
     API_ENDPOINTS,
-    CHARS_PER_TOKEN,
     COMPACTION_KEEP_RECENT,
     COMPACTION_THRESHOLD,
     CONTEXT_WINDOW_TOKENS,
@@ -196,6 +195,8 @@ class Session:
             "permission_mode": self.permission_mode,
             "plan": self.plan,
             "messages": self.messages,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
         }
 
     @classmethod
@@ -215,6 +216,8 @@ class Session:
         session.plan = data.get("plan", [])
         session.title = data.get("title")
         session.permission_mode = data.get("permission_mode", "ask")
+        session.total_input_tokens = data.get("total_input_tokens", 0)
+        session.total_output_tokens = data.get("total_output_tokens", 0)
         messages = data.get("messages")
         if messages:
             session.messages = messages
@@ -445,13 +448,12 @@ class GlmAcpAgent(acp.Agent):
         additional_directories: list[str] | None = None,
         mcp_servers: Any = None,
         **kwargs: Any,
-    ) -> Any:
+    ) -> ForkSessionResponse:
         """Fork a session — copy all state to a new session ID.
 
         The new session gets a copy of the conversation history, plan,
         and config so the user can experiment with a different approach.
         """
-        from acp.schema import ForkSessionResponse
         parent = self._sessions.get(session_id)
         if not parent:
             raise RuntimeError(f"Cannot fork: session {session_id} not found")
@@ -1003,25 +1005,28 @@ class GlmAcpAgent(acp.Agent):
             return "🧹 Conversation history cleared."
 
         elif command == "/diff":
-            import subprocess
             try:
-                result = subprocess.run(
-                    ["git", "diff", "--stat"],
-                    capture_output=True, text=True, timeout=10,
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "diff", "--stat",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                     cwd=session.cwd,
                 )
-                if result.returncode != 0:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=10)
+                if proc.returncode != 0:
                     return "❌ Not a git repository or git error."
-                output = result.stdout.strip()
+                output = stdout_b.decode().strip()
                 if not output:
                     return "✅ No uncommitted changes in the working tree."
                 # Get full diff too
-                result_full = subprocess.run(
-                    ["git", "diff"],
-                    capture_output=True, text=True, timeout=10,
+                proc_full = await asyncio.create_subprocess_exec(
+                    "git", "diff",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                     cwd=session.cwd,
                 )
-                summary = result_full.stdout.strip()[:4000]
+                stdout_f, _ = await asyncio.wait_for(proc_full.communicate(), timeout=10)
+                summary = stdout_f.decode().strip()[:4000]
                 return f"\n📝 **Git diff**\n\n```\n{output}\n```\n\n<details><summary>Full diff</summary>\n\n```diff\n{summary}\n```\n\n</details>"
             except Exception as e:
                 return f"❌ Error running git diff: {e}"
@@ -1243,22 +1248,6 @@ class GlmAcpAgent(acp.Agent):
         """Echo a user message back to the UI (for slash commands)."""
         chunk = acp.update_user_message_text(text)
         await self._conn.session_update(session_id=session_id, update=chunk)
-
-    @staticmethod
-    def _format_image_prompt(
-        images: list[dict[str, str]], saved_paths: list[str]
-    ) -> str:
-        """Build a content string for vision models referencing saved images.
-
-        The actual image data is sent via a special message format in the
-        API call (see _build_vision_messages).  This text is just a
-        human-readable annotation for the model.
-        """
-        parts = ["\n\n[The user shared the following images:]"]
-        for path in saved_paths:
-            parts.append(f"\n  - {path}")
-        parts.append("\n\nPlease analyze the image(s) above.")
-        return "".join(parts)
 
     async def _send_session_info(self, session: Session) -> None:
         """Notify the client of the session title for its history sidebar."""
