@@ -37,6 +37,7 @@ from acp.schema import (
     SessionListCapabilities,
     SessionMode,
     SessionModeState,
+    SessionAdditionalDirectoriesCapabilities,
     SessionResumeCapabilities,
     SetSessionConfigOptionResponse,
     UsageUpdate,
@@ -197,6 +198,7 @@ class GlmAcpAgent(acp.Agent):
                     list=SessionListCapabilities(),
                     resume=SessionResumeCapabilities(),
                     close=SessionCloseCapabilities(),
+                    additional_directories=SessionAdditionalDirectoriesCapabilities(),
                 ),
             ),
             agent_info=Implementation(
