@@ -22,6 +22,7 @@ from .config import (
     DEFAULT_TIMEOUT,
     MAX_AUTO_CONTINUATIONS,
     MAX_TOKENS_BY_MODEL,
+    VISION_MODELS,
     get_api_key,
 )
 
@@ -55,7 +56,7 @@ class GlmClient:
         self.reasoning_effort = reasoning_effort
         self._api_key = get_api_key()
         self._client = httpx.AsyncClient(
-            base_url=base_url or os.environ.get("ZAI_BASE_URL", DEFAULT_BASE_URL),
+            base_url=base_url or os.environ.get("ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4"),
             headers={"Authorization": f"Bearer {self._api_key}"},
             timeout=httpx.Timeout(DEFAULT_TIMEOUT, read=DEFAULT_TIMEOUT),
         )
@@ -176,10 +177,14 @@ class GlmClient:
             "messages": messages,
             "stream": True,
             "max_tokens": max_tokens,
-            "thinking": {"type": self.thought_level},
         }
-        if self.reasoning_effort:
-            body["reasoning_effort"] = self.reasoning_effort
+        # Thinking / reasoning_effort only applies to text reasoning models,
+        # not vision models.
+        is_vision = self.model in VISION_MODELS
+        if not is_vision:
+            body["thinking"] = {"type": self.thought_level}
+            if self.reasoning_effort:
+                body["reasoning_effort"] = self.reasoning_effort
         if tools:
             body["tools"] = tools
 

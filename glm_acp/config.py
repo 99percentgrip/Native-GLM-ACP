@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 DEFAULT_MODEL = "glm-5.2"
 DEFAULT_TIMEOUT = 180
@@ -12,6 +13,10 @@ MAX_AUTO_CONTINUATIONS = 20
 # Per-model max_tokens limits.  Models not listed here fall back to
 # DEFAULT_MAX_TOKENS.
 MAX_TOKENS_BY_MODEL: dict[str, int] = {}
+
+# Vision models (models with a "v" suffix). These support image inputs
+# but do not support thinking / reasoning_effort.
+VISION_MODELS = frozenset({"glm-4.5v", "glm-4.6v"})
 
 # --- API endpoints (plans) ---
 # The user can switch between these from the chat dropdown so they're not
@@ -52,6 +57,8 @@ CONTEXT_WINDOW_TOKENS: dict[str, int] = {
     "glm-5.2": 1_000_000,
     "glm-5-turbo": 1_000_000,
     "glm-4.7": 1_000_000,
+    "glm-4.5v": 131_072,
+    "glm-4.6v": 131_072,
 }
 
 COMPACTION_SYSTEM_PROMPT = """\
@@ -130,8 +137,6 @@ MODELS: dict[str, dict[str, Any]] = {
     },
 }
 
-from typing import Any
-
 THOUGHT_LEVELS: dict[str, dict[str, Any]] = {
     "disabled": {
         "name": "Off",
@@ -165,7 +170,13 @@ THOUGHT_LEVELS: dict[str, dict[str, Any]] = {
 
 
 def thought_levels_for_model(model: str) -> dict[str, dict[str, Any]]:
-    """Return the subset of thought levels available for the given model."""
+    """Return the subset of thought levels available for the given model.
+
+    Vision models don't support thinking — only 'disabled' is available.
+    Deep reasoning levels are restricted to models that list them.
+    """
+    if model in VISION_MODELS:
+        return {"disabled": THOUGHT_LEVELS["disabled"]}
     return {
         k: v
         for k, v in THOUGHT_LEVELS.items()

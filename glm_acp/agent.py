@@ -53,6 +53,7 @@ from .config import (
     DESTRUCTIVE_TOOLS,
     MODELS,
     THOUGHT_LEVELS,
+    VISION_MODELS,
     models_for_plan,
     thought_levels_for_model,
 )
@@ -429,26 +430,31 @@ class GlmAcpAgent(acp.Agent):
         # Extract images and text from the ACP prompt blocks.
         content, images = self._extract_prompt_parts(prompt)
 
-        # GLM-5.2 / GLM-4.7 are text-only models on the Coding Plan.  The
-        # Coding Plan does NOT include direct vision model API access.
-        # When the user pastes a screenshot, save it to disk so it's
-        # preserved and the model (or Vision MCP Server) can reference it.
+        # Text-only models can't process images. Vision models can.
+        is_vision_model = session.model in VISION_MODELS
+
         if images:
             saved_paths = await self._save_images(session, images)
-            file_note = (
-                f"\n\n[The user shared {len(images)} screenshot"
-                f"{'s' if len(images) > 1 else ''}. "
-                f"Saved to: {', '.join(saved_paths)}. "
-                f"Note: GLM-5.2 is a text-only model and cannot view images "
-                f"directly. To analyze screenshots, enable the Z.ai Vision MCP "
-                f"Server or describe the screenshot in text.]"
-            )
-            content = (content or "") + file_note
-            await self._send_message(
-                session.id,
-                f"\n\n📸 Screenshot saved to: {', '.join(saved_paths)}\n"
-                f"_GLM-5.2 is text-only — use the Vision MCP Server to analyze images._\n",
-            )
+            if is_vision_model:
+                # Vision model: pass image data inline so the model can see it
+                content = (content or "") + self._format_image_prompt(images, saved_paths)
+            else:
+                # Text-only model: save to disk, tell the user
+                file_note = (
+                    f"\n\n[The user shared {len(images)} screenshot"
+                    f"{'s' if len(images) > 1 else ''}. "
+                    f"Saved to: {', '.join(saved_paths)}. "
+                    f"Note: {session.model} is a text-only model and cannot view "
+                    f"images directly. To analyze screenshots, enable the Z.ai Vision "
+                    f"MCP Server or describe the screenshot in text.]"
+                )
+                content = (content or "") + file_note
+                await self._send_message(
+                    session.id,
+                    f"\n\n📸 Screenshot saved to: {', '.join(saved_paths)}\n"
+                    f"_{session.model} is text-only — switch to a Vision model "
+                    f"or use the Vision MCP Server to analyze images._\n",
+                )
 
         session.messages.append({"role": "user", "content": content})
 
@@ -488,7 +494,7 @@ class GlmAcpAgent(acp.Agent):
         )
         tools = TOOL_DEFINITIONS if session.mode == "code" else [
             t for t in TOOL_DEFINITIONS
-            if t["function"]["name"] in ("read_file", "list_directory", "search_files", "grep")
+            if t["function"]["name"] in ("read_file", "list_directory", "search_files", "grep", "update_plan")
         ]
 
         try:
@@ -531,6 +537,7 @@ class GlmAcpAgent(acp.Agent):
 
                     # --- Plan tool: handled in-agent, not via sandbox ---
                     if tool_name == "update_plan":
+                        await self._complete_tool(session.id, tc_id, "Plan updated.")
                         output = await self._handle_update_plan(session, tc_id, tool_args)
                         session.messages.append({
                             "role": "tool",
@@ -909,6 +916,21 @@ class GlmAcpAgent(acp.Agent):
         chunk = acp.update_agent_message_text(text)
         await self._conn.session_update(session_id=session_id, update=chunk)
 
+    @staticmethod
+    def _format_image_prompt(
+        images: list[dict[str, str]], saved_paths: list[str]
+    ) -> str:
+        """Build a content string for vision models that includes image URLs.
+
+        Vision models accept image_url content blocks in the messages API.
+        We reference the saved file paths so the model can access them.
+        """
+        parts = ["\n\n[The user shared the following images:]"]
+        for path in saved_paths:
+            parts.append(f"\n  - {path}")
+        parts.append("\n\nPlease analyze the image(s) above.")
+        return "".join(parts)
+
     async def _send_session_info(self, session: Session) -> None:
         """Notify the client of the session title for its history sidebar."""
         update = SessionInfoUpdate(
@@ -986,6 +1008,7 @@ class GlmAcpAgent(acp.Agent):
             "search_files": "Searching files",
             "grep": "Searching code",
             "run_command": "Running command",
+            "update_plan": "Updating plan",
         }.get(name, name)
 
     def _build_model_option(self, session: Session) -> SessionConfigOptionSelect:
