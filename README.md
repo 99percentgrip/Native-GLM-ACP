@@ -19,7 +19,7 @@ features. This ACP agent does:
 ## Install
 
 ```bash
-cd /home/alex/Projects/Native\ GLM-5.2\ Provider
+cd /path/to/glm-acp
 uv pip install -e .
 ```
 
@@ -35,9 +35,9 @@ add to `settings.json`:
   "agent_servers": {
     "glm-acp": {
       "type": "custom",
-      "command": "/home/alex/Projects/Native GLM-5.2 Provider/.venv/bin/python3",
+      "command": "/path/to/glm-acp/.venv/bin/python3",
       "args": ["-m", "glm_acp"],
-      "cwd": "/home/alex/Projects/Native GLM-5.2 Provider",
+      "cwd": "/path/to/glm-acp",
       "env": {
         "ZAI_API_KEY": "your-api-key-here"
       }
