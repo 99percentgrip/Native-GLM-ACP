@@ -320,6 +320,15 @@ class GlmClient:
 
                 choices = chunk.get("choices", [])
                 if not choices:
+                    # Still check for usage — Z.ai sends it in a separate
+                    # final chunk with empty choices.
+                    usage = chunk.get("usage")
+                    if usage:
+                        result.usage = {
+                            "input_tokens": usage.get("prompt_tokens", 0),
+                            "output_tokens": usage.get("completion_tokens", 0),
+                            "total_tokens": usage.get("total_tokens", 0),
+                        }
                     continue
                 delta = choices[0].get("delta", {})
                 finish = choices[0].get("finish_reason")
