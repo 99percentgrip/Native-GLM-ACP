@@ -72,11 +72,12 @@ class TestGlmClientInit:
         assert "include_usage" in src
 
     def test_retry_clears_results(self):
-        """Retry should clear partial StreamResult fields."""
+        """Retry should clear partial StreamResult fields including usage."""
         import inspect
         src = inspect.getsource(GlmClient._do_stream_request)
         assert 'result.content = ""' in src
         assert "result.tool_calls = []" in src
+        assert "result.usage = None" in src
 
     def test_retry_count(self):
         """Should retry MAX_RETRIES + 1 times."""
@@ -96,3 +97,34 @@ class TestGlmClientInit:
         import inspect
         src = inspect.getsource(GlmClient._execute_stream)
         assert "self._cancelled" in src
+
+
+# ============================================================
+# Summarize robustness
+# ============================================================
+
+class TestSummarizeRobustness:
+    def test_summarize_handles_non_json_response(self):
+        """summarize_messages should handle non-JSON 200 response gracefully."""
+        import inspect
+        src = inspect.getsource(GlmClient.summarize_messages)
+        # Must have a try/except around resp.json()
+        assert "except Exception" in src or "json.JSONDecodeError" in src
+
+    def test_summarize_returns_fallback_on_empty_choices(self):
+        """Should return fallback message when choices is empty."""
+        import inspect
+        src = inspect.getsource(GlmClient.summarize_messages)
+        assert "no summary" in src.lower()
+
+
+# ============================================================
+# Error body decode robustness
+# ============================================================
+
+class TestErrorBodyDecode:
+    def test_execute_stream_uses_replace_on_error_decode(self):
+        """Error response body decode should use errors=replace."""
+        import inspect
+        src = inspect.getsource(GlmClient._execute_stream)
+        assert 'errors="replace"' in src or "errors='replace'" in src

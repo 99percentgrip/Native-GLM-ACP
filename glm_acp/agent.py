@@ -1345,7 +1345,15 @@ class GlmAcpAgent(acp.Agent):
 
             filename = f"screenshot_{timestamp}_{i}.{ext}"
             filepath = img_dir / filename
-            filepath.write_bytes(base64.b64decode(img["data"]))
+            raw_data = img.get("data")
+            if not raw_data:
+                logger.warning("Image %d has no data — skipping", i)
+                continue
+            try:
+                filepath.write_bytes(base64.b64decode(raw_data))
+            except Exception as e:
+                logger.warning("Failed to decode/save image %d: %s", i, e)
+                continue
             saved.append(str(filepath))
             logger.info("Saved pasted image to %s", filepath)
 

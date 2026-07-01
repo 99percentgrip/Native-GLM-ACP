@@ -163,7 +163,11 @@ class GlmClient:
             delay = RETRY_BASE_DELAY * (2 ** attempt)
             await asyncio.sleep(delay)
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning("Compaction response was not valid JSON")
+            return "(compaction produced no summary)"
         choices = data.get("choices", [])
         if not choices:
             return "(compaction produced no summary)"
@@ -255,11 +259,12 @@ class GlmClient:
                     e.status_code, delay, attempt + 1, MAX_RETRIES,
                 )
                 # Clear partial results from the failed attempt so retry
-                # doesn't produce duplicate content
+                # doesn't produce duplicate content or stale usage
                 result.content = ""
                 result.reasoning = ""
                 result.tool_calls = []
                 result.finish_reason = ""
+                result.usage = None
                 await asyncio.sleep(delay)
             except httpx.TransportError as e:
                 if attempt == MAX_RETRIES:
@@ -269,6 +274,7 @@ class GlmClient:
                 result.reasoning = ""
                 result.tool_calls = []
                 result.finish_reason = ""
+                result.usage = None
                 await asyncio.sleep(delay)
 
     async def _execute_stream(

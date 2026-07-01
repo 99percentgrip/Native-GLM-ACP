@@ -3,6 +3,7 @@
 import asyncio
 import json
 import pytest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 os = __import__("os")
@@ -762,3 +763,67 @@ class TestFriendlyErrorsExtended:
     def test_connection_refused(self, agent, session):
         msg = agent._friendly_error(ConnectionRefusedError("connection refused"), session)
         assert "network" in msg.lower() or "connection" in msg.lower()
+
+
+# ============================================================
+# Image saving robustness
+# ============================================================
+
+class TestSaveImages:
+    @pytest.mark.asyncio
+    async def test_valid_image_saved(self, agent, session, tmp_path):
+        """Valid base64 image should be saved to disk."""
+        import base64
+        session.cwd = str(tmp_path)
+        img_data = base64.b64encode(b"fake-png-data").decode()
+        paths = await agent._save_images(session, [{"data": img_data, "mime_type": "image/png"}])
+        assert len(paths) == 1
+        saved = tmp_path / ".glm-acp-images"
+        assert saved.exists()
+        files = list(saved.glob("*.png"))
+        assert len(files) == 1
+
+    @pytest.mark.asyncio
+    async def test_malformed_base64_skipped(self, agent, session, tmp_path):
+        """Malformed base64 data should be skipped, not crash."""
+        session.cwd = str(tmp_path)
+        paths = await agent._save_images(session, [{"data": "!!!not-base64!!!", "mime_type": "image/png"}])
+        assert len(paths) == 0  # skipped
+
+    @pytest.mark.asyncio
+    async def test_missing_data_key_skipped(self, agent, session, tmp_path):
+        """Missing 'data' key should skip the image, not crash."""
+        session.cwd = str(tmp_path)
+        paths = await agent._save_images(session, [{"mime_type": "image/png"}])
+        assert len(paths) == 0
+
+    @pytest.mark.asyncio
+    async def test_multiple_images_with_bad_one(self, agent, session, tmp_path):
+        """One bad image shouldn't prevent saving the others."""
+        import base64
+        session.cwd = str(tmp_path)
+        good_data = base64.b64encode(b"valid").decode()
+        images = [
+            {"data": good_data, "mime_type": "image/png"},
+            {"data": "!!!bad!!!", "mime_type": "image/png"},
+            {"data": good_data, "mime_type": "image/jpeg"},
+        ]
+        paths = await agent._save_images(session, images)
+        assert len(paths) == 2  # two valid, one skipped
+
+    @pytest.mark.asyncio
+    async def test_mime_type_extension_mapping(self, agent, session, tmp_path):
+        """Different mime types should produce different file extensions."""
+        import base64
+        session.cwd = str(tmp_path)
+        good = base64.b64encode(b"x").decode()
+        images = [
+            {"data": good, "mime_type": "image/png"},
+            {"data": good, "mime_type": "image/jpeg"},
+            {"data": good, "mime_type": "image/webp"},
+        ]
+        paths = await agent._save_images(session, images)
+        extensions = [Path(p).suffix for p in paths]
+        assert ".png" in extensions
+        assert ".jpg" in extensions
+        assert ".webp" in extensions
