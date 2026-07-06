@@ -68,10 +68,21 @@ The system prompt auto-detects your project on session creation:
 
 ## Install
 
+The agent must be **installed into its virtualenv** so the `glm_acp`
+Python module resolves regardless of which directory Zed launches the
+subprocess from. A bare `git clone` is not enough — Zed sets the
+subprocess `cwd` to whatever project you have open, and without an
+install `python -m glm_acp` will fail with `ModuleNotFoundError` (exit
+code 1) in any repo other than this one.
+
 ```bash
 cd /path/to/glm-acp
 uv pip install -e .
 ```
+
+> ⚠️ If the agent crashes on startup in other repos with no visible
+> error, re-run the install command above — the package is missing from
+> the venv's `site-packages`.
 
 Get your API key at https://z.ai/
 
@@ -184,6 +195,25 @@ cd /path/to/glm-acp
 ```
 
 ## Troubleshooting
+
+### Agent crashes on startup in other repos (exit 1, no error)
+
+The most common cause: **the `glm_acp` package is not installed in the
+virtualenv.** Python only finds it when run from this repo's directory
+(the cwd is on `sys.path`), so opening any other project in Zed makes
+`python -m glm_acp` exit with `ModuleNotFoundError`. Fix:
+
+```bash
+cd /path/to/glm-acp
+uv pip install -e .
+```
+
+You can confirm it's installed by checking for the editable finder:
+
+```bash
+ls .venv/lib/*/site-packages/ | grep glm_acp
+# expect: glm_acp-0.1.0.dist-info  (and _editable_impl_glm_acp.pth)
+```
 
 ### Agent crashes on startup (API key)
 
