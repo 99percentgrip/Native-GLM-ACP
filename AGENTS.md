@@ -88,6 +88,29 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 - Models: GLM-5.2, GLM-5-Turbo, GLM-4.7 (only models supported by the Coding Plan)
 - Entry point: `python3 -m glm_acp`
 
+## Install (binding)
+
+The package MUST be installed into the venv that Zed launches:
+
+```bash
+cd /path/to/glm-acp
+uv pip install -e .
+```
+
+Without this, `python3 -m glm_acp` only resolves when run from this repo's
+directory (Python puts the cwd on `sys.path`). Zed sets the subprocess cwd
+to whatever project is open, so an uninstalled package crashes with
+`ModuleNotFoundError` (exit 1) in any other repository. A bare `git clone`
+is not enough — the install is required and must be re-run whenever the
+venv is recreated or the repo is cloned fresh.
+
+Verify the install:
+
+```bash
+ls .venv/lib/*/site-packages/ | grep glm_acp
+# expect: _editable_impl_glm_acp.pth  and  glm_acp-0.1.0.dist-info
+```
+
 ## Child DOX Index
 
 - `glm_acp/` — The Python package implementing the ACP agent server. See `glm_acp/AGENTS.md`.

@@ -17,6 +17,13 @@ streaming, 1M context, and auto-continuation for long generations.
 - **Config**: `config.py` — model registry, API key, constants
 - **Persistence**: `session_store.py` — JSON file store for conversation state in `~/.glm-acp/sessions/`
 
+### Entry point resolution
+
+The agent is launched by Zed as `python3 -m glm_acp`. For `-m` to resolve
+the module from any cwd (not just this repo's directory), the package MUST
+be installed into the venv: `uv pip install -e .` from the repo root. See
+the root `AGENTS.md` "Install (binding)" section.
+
 ## Local Contracts
 
 ### Token stream routing
@@ -137,12 +144,14 @@ The server runs with `use_unstable_protocol=True` to expose
 ## Verification
 
 ```bash
+# Full test suite (247 tests)
+.venv/bin/python3 -m pytest tests/ -q
+
 # Import check
-. .venv/bin/activate
-python3 -c "from glm_acp.agent import GlmAcpAgent; print('OK')"
+.venv/bin/python3 -c "from glm_acp.agent import GlmAcpAgent; print('OK')"
 
 # ACP handshake test (no real API key needed)
-ZAI_API_KEY=test python3 -c "
+ZAI_API_KEY=test .venv/bin/python3 -c "
 from glm_acp.agent import GlmAcpAgent
 import asyncio
 agent = GlmAcpAgent()
@@ -155,7 +164,8 @@ print('Handshake OK')
 "
 ```
 
-No test framework is set up yet. Add pytest when tests grow beyond smoke checks.
+Tests live in `tests/` (pytest + pytest-asyncio). Run before merging any
+change to `glm_client.py`, `agent.py`, `tools.py`, or `session_store.py`.
 
 ## Child DOX Index
 
