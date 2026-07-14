@@ -18,6 +18,8 @@ Own continuous verification and reproducible cross-platform release publication.
 - Linux, macOS x86-64, and Windows x86-64 artifacts must each run `--version` before publication.
 - Each frozen executable must remain below the 30 MiB release-size ceiling.
 - Published archives receive SHA-256 files and GitHub build-provenance attestations.
+- Build Python distributions before downloading frozen-binary artifacts so temporary
+  release files cannot enter the source distribution.
 
 ## Work Guidance
 
