@@ -95,13 +95,14 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 ## Current Project Status
 
 - Package and ACP implementation version is `0.3.0` from `glm_acp.__version__`.
+- GitHub release `v0.3.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, and the icon.
+- ACP Registry publication is tracked in `agentclientprotocol/registry#439` and remains pending until Registry maintainers merge it.
 - Source installs, the `glm-acp` console script, module execution, and frozen binaries share `cli.main()`.
 - ACP initialization advertises Registry-compatible `zai-api-key-setup` Terminal Auth.
 - Terminal setup stores credentials atomically without echoing or logging the key; environment credentials take precedence.
 - GitHub Actions tests Python 3.10–3.13 and packages Linux x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x86-64 binaries.
 - Official Z.ai Web Search, Web Reader, and optional local Vision MCP capabilities are exposed alongside configurable MCP servers.
 - Root project instructions and permission-gated `.glm-acp/memory.md` knowledge are loaded into model context.
-- Tagged releases publish checksums, provenance attestations, Python distributions, Registry metadata, and the icon.
 
 ## Install and distribution (binding)
 

@@ -102,8 +102,9 @@ servers reuse the existing API key without printing or persisting it.
 
 ### Release binary
 
-Download the archive for your platform from
-[GitHub Releases](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases),
+The current release is
+[v0.3.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v0.3.0).
+Download the archive for your platform from that release,
 extract it, then run the one-time terminal setup:
 
 ```bash
@@ -123,8 +124,10 @@ Default credential locations:
 Set `GLM_ACP_CONFIG_DIR` to override the configuration directory. The key is
 never printed or written to logs.
 
-Configure the extracted executable as a custom Zed agent, or install it from
-the ACP Registry after the public submission is accepted.
+Configure the extracted executable as a custom Zed agent. ACP Registry
+publication is tracked in
+[agentclientprotocol/registry#439](https://github.com/agentclientprotocol/registry/pull/439);
+Registry installation becomes public after the Registry maintainers merge it.
 
 ### Development installation
 
