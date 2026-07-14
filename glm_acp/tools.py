@@ -404,6 +404,8 @@ class ToolResult:
     old_text: str | None = None
     # For file edits: the new content after the change (for diff rendering)
     new_text: str | None = None
+    # For commands: the process exit code, otherwise None
+    exit_code: int | None = None
 
 
 class Sandbox:
@@ -814,4 +816,4 @@ async def _run_command(args: dict[str, Any], sandbox: Sandbox, on_output: Any = 
         sections.append(f"Stderr:\n{stderr_text}")
     if not stdout_text and not stderr_text:
         sections.append("(no output)")
-    return ToolResult(output="\n\n".join(sections))
+    return ToolResult(output="\n\n".join(sections), exit_code=proc.returncode)

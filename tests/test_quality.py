@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -13,8 +14,17 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from acp import PROTOCOL_VERSION, spawn_agent_process
 
-from benchmarks.eval import load_cases, prepare, redact
+from benchmarks.eval import (
+    build_report,
+    load_cases,
+    persist_report,
+    prepare,
+    redact,
+    run_external,
+    verify,
+)
 from benchmarks.report import case_cell, load_report, row
+from benchmarks.run_live import BenchmarkAlreadyRunning, LiveRunLock
 from glm_acp.agent import GlmAcpAgent, Session
 from glm_acp.glm_client import StreamResult
 
@@ -108,6 +118,155 @@ async def test_malformed_tool_arguments_receive_actionable_feedback(tmp_path):
     assert "malformed JSON" in feedback[0]
 
 
+@pytest.mark.asyncio
+async def test_failed_command_forces_one_verification_recovery_turn(tmp_path):
+    failed_command = StreamResult(
+        tool_calls=[
+            {
+                "id": "failed-check",
+                "function": {
+                    "name": "run_command",
+                    "arguments": {"command": f'"{sys.executable}" -c "raise SystemExit(1)"'},
+                },
+            }
+        ],
+        finish_reason="tool_calls",
+    )
+    client = ScriptedClient(
+        [
+            failed_command,
+            StreamResult(content="Looks complete.", finish_reason="stop"),
+            StreamResult(content="Blocked; verification still fails.", finish_reason="stop"),
+        ]
+    )
+    agent = configured_agent(client)
+    session = Session("failed-verification", str(tmp_path))
+    session.permission_mode = "bypass"
+
+    assert await agent._run_turn(session) == "end_turn"
+    assert client.calls == 3
+    guard = [
+        item["content"]
+        for item in session.messages
+        if item["role"] == "system" and "Automated verification guard" in item["content"]
+    ]
+    assert len(guard) == 1
+    assert "Do not delete or weaken tests" in guard[0]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_success_does_not_clear_failed_verification(tmp_path):
+    def command_result(call_id: str, command: str) -> StreamResult:
+        return StreamResult(
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "function": {
+                        "name": "run_command",
+                        "arguments": {"command": command},
+                    },
+                }
+            ],
+            finish_reason="tool_calls",
+        )
+
+    client = ScriptedClient(
+        [
+            command_result("failed-check", f'"{sys.executable}" -c "raise SystemExit(1)"'),
+            command_result("unrelated-success", f'"{sys.executable}" -c "print(1)"'),
+            StreamResult(content="Done.", finish_reason="stop"),
+            StreamResult(content="Blocked after review.", finish_reason="stop"),
+        ]
+    )
+    agent = configured_agent(client)
+    session = Session("failed-verification-success", str(tmp_path))
+    session.permission_mode = "bypass"
+
+    assert await agent._run_turn(session) == "end_turn"
+    assert client.calls == 4
+    assert any(
+        item["role"] == "system" and "Automated verification guard" in item["content"]
+        for item in session.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_change_forces_one_verification_turn(tmp_path):
+    changed_file = StreamResult(
+        tool_calls=[
+            {
+                "id": "write-change",
+                "function": {
+                    "name": "write_file",
+                    "arguments": {"path": "client.py", "content": "value = 1\n"},
+                },
+            }
+        ],
+        finish_reason="tool_calls",
+    )
+    client = ScriptedClient(
+        [
+            changed_file,
+            StreamResult(content="Done without testing.", finish_reason="stop"),
+            StreamResult(content="Blocked; no test runner is available.", finish_reason="stop"),
+        ]
+    )
+    agent = configured_agent(client)
+    session = Session("unverified-change", str(tmp_path))
+    session.permission_mode = "bypass"
+
+    assert await agent._run_turn(session) == "end_turn"
+    assert client.calls == 3
+    guards = [
+        item["content"]
+        for item in session.messages
+        if item["role"] == "system" and "files were changed" in item["content"]
+    ]
+    assert len(guards) == 1
+    assert "successful verification command" in guards[0]
+
+
+@pytest.mark.asyncio
+async def test_successful_verification_clears_unverified_change(tmp_path):
+    changed_file = StreamResult(
+        tool_calls=[
+            {
+                "id": "write-change",
+                "function": {
+                    "name": "write_file",
+                    "arguments": {"path": "client.py", "content": "value = 1\n"},
+                },
+            }
+        ],
+        finish_reason="tool_calls",
+    )
+    verification = StreamResult(
+        tool_calls=[
+            {
+                "id": "successful-check",
+                "function": {
+                    "name": "run_command",
+                    "arguments": {"command": f'"{sys.executable}" -c "print(\'pytest passed\')"'},
+                },
+            }
+        ],
+        finish_reason="tool_calls",
+    )
+    client = ScriptedClient(
+        [changed_file, verification, StreamResult(content="Verified.", finish_reason="stop")]
+    )
+    agent = configured_agent(client)
+    session = Session("verified-change", str(tmp_path))
+    session.permission_mode = "bypass"
+
+    assert await agent._run_turn(session) == "end_turn"
+    assert client.calls == 3
+    assert not any(
+        item["role"] == "system" and "files were changed" in item["content"]
+        for item in session.messages
+    )
+
+
 def test_benchmark_catalog_is_broad_and_valid():
     cases = load_cases()
     assert len(cases) >= 10
@@ -116,10 +275,35 @@ def test_benchmark_catalog_is_broad_and_valid():
     }
 
 
+def test_multi_file_case_observes_discount_order(tmp_path):
+    case = next(item for item in load_cases() if item["id"] == "multi-file-regression")
+    prepare(case, tmp_path)
+    assert verify(case, tmp_path)["passed"] is False
+    (tmp_path / "shop/order.py").write_text(
+        "from shop.pricing import discounted\n\n"
+        "def total(subtotal: float, discount: float, tax_rate: float) -> float:\n"
+        "    return discounted(subtotal, discount) * (1 + tax_rate)\n",
+        encoding="utf-8",
+    )
+    shutil.rmtree(tmp_path / "shop/__pycache__", ignore_errors=True)
+    assert verify(case, tmp_path)["passed"] is True
+
+
 def test_benchmark_fixture_cannot_escape_workspace(tmp_path):
     case = {"files": {"../escape.py": "bad"}}
     with pytest.raises(ValueError, match="escapes workspace"):
         prepare(case, tmp_path / "workspace")
+
+
+@pytest.mark.asyncio
+async def test_external_benchmark_handles_fast_exit(tmp_path):
+    result = await run_external(
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        {"prompt": "ignored", "timeout": 2},
+        tmp_path,
+    )
+    assert result["stop_reason"] == "completed"
+    assert result["runner_exit_code"] == 0
 
 
 def test_benchmark_redaction(monkeypatch):
@@ -145,6 +329,72 @@ def test_native_benchmark_missing_credentials_is_safe(tmp_path):
     assert "Traceback" not in result.stderr
 
 
+def test_live_benchmark_check_is_secret_safe(tmp_path):
+    env = os.environ.copy()
+    env["ZAI_API_KEY"] = "operator-secret-value"
+    env["GLM_ACP_CONFIG_DIR"] = str(tmp_path / "config")
+    result = subprocess.run(
+        [sys.executable, "benchmarks/run_live.py", "--check"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0
+    assert "model=glm-5.2" in output
+    assert "operator-secret-value" not in output
+
+
+def test_live_benchmark_lock_rejects_concurrent_owner(tmp_path):
+    lock_path = tmp_path / ".live-benchmark.lock"
+    with LiveRunLock(lock_path):
+        with pytest.raises(BenchmarkAlreadyRunning, match="already running"):
+            with LiveRunLock(lock_path):
+                pass
+    assert not lock_path.exists()
+
+
+def test_live_benchmark_lock_recovers_stale_owner(tmp_path):
+    lock_path = tmp_path / ".live-benchmark.lock"
+    lock_path.mkdir()
+    (lock_path / "owner.json").write_text('{"pid": 999999999}\n', encoding="utf-8")
+    with LiveRunLock(lock_path):
+        assert lock_path.is_dir()
+    assert not lock_path.exists()
+
+
+def test_incremental_benchmark_artifacts_are_atomic(tmp_path):
+    result = {
+        "id": "case",
+        "attempt": 1,
+        "elapsed_seconds": 1.0,
+        "first_delta_seconds": 0.2,
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "verification": {"passed": True, "exit_code": 0, "summary": "ok"},
+    }
+    report = build_report(
+        label="candidate",
+        runner="native",
+        repeat=3,
+        planned_total=3,
+        status="running",
+        candidate={"model": "glm-5.2"},
+        results=[result],
+    )
+    json_path = tmp_path / "native.json"
+    markdown_path = tmp_path / "report.md"
+    persist_report(report, json_path, markdown_path)
+
+    loaded = load_report(json_path)
+    assert loaded["completed"] == 1
+    assert loaded["planned_total"] == 3
+    assert "Partial report: 1/3 attempts completed" in markdown_path.read_text(encoding="utf-8")
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 def test_million_token_estimate_boundary():
     content = "x" * 3_500_000
     estimate = GlmAcpAgent._estimate_tokens([{"role": "user", "content": content}])
@@ -164,14 +414,28 @@ def test_quality_report_row(tmp_path):
                 "skipped": 0,
                 "results": [
                     {"elapsed_seconds": 1.0, "input_tokens": 10, "output_tokens": 5},
-                    {"elapsed_seconds": 3.0, "input_tokens": 20, "output_tokens": 7},
+                    {
+                        "elapsed_seconds": 3.0,
+                        "first_delta_seconds": 0.5,
+                        "input_tokens": 20,
+                        "output_tokens": 7,
+                    },
                 ],
             }
         ),
         encoding="utf-8",
     )
     report = load_report(path)
-    assert row(report) == ["candidate", "100.0%", "2/2", "0", "2.00", "30", "12"]
+    assert row(report) == [
+        "candidate",
+        "100.0%",
+        "2/2",
+        "0",
+        "2.00",
+        "0.50",
+        "30",
+        "12",
+    ]
     assert case_cell(report, "missing") == "skipped"
 
 

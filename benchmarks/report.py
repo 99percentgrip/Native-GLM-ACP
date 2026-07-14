@@ -27,12 +27,20 @@ def row(report: dict[str, Any]) -> list[str]:
     input_tokens = sum(int(item.get("input_tokens", 0)) for item in report["results"])
     output_tokens = sum(int(item.get("output_tokens", 0)) for item in report["results"])
     median = f"{statistics.median(elapsed):.2f}" if elapsed else "—"
+    first_delta = [
+        float(item["first_delta_seconds"])
+        for item in report["results"]
+        if isinstance(item.get("first_delta_seconds"), (int, float))
+        and not item.get("verification", {}).get("skipped")
+    ]
+    median_first_delta = f"{statistics.median(first_delta):.2f}" if first_delta else "—"
     return [
         str(report.get("label", report.get("runner", "unknown"))),
         f"{100 * float(report.get('pass_rate', 0)):.1f}%",
         f"{report.get('passed', 0)}/{report.get('total', 0)}",
         str(report.get("skipped", 0)),
         median,
+        median_first_delta,
         f"{input_tokens:,}",
         f"{output_tokens:,}",
     ]
@@ -53,20 +61,26 @@ def case_cell(report: dict[str, Any], case_id: str) -> str:
     return f"{passed}/{len(scored)}{timing}"
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("reports", nargs="+", type=Path)
-    parser.add_argument("--output", type=Path)
-    args = parser.parse_args()
-    reports = [load_report(path) for path in args.reports]
-    reports.sort(key=lambda item: (-float(item.get("pass_rate", 0)), str(item.get("label", ""))))
+def render_reports(reports: list[dict[str, Any]]) -> str:
+    reports = sorted(
+        reports,
+        key=lambda item: (-float(item.get("pass_rate", 0)), str(item.get("label", ""))),
+    )
+    partial = [report for report in reports if report.get("status") == "running"]
+    progress: list[str] = []
+    if partial:
+        completed = sum(int(report.get("completed", 0)) for report in partial)
+        planned = sum(int(report.get("planned_total", 0)) for report in partial)
+        progress = [f"Partial report: {completed}/{planned} attempts completed.", ""]
     lines = [
         "# Native GLM ACP quality report",
         "",
+        *progress,
         "Outcome-based, isolated coding tasks. Lower median time is better after pass rate.",
         "",
-        "| Runner | Pass rate | Passed | Skipped | Median seconds | Input tokens | Output tokens |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Runner | Pass rate | Passed | Skipped | Median seconds | "
+        "Median first delta | Input tokens | Output tokens |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for report in reports:
         lines.append("| " + " | ".join(row(report)) + " |")
@@ -93,7 +107,15 @@ def main() -> int:
             + " | ".join(case_cell(report, case_id) for report in reports)
             + " |"
         )
-    rendered = "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("reports", nargs="+", type=Path)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    rendered = render_reports([load_report(path) for path in args.reports])
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered, encoding="utf-8")

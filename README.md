@@ -105,7 +105,7 @@ servers reuse the existing API key without printing or persisting it.
 ### Release binary
 
 The current release is
-[v0.4.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v0.4.0).
+[v0.4.1](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v0.4.1).
 Download the archive for your platform from that release,
 extract it, then run the one-time terminal setup:
 
@@ -270,6 +270,10 @@ preserved-thinking requests.
 | `vision_analyze` | Optional official local Z.ai Vision MCP |
 | `mcp_list_tools` / `mcp_call` | Generic configured MCP access |
 
+After changing files, the agent requires a successful build, test, lint, or
+other verification command before normal completion. A failed command or an
+attempt to finish without verification triggers one focused recovery turn.
+
 All file paths are validated against workspace roots. `update_plan` is
 available in both Ask and Code modes.
 
@@ -287,11 +291,23 @@ smoke test on Linux x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x86-64.
 Opt-in live quality evaluation uses isolated fixtures and objective test results:
 
 ```bash
-.venv/bin/python3 benchmarks/eval.py --list
-.venv/bin/python3 benchmarks/eval.py --validate
-.venv/bin/python3 benchmarks/eval.py --runner native --repeat 3 \
-  --label native-glm-acp --output quality/native.json
+# Safe preflight: validates the catalog and credential without an API request.
+.venv/bin/python3 benchmarks/run_live.py --check
+
+# Full handoff run: three attempts for each of the 11 cases.
+.venv/bin/python3 benchmarks/run_live.py
 ```
+
+The runner creates a timestamped folder under `quality/` containing
+`native.json` and `report.md`. Send both files to the reviewer. The files never
+contain the API key, reasoning traces, temporary workspaces, authentication
+paths, or session IDs. Configure the credential with `glm-acp --setup` or in
+`ZAI_API_KEY`; never put the key itself in the command line.
+
+Only one live benchmark can run from a checkout at a time. Each attempt prints
+its case, attempt number, outcome, and elapsed time. Both artifacts are updated
+atomically after every completed attempt, so cancellation preserves usable
+partial results and a stale lock is recovered automatically on the next run.
 
 The catalog covers Python, TypeScript, Go, and Rust tasks including multi-file
 changes, async cleanup, nested instructions, path security, and CLI behavior.
@@ -303,9 +319,10 @@ An external agent can run the same corpus with `--runner external
   --output quality/report.md
 ```
 
-Reports contain outcome, latency, token totals, candidate version/model, and a
-system-prompt fingerprint. They exclude credentials, reasoning traces,
-authentication paths, and session IDs. The manually triggered **Quality
+Reports contain outcome, end-to-end and first-delta latency, token totals,
+candidate version/model, a system-prompt fingerprint, and non-identifying
+runtime details. They exclude credentials, reasoning traces, authentication
+paths, and session IDs. The manually triggered **Quality
 benchmark** GitHub workflow provides an opt-in native run and job-summary
 dashboard; it never runs live API usage on ordinary CI or pull requests.
 
@@ -327,7 +344,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-0.4.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-0.4.1.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

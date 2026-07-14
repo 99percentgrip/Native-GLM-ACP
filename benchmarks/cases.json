@@ -31,18 +31,18 @@
   },
   {
     "id": "multi-file-regression",
-    "prompt": "Fix the order total regression. Apply discounts before tax, preserve the public API, and add or update tests. Inspect all project files before editing.",
+    "prompt": "Fix the order total regression. Apply the fixed discount amount before tax, preserve the public API, and add or update tests. Inspect all project files before editing.",
     "files": {
       "shop/order.py": "from shop.pricing import discounted\n\ndef total(subtotal: float, discount: float, tax_rate: float) -> float:\n    return discounted(subtotal * (1 + tax_rate), discount)\n",
-      "shop/pricing.py": "def discounted(amount: float, discount: float) -> float:\n    return amount * (1 - discount)\n",
-      "test_order.py": "from shop.order import total\n\ndef test_discount_precedes_tax():\n    assert total(100, 0.20, 0.10) == 88\n"
+      "shop/pricing.py": "def discounted(amount: float, discount: float) -> float:\n    return amount - discount\n",
+      "test_order.py": "from shop.order import total\n\ndef test_discount_precedes_tax():\n    assert total(100, 20, 0.10) == 88\n"
     },
     "verify": ["python", "-m", "pytest", "-q"],
     "timeout": 240
   },
   {
     "id": "async-resource-cleanup",
-    "prompt": "Fix client.py so fetch_all always closes the client, including when one request fails, without serializing the requests. Preserve the function signature.",
+    "prompt": "Fix client.py so fetch_all always closes the client, including when one request fails, without serializing the requests. Inspect the provided Client interface and use its existing asynchronous shutdown method. Preserve the function signature and do not modify the tests.",
     "files": {
       "client.py": "import asyncio\n\nasync def fetch_all(client, urls):\n    return await asyncio.gather(*(client.get(url) for url in urls))\n",
       "test_client.py": "import asyncio\nimport pytest\nfrom client import fetch_all\n\nclass Client:\n    def __init__(self): self.closed = False\n    async def get(self, url):\n        await asyncio.sleep(0)\n        if url == 'bad': raise RuntimeError('boom')\n        return url\n    async def aclose(self): self.closed = True\n\ndef test_success_closes():\n    c = Client(); assert asyncio.run(fetch_all(c, ['a', 'b'])) == ['a', 'b']; assert c.closed\n\ndef test_failure_closes():\n    c = Client()\n    with pytest.raises(RuntimeError): asyncio.run(fetch_all(c, ['a', 'bad']))\n    assert c.closed\n"

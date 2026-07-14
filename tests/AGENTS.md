@@ -12,7 +12,7 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
 - `test_registry_package.py` covers public Registry identity and release URL invariants.
 - Remaining modules cover tools, sessions, streaming, compaction, and GLM HTTP behavior.
 - `test_mcp.py` and `test_memory.py` cover remote MCP protocol handling and opt-in project memory.
-- `test_quality.py` covers tool-loop recovery, malformed calls, benchmark/report contracts, million-token estimation, and real stdio/SDK ACP process lifecycles.
+- `test_quality.py` covers tool-loop, failed-verification and unverified-edit recovery, benchmark locking/incremental reports, million-token estimation, and real stdio/SDK ACP process lifecycles.
 
 ## Local Contracts
 

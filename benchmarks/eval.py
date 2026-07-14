@@ -8,11 +8,13 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -112,13 +114,21 @@ async def run_external(command: list[str], case: dict[str, Any], root: Path) -> 
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
+    assert process.stdin is not None
     try:
-        await asyncio.wait_for(
-            process.communicate(case["prompt"].encode()), timeout=float(case["timeout"])
-        )
-    except asyncio.TimeoutError:
+        process.stdin.write(case["prompt"].encode())
+        await process.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        process.stdin.close()
+    deadline = time.monotonic() + float(case["timeout"])
+    while process.returncode is None and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    if process.returncode is None:
         process.kill()
-        await process.wait()
+        while process.returncode is None:
+            await asyncio.sleep(0.05)
         return {"stop_reason": "timeout", "elapsed_seconds": case["timeout"]}
     return {
         "stop_reason": "completed" if process.returncode == 0 else "runner_error",
@@ -171,6 +181,76 @@ def redact(text: str) -> str:
     return redacted
 
 
+def candidate_metadata(runner: str) -> dict[str, str]:
+    if runner != "native":
+        return {}
+    from glm_acp import __version__
+    from glm_acp.agent import SYSTEM_PROMPT_TEMPLATE
+    from glm_acp.config import DEFAULT_MODEL
+
+    return {
+        "package_version": __version__,
+        "model": DEFAULT_MODEL,
+        "system_prompt_sha256": hashlib.sha256(SYSTEM_PROMPT_TEMPLATE.encode("utf-8")).hexdigest(),
+    }
+
+
+def build_report(
+    *,
+    label: str,
+    runner: str,
+    repeat: int,
+    planned_total: int,
+    status: str,
+    candidate: dict[str, str],
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    scored = [item for item in results if not item["verification"].get("skipped")]
+    passed = sum(bool(item["verification"]["passed"]) for item in scored)
+    return {
+        "schema_version": 1,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "status": status,
+        "completed": len(results),
+        "planned_total": planned_total,
+        "label": label,
+        "runner": runner,
+        "candidate": candidate,
+        "repeat": repeat,
+        "passed": passed,
+        "total": len(scored),
+        "skipped": len(results) - len(scored),
+        "pass_rate": round(passed / len(scored), 4) if scored else 0.0,
+        "environment": {
+            "python": platform.python_version(),
+            "system": platform.system(),
+            "machine": platform.machine(),
+        },
+        "results": results,
+    }
+
+
+def write_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def persist_report(report: dict[str, Any], output: Path | None, markdown: Path | None) -> str:
+    rendered = json.dumps(report, indent=2, ensure_ascii=False)
+    if output:
+        write_atomic(output, rendered + "\n")
+    if markdown:
+        from benchmarks.report import render_reports
+
+        write_atomic(markdown, render_reports([report]))
+    return rendered
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--list", action="store_true")
@@ -180,6 +260,7 @@ async def main() -> int:
     parser.add_argument("--label", default="native-glm-acp")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--markdown-output", type=Path)
     parser.add_argument("--validate", action="store_true")
     args = parser.parse_args()
     cases = load_cases()
@@ -205,11 +286,22 @@ async def main() -> int:
             )
             return 2
     selected = set(args.selected or [])
-    results = []
+    known = {str(case["id"]) for case in cases}
+    unknown = selected - known
+    if unknown:
+        parser.error(f"unknown benchmark case(s): {', '.join(sorted(unknown))}")
+    selected_cases = [case for case in cases if not selected or case["id"] in selected]
+    planned_total = len(selected_cases) * args.repeat
+    candidate = candidate_metadata(args.runner)
+    results: list[dict[str, Any]] = []
     for attempt in range(1, args.repeat + 1):
-        for case in cases:
-            if selected and case["id"] not in selected:
-                continue
+        for case in selected_cases:
+            ordinal = len(results) + 1
+            print(
+                f"[{ordinal}/{planned_total}] Running {case['id']} (attempt {attempt})...",
+                file=sys.stderr,
+                flush=True,
+            )
             with tempfile.TemporaryDirectory(prefix=f"glm-eval-{case['id']}-") as temp:
                 workspace = Path(temp)
                 prepare(case, workspace)
@@ -217,45 +309,41 @@ async def main() -> int:
                     run = await run_native(case, workspace)
                 else:
                     run = await run_external(args.external_command, case, workspace)
+                verification = verify(case, workspace)
                 results.append(
-                    {
-                        "id": case["id"],
-                        "attempt": attempt,
-                        **run,
-                        "verification": verify(case, workspace),
-                    }
+                    {"id": case["id"], "attempt": attempt, **run, "verification": verification}
                 )
-    scored = [item for item in results if not item["verification"].get("skipped")]
-    passed = sum(bool(item["verification"]["passed"]) for item in scored)
-    candidate: dict[str, str] = {}
-    if args.runner == "native":
-        from glm_acp import __version__
-        from glm_acp.agent import SYSTEM_PROMPT_TEMPLATE
-        from glm_acp.config import DEFAULT_MODEL
-
-        candidate = {
-            "package_version": __version__,
-            "model": DEFAULT_MODEL,
-            "system_prompt_sha256": hashlib.sha256(
-                SYSTEM_PROMPT_TEMPLATE.encode("utf-8")
-            ).hexdigest(),
-        }
-    report = {
-        "schema_version": 1,
-        "label": args.label,
-        "runner": args.runner,
-        "candidate": candidate,
-        "repeat": args.repeat,
-        "passed": passed,
-        "total": len(scored),
-        "skipped": len(results) - len(scored),
-        "pass_rate": round(passed / len(scored), 4) if scored else 0.0,
-        "results": results,
-    }
-    rendered = json.dumps(report, indent=2, ensure_ascii=False)
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(rendered + "\n", encoding="utf-8")
+            outcome = (
+                "SKIP"
+                if verification.get("skipped")
+                else ("PASS" if verification["passed"] else "FAIL")
+            )
+            print(
+                f"[{ordinal}/{planned_total}] {outcome} {case['id']} "
+                f"({run.get('elapsed_seconds', 0):.2f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
+            partial = build_report(
+                label=args.label,
+                runner=args.runner,
+                repeat=args.repeat,
+                planned_total=planned_total,
+                status="running",
+                candidate=candidate,
+                results=results,
+            )
+            persist_report(partial, args.output, args.markdown_output)
+    report = build_report(
+        label=args.label,
+        runner=args.runner,
+        repeat=args.repeat,
+        planned_total=planned_total,
+        status="completed",
+        candidate=candidate,
+        results=results,
+    )
+    rendered = persist_report(report, args.output, args.markdown_output)
     print(rendered)
     return 0 if report["passed"] == report["total"] and report["total"] else 1
 

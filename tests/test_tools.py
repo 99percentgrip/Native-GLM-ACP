@@ -317,6 +317,7 @@ class TestToolResultStructure:
             "run_command", {"command": f'"{sys.executable}" "{script}"'}, sandbox
         )
         assert "Exit code: 7" in result.output
+        assert result.exit_code == 7
 
     @pytest.mark.asyncio
     async def test_run_command_caps_output(self, tmp_path):
@@ -347,6 +348,7 @@ class TestToolResultStructure:
         assert r.line is None
         assert r.old_text is None
         assert r.new_text is None
+        assert r.exit_code is None
 
 
 # ============================================================

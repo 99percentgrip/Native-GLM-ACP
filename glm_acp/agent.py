@@ -97,12 +97,15 @@ instruction from the repository root to the target file.
 - Read files before editing them. Understand the codebase structure first.
 - Make minimal, surgical changes. Match existing conventions.
 - Preserve unrelated user changes and avoid unrelated refactors.
+- Inspect existing tests, types, and interfaces before choosing method names.
+- Never delete, disable, or weaken existing tests to make verification pass.
 - Use run_command for builds, tests, and git operations.
 - When writing or editing files, briefly explain what you're changing.
 - If a task spans many files, work through them systematically.
-- Verify changed behavior with the narrowest relevant checks. Do not claim a \
-change is complete or working when verification was not run or failed; report \
-unverified work and remaining risk explicitly.
+- Verify changed behavior with the narrowest relevant checks. If a check fails, \
+diagnose the output, fix the root cause, and rerun it. Do not claim a change is \
+complete or working when verification was not run or failed; report unverified \
+work and remaining risk explicitly.
 
 Planning:
 - For any task with 3+ steps, call update_plan FIRST to lay out your plan.
@@ -956,6 +959,26 @@ class GlmAcpAgent(acp.Agent):
             )
         return None
 
+    @staticmethod
+    def _is_verification_command(command: str) -> bool:
+        normalized = command.lower()
+        return any(
+            marker in normalized
+            for marker in (
+                "pytest",
+                " test",
+                "test ",
+                "ruff",
+                "lint",
+                "mypy",
+                "pyright",
+                "check",
+                "build",
+                "audit",
+                "verify",
+            )
+        )
+
     async def _run_turn(self, session: Session) -> str:
         """Execute the full model-turn loop: stream → tool calls → repeat."""
         client = self._client_for_session(session)
@@ -984,6 +1007,10 @@ class GlmAcpAgent(acp.Agent):
 
         previous_tool_batch = ""
         repeated_tool_batches = 0
+        failed_command_pending = False
+        failed_command_guard_used = False
+        unverified_change_pending = False
+        unverified_change_guard_used = False
 
         for turn_iter in range(MAX_TOOL_ITERATIONS):
             # --- Check for cancellation ---
@@ -1067,6 +1094,38 @@ class GlmAcpAgent(acp.Agent):
                 if getattr(client, "preserve_thinking", False) and result.reasoning:
                     assistant_message["reasoning_content"] = result.reasoning
                 session.messages.append(assistant_message)
+                if failed_command_pending and not failed_command_guard_used:
+                    session.messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Automated verification guard: the most recent "
+                                "run_command failed or timed out. Inspect its output, "
+                                "fix the root cause, and rerun the narrowest relevant "
+                                "verification. Do not delete or weaken tests. You may "
+                                "stop only if genuinely blocked, and then must report "
+                                "the failed command and remaining risk explicitly."
+                            ),
+                        }
+                    )
+                    failed_command_guard_used = True
+                    continue
+                if unverified_change_pending and not unverified_change_guard_used:
+                    session.messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Automated verification guard: files were changed, but no "
+                                "successful verification command was observed afterward. "
+                                "Inspect the applicable tests and interfaces, then run the "
+                                "narrowest relevant verification. Do not delete or weaken "
+                                "tests. You may stop only if genuinely blocked, and then must "
+                                "report that the changes remain unverified and explain why."
+                            ),
+                        }
+                    )
+                    unverified_change_guard_used = True
+                    continue
                 notice = self._finish_reason_notice(result.finish_reason)
                 if notice:
                     await self._send_message(session.id, f"\n\n{notice}\n")
@@ -1242,10 +1301,23 @@ class GlmAcpAgent(acp.Agent):
                         )
                     await self._complete_tool(session.id, tc_id, tool_result)
                     output = tool_result.output
+                    if tool_name in {"write_file", "edit_file", "apply_patch"}:
+                        unverified_change_pending = True
+                    elif tool_name == "run_command":
+                        if tool_result.exit_code not in (None, 0):
+                            failed_command_pending = True
+                        elif self._is_verification_command(str(tool_args.get("command", ""))):
+                            unverified_change_pending = False
+                            unverified_change_guard_used = False
+                            if failed_command_pending:
+                                failed_command_pending = False
+                                failed_command_guard_used = False
                 except (ToolError, McpError) as e:
                     error_msg = str(e)
                     output = f"Error: {error_msg}"
                     await self._fail_tool(session.id, tc_id, error_msg)
+                    if tool_name == "run_command":
+                        failed_command_pending = True
 
                 session.messages.append(
                     {

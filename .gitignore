@@ -33,6 +33,7 @@ env/
 .coverage
 htmlcov/
 .tox/
+quality/
 
 # Pasted screenshots (temporary)
 .glm-acp-images/

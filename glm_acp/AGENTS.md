@@ -170,6 +170,13 @@ instead of consuming the full iteration budget. Malformed JSON tool arguments
 are rejected with schema-oriented corrective feedback before permission or
 execution.
 
+Command results carry structured exit codes. After a failed or timed-out
+command, the model receives one automatic verification-recovery turn before it
+may finish, directing it to inspect the failure, preserve tests, correct the
+root cause, and rerun the narrowest relevant check or report a genuine blocker.
+After a successful file edit, the model likewise receives one recovery turn if
+it tries to finish before a successful verification command has been observed.
+
 ### MCP and durable memory
 
 Z.ai Search and Reader use authenticated Streamable HTTP MCP. Vision uses the
