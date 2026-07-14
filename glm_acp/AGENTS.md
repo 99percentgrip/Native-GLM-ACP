@@ -11,7 +11,8 @@ streaming, 1M context, and auto-continuation for long generations.
 ## Ownership
 
 - **Entry point**: `__main__.py` → `cli.py:main()` → `agent.py:run()`
-- **CLI and terminal auth**: `cli.py` → `main()` / `configure_credentials()`
+- **CLI, terminal auth, and uninstall routing**: `cli.py` → `main()` / `configure_credentials()`
+- **Public-install removal**: `uninstall.py` — frozen-copy validation, command/PATH cleanup, credential purge, and guarded Zed JSONC editing
 - **Frozen executable entry**: `launcher.py` → absolute import of `cli.main()`
 - **ACP protocol**: `agent.py` — implements `acp.Agent` (initialize, new_session, load_session, resume_session, close_session, list_sessions, prompt, set_config_option, set_session_mode)
 - **GLM API client**: `glm_client.py` — SSE/tool streaming, preserved thinking, cancellation, retry, cache usage, auto-continuation
@@ -41,6 +42,13 @@ must all route through `cli.main()`.
 - `ZAI_API_KEY` and `Z_AI_API_KEY` override stored credentials.
 - API keys must never appear in stdout, stderr, logs, test output, or ACP messages.
 - `authenticate()` succeeds only for the advertised method and configured credentials.
+
+### Public-install removal
+
+- `glm-acp --uninstall` operates only from the user-local frozen-binary install directory; source and Registry-managed executables fail safely with guidance.
+- Removal deletes both public command aliases and only the exact PATH marker created by the installer.
+- A matching custom `agent_servers.glm-acp` entry is removed from Zed JSONC only after a same-directory command match, with a sibling backup created first; Registry and unrelated entries remain untouched.
+- Stored credentials survive normal uninstall. `--uninstall --purge` removes only the credential file and does not delete sessions or other configuration.
 
 ### Token stream routing
 

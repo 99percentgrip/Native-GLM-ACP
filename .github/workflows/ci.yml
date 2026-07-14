@@ -47,7 +47,7 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --frozen --extra dev
       - name: Check release-code formatting
-        run: uv run --frozen ruff format --check glm_acp/cli.py glm_acp/launcher.py tests/test_cli.py tests/test_installers.py tests/test_registry_package.py
+        run: uv run --frozen ruff format --check glm_acp/cli.py glm_acp/launcher.py glm_acp/uninstall.py tests/test_cli.py tests/test_installers.py tests/test_registry_package.py tests/test_uninstall.py
       - name: Check Unix installer syntax
         run: bash -n scripts/install.sh
       - name: Run fatal Python lint

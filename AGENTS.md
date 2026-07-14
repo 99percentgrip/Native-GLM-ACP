@@ -81,6 +81,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - Public releases and ACP Registry metadata identify Aleksejs Kozlitins as author and use Apache-2.0.
 - Registry installation uses version-pinned frozen binaries for Linux x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x86-64.
 - Public GitHub installation provides checksum-verifying, user-local installers that expose both `native-glm-acp` and `glm-acp` without requiring Python, Node.js, or administrator privileges.
+- Public frozen installs provide `glm-acp --uninstall`; credentials are preserved unless the user explicitly adds `--purge`, and source or Registry-managed copies must not self-delete.
 - Terminal authentication must never echo or log `ZAI_API_KEY`; environment credentials take precedence over the user-only stored credential file.
 
 ## Project Purpose
@@ -95,10 +96,11 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 
 ## Current Project Status
 
-- Package and ACP implementation version is `0.5.0` from `glm_acp.__version__`.
-- GitHub release `v0.5.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, and checksum-verifying Unix and Windows installers.
+- Package and ACP implementation version is `0.6.0` from `glm_acp.__version__`.
+- GitHub release `v0.6.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
 - ACP Registry publication is tracked in `agentclientprotocol/registry#439` and remains pending until Registry maintainers merge it.
 - Source installs, the `glm-acp` console script, module execution, and frozen binaries share `cli.main()`.
+- Public frozen binaries support one-command removal of installer-owned commands, PATH markers, and matching custom Zed configuration with an automatic settings backup.
 - ACP initialization advertises Registry-compatible `zai-api-key-setup` Terminal Auth.
 - Terminal setup stores credentials atomically without echoing or logging the key; environment credentials take precedence.
 - GitHub Actions tests Python 3.10–3.13 and packages Linux x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x86-64 binaries.
@@ -129,7 +131,7 @@ Verify the install:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: editable glm_acp metadata and glm_acp-0.5.0.dist-info
+# expect: editable glm_acp metadata and glm_acp-0.6.0.dist-info
 ```
 
 ## Verification

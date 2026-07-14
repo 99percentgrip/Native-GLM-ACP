@@ -11,6 +11,7 @@ from collections.abc import Callable, Sequence
 from . import __version__
 from .agent import run
 from .config import get_api_key, store_api_key
+from .uninstall import UninstallError, uninstall_release
 
 
 def configure_credentials(
@@ -37,22 +38,36 @@ def build_parser() -> argparse.ArgumentParser:
         prog="glm-acp",
         description="Native ACP coding agent powered by Z.ai GLM models.",
     )
-    parser.add_argument(
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument(
         "--setup",
         action="store_true",
         help="store Z.ai API credentials for Registry and editor launches",
     )
-    parser.add_argument(
+    actions.add_argument(
         "--check-auth",
         action="store_true",
         help="check whether usable credentials are configured without printing them",
+    )
+    actions.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="remove a public frozen-binary installation and matching Zed custom entry",
+    )
+    parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="with --uninstall, also remove the stored Z.ai credential",
     )
     parser.add_argument("--version", action="version", version=__version__)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.purge and not args.uninstall:
+        parser.error("--purge requires --uninstall")
     if args.setup:
         return configure_credentials()
     if args.check_auth:
@@ -62,6 +77,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("Z.ai credentials are not configured.")
             return 1
         print("Z.ai credentials are configured.")
+        return 0
+    if args.uninstall:
+        try:
+            result = uninstall_release(purge=args.purge)
+        except UninstallError as error:
+            print(f"Uninstall failed: {error}")
+            return 1
+        status = "scheduled for removal" if result.scheduled else "removed"
+        print(f"Native GLM ACP commands {status}.")
+        if result.zed_settings:
+            print(f"Removed the matching Zed custom agent from {result.zed_settings}.")
+            print(f"Zed settings backup: {result.zed_backup}")
+        if args.purge:
+            message = "removed" if result.credentials_removed else "were not present"
+            print(f"Stored credentials {message}.")
+        else:
+            print("Stored credentials were preserved. Use --uninstall --purge to remove them.")
+        print("Restart Zed to finish.")
         return 0
     asyncio.run(run())
     return 0

@@ -126,10 +126,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v0.5.0` before running the Unix
-installer, or pass `-Version v0.5.0` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v0.6.0` before running the Unix
+installer, or pass `-Version v0.6.0` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v0.5.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v0.5.0).
+[v0.6.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v0.6.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -143,6 +143,29 @@ Default credential locations:
 
 Set `GLM_ACP_CONFIG_DIR` to override the configuration directory. The key is
 never printed or written to logs.
+
+### One-command uninstall
+
+For a public frozen-binary installation, run:
+
+```bash
+glm-acp --uninstall
+```
+
+This removes both installed command names, the installer-owned PATH entry, and
+a matching custom `glm-acp` entry from Zed settings. Zed settings are backed up
+before editing. Restart Zed afterward.
+
+Credentials are preserved so reinstalling does not require entering the API key
+again. To remove the stored credential too, use:
+
+```bash
+glm-acp --uninstall --purge
+```
+
+The command refuses to self-delete source installations and Registry-managed
+copies. Remove Registry installations through Zed; remove development packages
+with the package manager that installed them.
 
 Configure the installed command as a custom Zed agent. ACP Registry publication
 is tracked in
@@ -364,7 +387,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-0.5.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-0.6.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials
