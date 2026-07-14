@@ -80,6 +80,7 @@ When the user requests a durable behavior change, record it here or in the relev
 
 - Public releases and ACP Registry metadata identify Aleksejs Kozlitins as author and use Apache-2.0.
 - Registry installation uses version-pinned frozen binaries for Linux x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x86-64.
+- Public GitHub installation provides checksum-verifying, user-local installers that expose both `native-glm-acp` and `glm-acp` without requiring Python, Node.js, or administrator privileges.
 - Terminal authentication must never echo or log `ZAI_API_KEY`; environment credentials take precedence over the user-only stored credential file.
 
 ## Project Purpose
@@ -94,8 +95,8 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 
 ## Current Project Status
 
-- Package and ACP implementation version is `0.4.1` from `glm_acp.__version__`.
-- GitHub release `v0.4.1` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, and the icon.
+- Package and ACP implementation version is `0.5.0` from `glm_acp.__version__`.
+- GitHub release `v0.5.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, and checksum-verifying Unix and Windows installers.
 - ACP Registry publication is tracked in `agentclientprotocol/registry#439` and remains pending until Registry maintainers merge it.
 - Source installs, the `glm-acp` console script, module execution, and frozen binaries share `cli.main()`.
 - ACP initialization advertises Registry-compatible `zai-api-key-setup` Terminal Auth.
@@ -128,7 +129,7 @@ Verify the install:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: editable glm_acp metadata and glm_acp-0.4.1.dist-info
+# expect: editable glm_acp metadata and glm_acp-0.5.0.dist-info
 ```
 
 ## Verification
@@ -157,3 +158,4 @@ authentication verifier against the published version-pinned archives.
 | `uv.lock` | Reproducible dependency resolution | Python implementation |
 | `README.md` | Installation, operation, security, and release guide | Project maintainers |
 | `benchmarks/` | Opt-in native/external coding-agent quality evaluation | Quality engineering |
+| `scripts/` | Runtime-free public installers for published frozen binaries | Release engineering |

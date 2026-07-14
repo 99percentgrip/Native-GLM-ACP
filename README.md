@@ -102,16 +102,34 @@ servers reuse the existing API key without printing or persisting it.
 
 ## Install
 
-### Release binary
+### One-command release install
 
-The current release is
-[v0.4.1](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v0.4.1).
-Download the archive for your platform from that release,
-extract it, then run the one-time terminal setup:
+Linux and macOS:
 
 ```bash
-./native-glm-acp --setup
+curl -fsSL https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/latest/download/install.sh | sh
+glm-acp --setup
 ```
+
+Windows PowerShell:
+
+```powershell
+$installer = Join-Path $env:TEMP "install-glm-acp.ps1"
+Invoke-WebRequest https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/latest/download/install.ps1 -OutFile $installer
+& $installer
+Remove-Item $installer
+glm-acp --setup
+```
+
+The installers select the correct frozen binary, verify its published SHA-256
+checksum, install without administrator privileges, and expose both `glm-acp`
+and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
+terminal after installation if `glm-acp` is not immediately found.
+
+To pin a release, set `GLM_ACP_VERSION=v0.5.0` before running the Unix
+installer, or pass `-Version v0.5.0` to the downloaded PowerShell script.
+The current release and manual-download fallback is
+[v0.5.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v0.5.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -126,8 +144,8 @@ Default credential locations:
 Set `GLM_ACP_CONFIG_DIR` to override the configuration directory. The key is
 never printed or written to logs.
 
-Configure the extracted executable as a custom Zed agent. ACP Registry
-publication is tracked in
+Configure the installed command as a custom Zed agent. ACP Registry publication
+is tracked in
 [agentclientprotocol/registry#439](https://github.com/agentclientprotocol/registry/pull/439);
 Registry installation becomes public after the Registry maintainers merge it.
 
@@ -161,7 +179,7 @@ add to `settings.json`:
   "agent_servers": {
     "glm-acp": {
       "type": "custom",
-      "command": "/path/to/native-glm-acp",
+      "command": "glm-acp",
       "args": []
     }
   }
@@ -169,7 +187,9 @@ add to `settings.json`:
 ```
 
 Restart Zed, open the Agent Panel, and select **Z.ai GLM** from the agent
-dropdown.
+dropdown. If Zed was already open during installation and does not inherit the
+updated PATH, restart it or use the absolute installed command (`~/.local/bin/glm-acp`
+on Linux and macOS).
 
 If you use the development installation instead, keep the Python command,
 `-m glm_acp` argument, working directory, and optional `ZAI_API_KEY` environment
@@ -344,7 +364,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-0.4.1.dist-info  (and editable-install metadata)
+# expect: glm_acp-0.5.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

@@ -47,7 +47,9 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --frozen --extra dev
       - name: Check release-code formatting
-        run: uv run --frozen ruff format --check glm_acp/cli.py glm_acp/launcher.py tests/test_cli.py tests/test_registry_package.py
+        run: uv run --frozen ruff format --check glm_acp/cli.py glm_acp/launcher.py tests/test_cli.py tests/test_installers.py tests/test_registry_package.py
+      - name: Check Unix installer syntax
+        run: bash -n scripts/install.sh
       - name: Run fatal Python lint
         run: uv run --frozen ruff check --select E9,F63,F7,F82 .
       - name: Validate quality benchmark catalog
@@ -99,6 +101,10 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
       - name: Install locked dependencies
         run: uv sync --frozen --extra dev
+      - name: Check PowerShell installer syntax
+        if: matrix.target == 'windows-x86_64'
+        shell: pwsh
+        run: $null = [scriptblock]::Create((Get-Content -Raw scripts/install.ps1))
       - name: Run tests
         run: uv run --frozen pytest tests/ -q
       - name: Build frozen executable

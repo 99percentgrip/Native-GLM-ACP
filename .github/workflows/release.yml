@@ -134,4 +134,4 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes agent.json icon.svg native-glm-acp-* dist/*
+        run: gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes agent.json icon.svg scripts/install.sh scripts/install.ps1 native-glm-acp-* dist/*

@@ -10,6 +10,7 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
 - `test_cli.py` covers terminal setup and secret-safe status output.
 - `test_config.py` covers models, endpoints, credential precedence, and secure persistence.
 - `test_registry_package.py` covers public Registry identity and release URL invariants.
+- `test_installers.py` covers the user-local command aliases, checksum enforcement, platform mapping, and release publication contract.
 - Remaining modules cover tools, sessions, streaming, compaction, and GLM HTTP behavior.
 - `test_mcp.py` and `test_memory.py` cover remote MCP protocol handling and opt-in project memory.
 - `test_quality.py` covers tool-loop, failed-verification and unverified-edit recovery, benchmark locking/incremental reports, million-token estimation, and real stdio/SDK ACP process lifecycles.
