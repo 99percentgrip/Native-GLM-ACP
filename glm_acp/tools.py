@@ -8,11 +8,24 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import os
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+MAX_TOOL_OUTPUT_CHARS = 64_000
+_COMMAND_STREAM_LIMIT = MAX_TOOL_OUTPUT_CHARS // 2
+_ALWAYS_IGNORE = [
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".eggs",
+]
 
 
 def _load_gitignore_patterns(root: Path) -> list[str]:
@@ -60,6 +73,7 @@ def _is_ignored(rel_path: str, patterns: list[str]) -> bool:
             return True
     return False
 
+
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -70,8 +84,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file"},
-                    "start_line": {"type": "integer", "description": "1-based line to start reading from (optional)"},
-                    "end_line": {"type": "integer", "description": "1-based line to end reading at (optional)"},
+                    "start_line": {
+                        "type": "integer",
+                        "description": "1-based line to start reading from (optional)",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "1-based line to end reading at (optional)",
+                    },
                 },
                 "required": ["path"],
             },
@@ -145,7 +165,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "Regular expression to search for"},
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regular expression to search for",
+                    },
                     "path": {"type": "string", "description": "Root directory (defaults to cwd)"},
                     "include": {"type": "string", "description": "Glob filter (e.g. *.py)"},
                 },
@@ -162,7 +185,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The shell command to execute"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"},
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default 120)",
+                    },
                 },
                 "required": ["command"],
             },
@@ -314,30 +340,61 @@ async def execute_tool(
 
 
 async def _read_file(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
+    return await asyncio.to_thread(_read_file_sync, args, sandbox)
+
+
+def _read_file_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     path = sandbox.resolve(args["path"])
     if not path.is_file():
         raise ToolError(f"File not found: {path}")
-    text = _read_utf8_text(path, "read")
     start = args.get("start_line")
     end = args.get("end_line")
-    if start or end:
-        # Coerce to int in case the model sends strings
-        try:
-            start = int(start) if start else None
-            end = int(end) if end else None
-        except (TypeError, ValueError):
-            raise ToolError("start_line and end_line must be integers")
-        lines = text.splitlines(keepends=True)
-        s = (start - 1) if start and start > 0 else 0
-        e = end if end and end <= len(lines) else len(lines)
-        if s >= len(lines):
-            text = ""
-        else:
-            text = "".join(lines[s:e])
-    return ToolResult(output=text, file_path=str(path), line=start if isinstance(start, int) else None)
+    try:
+        start = int(start) if start else 1
+        end = int(end) if end else None
+    except (TypeError, ValueError):
+        raise ToolError("start_line and end_line must be integers")
+    start = max(start, 1)
+
+    parts: list[str] = []
+    chars = 0
+    truncated_at: int | None = None
+    with open(path, "rb") as fh:
+        for line_no, raw_line in enumerate(fh, 1):
+            if line_no < start:
+                continue
+            if end is not None and line_no > end:
+                break
+            if b"\x00" in raw_line:
+                raise ToolError(f"Cannot read binary file: {path}")
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ToolError(f"Cannot read binary file: {path}")
+            line = line.replace("\r\n", "\n").replace("\r", "\n")
+            remaining = MAX_TOOL_OUTPUT_CHARS - chars
+            if len(line) > remaining:
+                if remaining > 0:
+                    parts.append(line[:remaining])
+                truncated_at = line_no + 1
+                break
+            parts.append(line)
+            chars += len(line)
+
+    text = "".join(parts)
+    if truncated_at is not None:
+        text += (
+            f"\n... (truncated at {MAX_TOOL_OUTPUT_CHARS} characters; "
+            f"continue with start_line={truncated_at})"
+        )
+    return ToolResult(output=text, file_path=str(path), line=start)
 
 
 async def _write_file(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
+    return await asyncio.to_thread(_write_file_sync, args, sandbox)
+
+
+def _write_file_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     path = sandbox.resolve(args["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
     old_text = path.read_text() if path.exists() else None
@@ -351,6 +408,10 @@ async def _write_file(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
 
 
 async def _edit_file(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
+    return await asyncio.to_thread(_edit_file_sync, args, sandbox)
+
+
+def _edit_file_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     path = sandbox.resolve(args["path"])
     if not path.is_file():
         raise ToolError(f"File not found: {path}")
@@ -375,6 +436,10 @@ async def _edit_file(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
 
 
 async def _list_directory(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
+    return await asyncio.to_thread(_list_directory_sync, args, sandbox)
+
+
+def _list_directory_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     path = sandbox.resolve(args.get("path", "."))
     if not path.is_dir():
         raise ToolError(f"Not a directory: {path}")
@@ -386,25 +451,50 @@ async def _list_directory(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     return ToolResult(output="\n".join(lines) if lines else "(empty)", file_path=str(path))
 
 
-async def _search_files(args: dict[str, Any], sandbox: Sandbox) -> str:
+async def _search_files(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
+    return await asyncio.to_thread(_search_files_sync, args, sandbox)
+
+
+def _walk_files(root: Path, patterns: list[str]):
+    """Yield project files while pruning ignored directories before descent."""
+    for current, dirnames, filenames in os.walk(root):
+        current_path = Path(current)
+        rel_dir = current_path.relative_to(root)
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not _is_ignored(
+                str((rel_dir / name) if str(rel_dir) != "." else Path(name)),
+                patterns,
+            )
+        ]
+        for name in filenames:
+            yield current_path / name
+
+
+def _search_files_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     pattern = args["pattern"]
     root = sandbox.resolve(args.get("path", "."))
     gitignore_patterns = _load_gitignore_patterns(root)
     # Always ignore common non-project directories
-    always_ignore = [".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".eggs"]
+    ignore_patterns = gitignore_patterns + _ALWAYS_IGNORE
     matches = []
-    for p in root.rglob("*"):
+    for p in _walk_files(root, ignore_patterns):
         rel = p.relative_to(root)
         rel_str = str(rel)
         if p.is_file() and fnmatch.fnmatch(rel_str, pattern):
-            if _is_ignored(rel_str, gitignore_patterns) or _is_ignored(rel_str, always_ignore):
+            if _is_ignored(rel_str, ignore_patterns):
                 continue
             matches.append(rel_str)
     matches.sort()
     return ToolResult(output="\n".join(matches[:200]) if matches else "No files found")
 
 
-async def _grep(args: dict[str, Any], sandbox: Sandbox) -> str:
+async def _grep(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
+    return await asyncio.to_thread(_grep_sync, args, sandbox)
+
+
+def _grep_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     pattern = args["pattern"]
     root = sandbox.resolve(args.get("path", "."))
     include = args.get("include")
@@ -413,14 +503,14 @@ async def _grep(args: dict[str, Any], sandbox: Sandbox) -> str:
     except re.error as e:
         raise ToolError(f"Invalid regex pattern: {e}")
     gitignore_patterns = _load_gitignore_patterns(root)
-    always_ignore = [".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".eggs"]
+    ignore_patterns = gitignore_patterns + _ALWAYS_IGNORE
     results = []
-    for p in root.rglob("*"):
+    for p in _walk_files(root, ignore_patterns):
         if not p.is_file():
             continue
         rel = p.relative_to(root)
         rel_str = str(rel)
-        if _is_ignored(rel_str, gitignore_patterns) or _is_ignored(rel_str, always_ignore):
+        if _is_ignored(rel_str, ignore_patterns):
             continue
         if include and not fnmatch.fnmatch(p.name, include):
             continue
@@ -450,14 +540,49 @@ async def _run_command(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
+    async def collect(stream: asyncio.StreamReader | None) -> tuple[bytes, int]:
+        if stream is None:
+            return b"", 0
+        head_limit = _COMMAND_STREAM_LIMIT // 2
+        tail_limit = _COMMAND_STREAM_LIMIT - head_limit
+        head = bytearray()
+        tail = bytearray()
+        total = 0
+        while chunk := await stream.read(8192):
+            total += len(chunk)
+            if len(head) < head_limit:
+                take = min(head_limit - len(head), len(chunk))
+                head.extend(chunk[:take])
+                chunk = chunk[take:]
+            if chunk:
+                tail.extend(chunk)
+                if len(tail) > tail_limit:
+                    del tail[:-tail_limit]
+        if total <= _COMMAND_STREAM_LIMIT:
+            return bytes(head + tail), total
+        marker = (f"\n... (truncated {total - _COMMAND_STREAM_LIMIT} bytes) ...\n").encode()
+        return bytes(head) + marker + bytes(tail), total
+
+    stdout_task = asyncio.create_task(collect(proc.stdout))
+    stderr_task = asyncio.create_task(collect(proc.stderr))
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+        stdout_info, stderr_info = await asyncio.gather(stdout_task, stderr_task)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         raise ToolError(f"Command timed out after {timeout}s")
-    # Use errors="replace" to handle binary output gracefully
-    output = stdout.decode(errors="replace")
-    if stderr:
-        output += "\n" + stderr.decode(errors="replace")
-    return ToolResult(output=output.strip() if output.strip() else "(no output)")
+    stdout, _ = stdout_info
+    stderr, _ = stderr_info
+    stdout_text = stdout.decode(errors="replace").strip()
+    stderr_text = stderr.decode(errors="replace").strip()
+    sections = [f"Exit code: {proc.returncode}"]
+    if stdout_text:
+        sections.append(f"Stdout:\n{stdout_text}")
+    if stderr_text:
+        sections.append(f"Stderr:\n{stderr_text}")
+    if not stdout_text and not stderr_text:
+        sections.append("(no output)")
+    return ToolResult(output="\n\n".join(sections))

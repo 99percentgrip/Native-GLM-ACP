@@ -5,21 +5,20 @@ exercising the full chunk-parsing, tool-call assembly, usage tracking,
 and error-handling logic without hitting the real API.
 """
 
-import asyncio
 import json
+from unittest.mock import AsyncMock
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, AsyncMock
 
 os = __import__("os")
 os.environ.setdefault("ZAI_API_KEY", "test-key")
 
-from glm_acp.glm_client import GlmClient, GlmApiError, StreamResult
-from glm_acp.config import MAX_RETRIES
-
+from glm_acp.glm_client import GlmApiError, GlmClient, StreamResult
 
 # ============================================================
 # Helpers: build mock SSE responses
 # ============================================================
+
 
 def _sse_line(data: dict | str) -> bytes:
     """Build a single SSE line as bytes."""
@@ -83,8 +82,10 @@ class MockHttpClient:
     def __init__(self, lines: list[bytes], status_code: int = 200):
         self._lines = lines
         self._status = status_code
+        self.requests: list[dict] = []
 
     def stream(self, method: str, url: str, **kwargs):
+        self.requests.append(kwargs)
         return MockStreamResponse(self._lines, self._status)
 
     async def aclose(self):
@@ -101,6 +102,7 @@ def _make_client(lines: list[bytes], status_code: int = 200) -> GlmClient:
 # ============================================================
 # Content streaming
 # ============================================================
+
 
 class TestStreamContent:
     @pytest.mark.asyncio
@@ -143,19 +145,63 @@ class TestStreamContent:
         result = StreamResult()
         chunks = []
         await client._execute_stream(
-            {}, result, None,
+            {},
+            result,
+            None,
             AsyncMock(side_effect=lambda c: chunks.append(c)),
             None,
         )
-        assert chunks == ["AB", "CD"]
+        assert "".join(chunks) == "ABCD"
         assert result.content == "ABCD"
+
+    @pytest.mark.asyncio
+    async def test_small_deltas_are_coalesced(self):
+        """ACP updates should not be emitted once per tiny model delta."""
+        lines = [
+            *[_sse_line(_sse_chunk(content="x")) for _ in range(40)],
+            _sse_line(_sse_chunk(finish="stop")),
+            _sse_line("[DONE]"),
+        ]
+        client = _make_client(lines)
+        result = StreamResult()
+        chunks = []
+
+        await client._execute_stream(
+            {},
+            result,
+            None,
+            AsyncMock(side_effect=lambda chunk: chunks.append(chunk)),
+            None,
+        )
+
+        assert result.content == "x" * 40
+        assert "".join(chunks) == result.content
+        assert len(chunks) < 10
 
 
 # ============================================================
 # Reasoning streaming
 # ============================================================
 
+
 class TestStreamReasoning:
+    @pytest.mark.asyncio
+    async def test_deep_reasoning_preserves_history_in_request(self):
+        lines = [
+            _sse_line(_sse_chunk(content="answer", finish="stop")),
+            _sse_line("[DONE]"),
+        ]
+        client = _make_client(lines)
+        client.reasoning_effort = "high"
+        client.preserve_thinking = True
+        result = StreamResult()
+
+        await client._do_stream_request([], [], result, None, None, None)
+
+        body = client._client.requests[0]["json"]
+        assert body["thinking"] == {"type": "enabled", "clear_thinking": False}
+        assert body["reasoning_effort"] == "high"
+
     @pytest.mark.asyncio
     async def test_reasoning_accumulates(self):
         """Reasoning content should accumulate separately from content."""
@@ -196,18 +242,27 @@ class TestStreamReasoning:
 # Tool call assembly
 # ============================================================
 
+
 class TestStreamToolCalls:
     @pytest.mark.asyncio
     async def test_single_tool_call(self):
         """A complete tool call should be assembled from deltas."""
         lines = [
-            _sse_line(_sse_chunk(tool_calls=[
-                {"index": 0, "id": "call_1", "type": "function",
-                 "function": {"name": "read_file", "arguments": '{"path":'}}
-            ])),
-            _sse_line(_sse_chunk(tool_calls=[
-                {"index": 0, "function": {"arguments": ' "main.py"}'}}
-            ])),
+            _sse_line(
+                _sse_chunk(
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path":'},
+                        }
+                    ]
+                )
+            ),
+            _sse_line(
+                _sse_chunk(tool_calls=[{"index": 0, "function": {"arguments": ' "main.py"}'}}])
+            ),
             _sse_line(_sse_chunk(finish="tool_calls")),
             _sse_line("[DONE]"),
         ]
@@ -224,12 +279,28 @@ class TestStreamToolCalls:
     async def test_multiple_tool_calls(self):
         """Multiple tool calls in the same response."""
         lines = [
-            _sse_line(_sse_chunk(tool_calls=[
-                {"index": 0, "id": "call_1", "function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}
-            ])),
-            _sse_line(_sse_chunk(tool_calls=[
-                {"index": 1, "id": "call_2", "function": {"name": "read_file", "arguments": '{"path": "b.py"}'}}
-            ])),
+            _sse_line(
+                _sse_chunk(
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
+                        }
+                    ]
+                )
+            ),
+            _sse_line(
+                _sse_chunk(
+                    tool_calls=[
+                        {
+                            "index": 1,
+                            "id": "call_2",
+                            "function": {"name": "read_file", "arguments": '{"path": "b.py"}'},
+                        }
+                    ]
+                )
+            ),
             _sse_line(_sse_chunk(finish="tool_calls")),
             _sse_line("[DONE]"),
         ]
@@ -244,9 +315,17 @@ class TestStreamToolCalls:
     async def test_tool_call_started_callback(self):
         """on_tool_call_started should fire when name first appears."""
         lines = [
-            _sse_line(_sse_chunk(tool_calls=[
-                {"index": 0, "id": "call_1", "function": {"name": "write_file", "arguments": "{}"}}
-            ])),
+            _sse_line(
+                _sse_chunk(
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {"name": "write_file", "arguments": "{}"},
+                        }
+                    ]
+                )
+            ),
             _sse_line(_sse_chunk(finish="tool_calls")),
             _sse_line("[DONE]"),
         ]
@@ -254,7 +333,10 @@ class TestStreamToolCalls:
         result = StreamResult()
         calls = []
         await client._execute_stream(
-            {}, result, None, None,
+            {},
+            result,
+            None,
+            None,
             AsyncMock(side_effect=lambda tc_id, name: calls.append((tc_id, name))),
         )
         assert len(calls) == 1
@@ -264,9 +346,11 @@ class TestStreamToolCalls:
     async def test_tool_call_no_name_skipped(self):
         """Tool call deltas without a name should be skipped in final list."""
         lines = [
-            _sse_line(_sse_chunk(tool_calls=[
-                {"index": 0, "id": "call_1", "function": {"arguments": "{}"}}
-            ])),
+            _sse_line(
+                _sse_chunk(
+                    tool_calls=[{"index": 0, "id": "call_1", "function": {"arguments": "{}"}}]
+                )
+            ),
             _sse_line(_sse_chunk(finish="tool_calls")),
             _sse_line("[DONE]"),
         ]
@@ -280,9 +364,17 @@ class TestStreamToolCalls:
     async def test_tool_call_malformed_arguments(self):
         """Malformed JSON arguments should become {"_raw": ...}."""
         lines = [
-            _sse_line(_sse_chunk(tool_calls=[
-                {"index": 0, "id": "call_1", "function": {"name": "read_file", "arguments": "{broken"}}
-            ])),
+            _sse_line(
+                _sse_chunk(
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {"name": "read_file", "arguments": "{broken"},
+                        }
+                    ]
+                )
+            ),
             _sse_line(_sse_chunk(finish="tool_calls")),
             _sse_line("[DONE]"),
         ]
@@ -296,9 +388,17 @@ class TestStreamToolCalls:
     async def test_tool_call_empty_arguments(self):
         """Empty arguments string should become empty dict."""
         lines = [
-            _sse_line(_sse_chunk(tool_calls=[
-                {"index": 0, "id": "call_1", "function": {"name": "update_plan", "arguments": ""}}
-            ])),
+            _sse_line(
+                _sse_chunk(
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {"name": "update_plan", "arguments": ""},
+                        }
+                    ]
+                )
+            ),
             _sse_line(_sse_chunk(finish="tool_calls")),
             _sse_line("[DONE]"),
         ]
@@ -312,9 +412,11 @@ class TestStreamToolCalls:
     async def test_tool_call_auto_id(self):
         """Tool call without an id should get an auto-generated one."""
         lines = [
-            _sse_line(_sse_chunk(tool_calls=[
-                {"index": 0, "function": {"name": "read_file", "arguments": "{}"}}
-            ])),
+            _sse_line(
+                _sse_chunk(
+                    tool_calls=[{"index": 0, "function": {"name": "read_file", "arguments": "{}"}}]
+                )
+            ),
             _sse_line(_sse_chunk(finish="tool_calls")),
             _sse_line("[DONE]"),
         ]
@@ -329,17 +431,23 @@ class TestStreamToolCalls:
 # Usage tracking
 # ============================================================
 
+
 class TestStreamUsage:
     @pytest.mark.asyncio
     async def test_usage_captured(self):
         """Usage data should be captured from the final chunk."""
         lines = [
             _sse_line(_sse_chunk(content="hello", finish="stop")),
-            _sse_line({"choices": [], "usage": {
-                "prompt_tokens": 100,
-                "completion_tokens": 50,
-                "total_tokens": 150,
-            }}),
+            _sse_line(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 50,
+                        "total_tokens": 150,
+                    },
+                }
+            ),
             _sse_line("[DONE]"),
         ]
         client = _make_client(lines)
@@ -367,6 +475,7 @@ class TestStreamUsage:
 # Error handling
 # ============================================================
 
+
 class TestStreamErrors:
     @pytest.mark.asyncio
     async def test_non_200_raises_glm_error(self):
@@ -392,6 +501,7 @@ class TestStreamErrors:
 # ============================================================
 # Edge cases: malformed SSE, empty lines, garbage
 # ============================================================
+
 
 class TestStreamMalformed:
     @pytest.mark.asyncio
@@ -439,7 +549,12 @@ class TestStreamMalformed:
         """Chunks with empty choices array should be skipped (but usage captured)."""
         lines = [
             _sse_line(_sse_chunk(content="text", finish="stop")),
-            _sse_line({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}),
+            _sse_line(
+                {
+                    "choices": [],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                }
+            ),
             _sse_line("[DONE]"),
         ]
         client = _make_client(lines)
@@ -478,6 +593,7 @@ class TestStreamMalformed:
 # Cancellation
 # ============================================================
 
+
 class TestStreamCancel:
     @pytest.mark.asyncio
     async def test_cancel_sets_finish_reason(self):
@@ -500,6 +616,7 @@ class TestStreamCancel:
 # Retry logic (via _do_stream_request)
 # ============================================================
 
+
 class TestStreamRetry:
     @pytest.mark.asyncio
     async def test_retry_on_500_then_success(self):
@@ -511,6 +628,7 @@ class TestStreamRetry:
         ]
 
         call_count = 0
+
         class FlakyClient:
             def stream(self, method, url, **kwargs):
                 nonlocal call_count
@@ -518,6 +636,7 @@ class TestStreamRetry:
                 if call_count == 1:
                     return MockStreamResponse(fail_lines, status_code=500)
                 return MockStreamResponse(success_lines, status_code=200)
+
             async def aclose(self):
                 pass
 
@@ -543,6 +662,7 @@ class TestStreamRetry:
         ]
 
         call_count = 0
+
         class FlakyClient:
             def stream(self, method, url, **kwargs):
                 nonlocal call_count
@@ -550,19 +670,28 @@ class TestStreamRetry:
                 if call_count == 1:
                     return MockStreamResponse(fail_lines, status_code=200)
                 return MockStreamResponse(success_lines, status_code=200)
+
             async def aclose(self):
                 pass
 
         client = GlmClient(model="glm-5.2")
         client._client = FlakyClient()
 
+        emitted = []
         result = StreamResult()
-        # The first attempt's _execute_stream will read "partial " content
-        # but then the stream ends (no DONE). It won't raise GlmApiError
-        # (status was 200). So retry won't trigger. This test verifies
-        # that a GlmApiError retry DOES clear content.
-        # Use a proper 500 scenario instead.
-        pass  # Tested in test_retry_on_500_then_success above
+        await client._do_stream_request(
+            {},
+            [],
+            result,
+            None,
+            AsyncMock(side_effect=lambda chunk: emitted.append(chunk)),
+            None,
+        )
+
+        assert call_count == 1
+        assert result.content == "partial "
+        assert "".join(emitted) == "partial "
+        assert result.finish_reason == "network_error"
 
     @pytest.mark.asyncio
     async def test_non_retryable_error_raises_immediately(self):
@@ -570,11 +699,13 @@ class TestStreamRetry:
         lines = [b'{"error": "bad request"}']
 
         call_count = 0
+
         class FailClient:
             def stream(self, method, url, **kwargs):
                 nonlocal call_count
                 call_count += 1
                 return MockStreamResponse(lines, status_code=400)
+
             async def aclose(self):
                 pass
 
@@ -591,7 +722,39 @@ class TestStreamRetry:
 # Auto-continuation (via stream_completion)
 # ============================================================
 
+
 class TestAutoContinuation:
+    @pytest.mark.asyncio
+    async def test_continuation_cap_is_reported(self, monkeypatch):
+        lines = [
+            _sse_line(_sse_chunk(content="part", finish="length")),
+            _sse_line("[DONE]"),
+        ]
+        call_count = 0
+
+        class LengthClient:
+            def stream(self, method, url, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                return MockStreamResponse(lines, status_code=200)
+
+            async def aclose(self):
+                pass
+
+        monkeypatch.setattr("glm_acp.glm_client.MAX_AUTO_CONTINUATIONS", 2)
+        client = GlmClient(model="glm-5.2")
+        client._client = LengthClient()
+        result = await client.stream_completion(
+            messages=[{"role": "user", "content": "test"}],
+            tools=[],
+            on_reasoning=None,
+            on_content=None,
+            on_tool_call_started=None,
+        )
+
+        assert call_count == 3  # initial request + two continuations
+        assert result.finish_reason == "continuation_limit"
+
     @pytest.mark.asyncio
     async def test_length_triggers_continuation(self):
         """finish_reason=length without tool_calls should auto-continue."""
@@ -607,6 +770,7 @@ class TestAutoContinuation:
         ]
 
         call_count = 0
+
         class ContinuationClient:
             def stream(self, method, url, **kwargs):
                 nonlocal call_count
@@ -614,6 +778,7 @@ class TestAutoContinuation:
                 if call_count == 1:
                     return MockStreamResponse(first_lines, status_code=200)
                 return MockStreamResponse(second_lines, status_code=200)
+
             async def aclose(self):
                 pass
 
@@ -636,20 +801,30 @@ class TestAutoContinuation:
     async def test_no_continuation_on_tool_calls(self):
         """finish_reason=length WITH tool_calls should NOT auto-continue."""
         lines = [
-            _sse_line(_sse_chunk(
-                content="",
-                tool_calls=[{"index": 0, "id": "call_1", "function": {"name": "read_file", "arguments": "{}"}}],
-                finish="length",
-            )),
+            _sse_line(
+                _sse_chunk(
+                    content="",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                    finish="length",
+                )
+            ),
             _sse_line("[DONE]"),
         ]
 
         call_count = 0
+
         class SingleClient:
             def stream(self, method, url, **kwargs):
                 nonlocal call_count
                 call_count += 1
                 return MockStreamResponse(lines, status_code=200)
+
             async def aclose(self):
                 pass
 
@@ -675,11 +850,13 @@ class TestAutoContinuation:
         ]
 
         call_count = 0
+
         class SingleClient:
             def stream(self, method, url, **kwargs):
                 nonlocal call_count
                 call_count += 1
                 return MockStreamResponse(lines, status_code=200)
+
             async def aclose(self):
                 pass
 

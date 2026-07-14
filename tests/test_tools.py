@@ -1,24 +1,16 @@
 """Tests for glm_acp.tools — sandbox, gitignore, tool execution, ToolResult."""
 
-import asyncio
+import sys
+
 import pytest
 
 from glm_acp.tools import (
     Sandbox,
     ToolError,
     ToolResult,
-    execute_tool,
     _is_ignored,
     _load_gitignore_patterns,
-)
-from pathlib import Path
-
-from glm_acp.tools import (
-    Sandbox,
-    ToolError,
     execute_tool,
-    _is_ignored,
-    _load_gitignore_patterns,
 )
 
 
@@ -98,6 +90,17 @@ class TestToolExecution:
         assert result.file_path is not None
 
     @pytest.mark.asyncio
+    async def test_read_file_caps_default_output(self, tmp_path):
+        from glm_acp.tools import MAX_TOOL_OUTPUT_CHARS
+
+        (tmp_path / "large.txt").write_text("line\n" * (MAX_TOOL_OUTPUT_CHARS // 2))
+        result = await execute_tool("read_file", {"path": "large.txt"}, Sandbox(str(tmp_path)))
+
+        assert len(result.output) <= MAX_TOOL_OUTPUT_CHARS + 250
+        assert "truncated" in result.output.lower()
+        assert "start_line" in result.output
+
+    @pytest.mark.asyncio
     async def test_read_file_not_found(self, tmp_path):
         sandbox = Sandbox(str(tmp_path))
         with pytest.raises(ToolError, match="File not found"):
@@ -117,7 +120,9 @@ class TestToolExecution:
         f = tmp_path / "existing.txt"
         f.write_text("old")
         sandbox = Sandbox(str(tmp_path))
-        result = await execute_tool("write_file", {"path": "existing.txt", "content": "new"}, sandbox)
+        result = await execute_tool(
+            "write_file", {"path": "existing.txt", "content": "new"}, sandbox
+        )
         assert result.old_text == "old"
         assert result.new_text == "new"
 
@@ -126,11 +131,15 @@ class TestToolExecution:
         f = tmp_path / "code.py"
         f.write_text("old line\nnew line")
         sandbox = Sandbox(str(tmp_path))
-        result = await execute_tool("edit_file", {
-            "path": "code.py",
-            "old_text": "old line",
-            "new_text": "replaced",
-        }, sandbox)
+        result = await execute_tool(
+            "edit_file",
+            {
+                "path": "code.py",
+                "old_text": "old line",
+                "new_text": "replaced",
+            },
+            sandbox,
+        )
         assert f.read_text() == "replaced\nnew line"
         assert result.file_path is not None
         assert result.old_text == "old line"
@@ -142,11 +151,15 @@ class TestToolExecution:
         f.write_text("hello")
         sandbox = Sandbox(str(tmp_path))
         with pytest.raises(ToolError, match="old_text not found"):
-            await execute_tool("edit_file", {
-                "path": "code.py",
-                "old_text": "missing",
-                "new_text": "x",
-            }, sandbox)
+            await execute_tool(
+                "edit_file",
+                {
+                    "path": "code.py",
+                    "old_text": "missing",
+                    "new_text": "x",
+                },
+                sandbox,
+            )
 
     @pytest.mark.asyncio
     async def test_edit_file_ambiguous(self, tmp_path):
@@ -154,11 +167,15 @@ class TestToolExecution:
         f.write_text("dup\ndup")
         sandbox = Sandbox(str(tmp_path))
         with pytest.raises(ToolError, match="appears 2 times"):
-            await execute_tool("edit_file", {
-                "path": "code.py",
-                "old_text": "dup",
-                "new_text": "x",
-            }, sandbox)
+            await execute_tool(
+                "edit_file",
+                {
+                    "path": "code.py",
+                    "old_text": "dup",
+                    "new_text": "x",
+                },
+                sandbox,
+            )
 
     @pytest.mark.asyncio
     async def test_list_directory(self, tmp_path):
@@ -220,7 +237,9 @@ class TestToolResultStructure:
     async def test_write_file_overwrite_has_old(self, tmp_path):
         (tmp_path / "existing.py").write_text("old content")
         sandbox = Sandbox(str(tmp_path))
-        result = await execute_tool("write_file", {"path": "existing.py", "content": "new"}, sandbox)
+        result = await execute_tool(
+            "write_file", {"path": "existing.py", "content": "new"}, sandbox
+        )
         assert result.old_text == "old content"
         assert result.new_text == "new"
 
@@ -228,11 +247,15 @@ class TestToolResultStructure:
     async def test_edit_file_has_diff(self, tmp_path):
         (tmp_path / "code.py").write_text("foo\nbar")
         sandbox = Sandbox(str(tmp_path))
-        result = await execute_tool("edit_file", {
-            "path": "code.py",
-            "old_text": "foo",
-            "new_text": "baz",
-        }, sandbox)
+        result = await execute_tool(
+            "edit_file",
+            {
+                "path": "code.py",
+                "old_text": "foo",
+                "new_text": "baz",
+            },
+            sandbox,
+        )
         assert result.file_path is not None
         assert result.old_text == "foo"
         assert result.new_text == "baz"
@@ -244,6 +267,31 @@ class TestToolResultStructure:
         assert result.file_path is None
         assert result.old_text is None
         assert result.new_text is None
+
+    @pytest.mark.asyncio
+    async def test_run_command_reports_silent_failure(self, tmp_path):
+        script = tmp_path / "fail.py"
+        script.write_text("raise SystemExit(7)\n")
+        sandbox = Sandbox(str(tmp_path))
+        result = await execute_tool(
+            "run_command", {"command": f'"{sys.executable}" "{script}"'}, sandbox
+        )
+        assert "Exit code: 7" in result.output
+
+    @pytest.mark.asyncio
+    async def test_run_command_caps_output(self, tmp_path):
+        from glm_acp.tools import MAX_TOOL_OUTPUT_CHARS
+
+        script = tmp_path / "large_output.py"
+        script.write_text("print('x' * 200000)\n")
+        sandbox = Sandbox(str(tmp_path))
+        result = await execute_tool(
+            "run_command",
+            {"command": f'"{sys.executable}" "{script}"'},
+            sandbox,
+        )
+        assert len(result.output) <= MAX_TOOL_OUTPUT_CHARS + 500
+        assert "truncated" in result.output.lower()
 
     @pytest.mark.asyncio
     async def test_read_file_with_line(self, tmp_path):
@@ -264,6 +312,7 @@ class TestToolResultStructure:
 # ============================================================
 # Edge cases: binary output, bad timeouts
 # ============================================================
+
 
 class TestToolEdgeCases:
     @pytest.mark.asyncio
@@ -287,24 +336,21 @@ class TestToolEdgeCases:
     async def test_run_command_zero_timeout_normalized(self, tmp_path):
         """Zero timeout should fall back to default."""
         sandbox = Sandbox(str(tmp_path))
-        result = await execute_tool(
-            "run_command", {"command": "echo hi", "timeout": 0}, sandbox
-        )
+        result = await execute_tool("run_command", {"command": "echo hi", "timeout": 0}, sandbox)
         assert "hi" in result.output
 
     @pytest.mark.asyncio
     async def test_run_command_negative_timeout_normalized(self, tmp_path):
         """Negative timeout should fall back to default."""
         sandbox = Sandbox(str(tmp_path))
-        result = await execute_tool(
-            "run_command", {"command": "echo hi", "timeout": -5}, sandbox
-        )
+        result = await execute_tool("run_command", {"command": "echo hi", "timeout": -5}, sandbox)
         assert "hi" in result.output
 
     @pytest.mark.asyncio
     async def test_read_file_missing_path_key(self, tmp_path):
         """Missing path key should raise ToolError."""
         from glm_acp.tools import ToolError
+
         sandbox = Sandbox(str(tmp_path))
         with pytest.raises(ToolError):
             await execute_tool("read_file", {}, sandbox)
@@ -313,6 +359,7 @@ class TestToolEdgeCases:
     async def test_write_file_missing_content_key(self, tmp_path):
         """Missing content key should raise ToolError."""
         from glm_acp.tools import ToolError
+
         sandbox = Sandbox(str(tmp_path))
         with pytest.raises(ToolError):
             await execute_tool("write_file", {"path": "x.py"}, sandbox)
@@ -321,6 +368,7 @@ class TestToolEdgeCases:
 # ============================================================
 # Binary file robustness
 # ============================================================
+
 
 class TestBinaryFiles:
     @pytest.mark.asyncio
@@ -335,6 +383,7 @@ class TestBinaryFiles:
     async def test_read_file_binary(self, tmp_path):
         """Reading a binary file should give a clear error, not crash."""
         from glm_acp.tools import ToolError
+
         (tmp_path / "data.bin").write_bytes(b"\xff\xfe\x00\x01\x02\x03")
         sandbox = Sandbox(str(tmp_path))
         with pytest.raises(ToolError, match="binary"):
@@ -344,10 +393,13 @@ class TestBinaryFiles:
     async def test_edit_file_binary(self, tmp_path):
         """Editing a binary file should give a clear error, not crash."""
         from glm_acp.tools import ToolError
+
         (tmp_path / "data.bin").write_bytes(b"\xff\xfe\x00\x01")
         sandbox = Sandbox(str(tmp_path))
         with pytest.raises(ToolError, match="binary"):
-            await execute_tool("edit_file", {"path": "data.bin", "old_text": "a", "new_text": "b"}, sandbox)
+            await execute_tool(
+                "edit_file", {"path": "data.bin", "old_text": "a", "new_text": "b"}, sandbox
+            )
 
     @pytest.mark.asyncio
     async def test_grep_skips_binary_files(self, tmp_path):
@@ -364,11 +416,13 @@ class TestBinaryFiles:
 # Invalid regex / string line numbers
 # ============================================================
 
+
 class TestToolInputValidation:
     @pytest.mark.asyncio
     async def test_grep_invalid_regex(self, tmp_path):
         """Invalid regex should give a clear error, not crash."""
         from glm_acp.tools import ToolError
+
         sandbox = Sandbox(str(tmp_path))
         with pytest.raises(ToolError, match="Invalid regex"):
             await execute_tool("grep", {"pattern": "[unclosed"}, sandbox)
@@ -402,15 +456,19 @@ class TestToolInputValidation:
     async def test_edit_file_empty_old_text(self, tmp_path):
         """Empty old_text should give a clear error, not match everywhere."""
         from glm_acp.tools import ToolError
+
         (tmp_path / "f.py").write_text("hello world")
         sandbox = Sandbox(str(tmp_path))
         with pytest.raises(ToolError, match="empty"):
-            await execute_tool("edit_file", {"path": "f.py", "old_text": "", "new_text": "x"}, sandbox)
+            await execute_tool(
+                "edit_file", {"path": "f.py", "old_text": "", "new_text": "x"}, sandbox
+            )
 
     @pytest.mark.asyncio
     async def test_edit_file_missing_old_text_key(self, tmp_path):
         """Missing old_text key should default to empty and give clear error."""
         from glm_acp.tools import ToolError
+
         (tmp_path / "f.py").write_text("hello world")
         sandbox = Sandbox(str(tmp_path))
         with pytest.raises(ToolError, match="empty"):

@@ -47,11 +47,18 @@ GLM SSE deltas are split at parse time and never mixed:
 - `delta.content` → `on_content()` callback → `agent_message_chunk` session update (code/response)
 - `delta.tool_calls` → accumulated, then reported via `tool_call` / `tool_call_update`
 
+Small text and reasoning deltas are coalesced before ACP updates. An HTTP 200
+stream that ends without `[DONE]` or a finish reason is incomplete: retry it
+only if no user-visible delta was emitted; otherwise preserve the partial
+response and report `network_error` without replaying duplicate text.
+
 ### Auto-continuation
 
 When `finish_reason == "length"` and no tool calls are pending, the client
 auto-sends a bare "continue" message (up to `MAX_AUTO_CONTINUATIONS` = 20
-times) so long multi-file refactors don't stall mid-generation.
+times) so long multi-file refactors don't stall mid-generation. Exhausting the
+cap reports `continuation_limit`; it never silently presents a capped response
+as complete.
 
 ### Context compaction (Claude Code parity)
 
@@ -67,6 +74,9 @@ context window, `_maybe_compact()` in `agent.py` fires:
    user message between the system prompt and the preserved recent messages.
 
 This mirrors Claude Code's compaction: summarize the past, keep the present.
+Compaction is transactional: invalid, missing, or empty summaries leave the
+original history unchanged. Tool call IDs and names remain explicit in the
+summary transcript so results cannot be detached from their calls.
 
 ### Usage reporting
 
@@ -93,6 +103,10 @@ GLM-5.2 supports `reasoning_effort` as a top-level API parameter (values:
 both `thinking.type` and `reasoning_effort` in the API request body. When the
 model is switched away from GLM-5.2, deep levels are hidden and the thought
 level falls back to Standard automatically.
+
+Deep High/Max requests set `thinking.clear_thinking=false`, and exact returned
+`reasoning_content` is retained in assistant history as required for subsequent
+requests. Standard and disabled modes do not persist reasoning traces.
 
 ### Permission system
 
@@ -134,12 +148,25 @@ Text-file tools decode strict UTF-8 with universal-newline normalization and
 consistently treat invalid UTF-8 or NUL-containing data as binary on every
 supported platform.
 
+Filesystem tools run off the ACP event-loop thread. Read/search calls in the
+same model batch may execute concurrently, while edits and commands remain
+ordered. Tool and embedded-resource output is bounded; truncated file reads
+include a `start_line` continuation hint. Command results always include the
+exit code and independently bounded stdout/stderr so silent failures remain
+visible without unbounded memory growth.
+
 ### Session persistence & history replay
 
 Conversation state (messages, model, mode, title) is persisted to disk
 (`~/.glm-acp/sessions/<id>.json`) after every prompt turn and config change.
 On `session/load` and `session/resume`, the agent rebuilds the `Session` from
 disk via `Session.from_dict`.
+
+Each session also has a small `.meta` sidecar for listing without parsing full
+conversation histories. Disk persistence is dispatched off the event loop,
+turns are serialized per session, and one pooled GLM HTTP client is reused until
+the session's model, endpoint, or thinking configuration changes. Agent
+shutdown and session close must close pooled clients.
 
 **Critical:** The ACP `LoadSessionResponse` and `ResumeSessionResponse` only
 carry `modes`, `config_options`, and `models` — they do **not** include message

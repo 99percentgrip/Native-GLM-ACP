@@ -32,6 +32,7 @@ def sample_data():
 # Save / Load round-trip
 # ============================================================
 
+
 class TestSaveLoad:
     def test_save_and_load(self, store, sample_data):
         store.save("session-1", sample_data)
@@ -61,6 +62,7 @@ class TestSaveLoad:
 # ============================================================
 # Path traversal protection
 # ============================================================
+
 
 class TestPathTraversal:
     def test_traversal_attempt_sanitized(self, store, sample_data):
@@ -96,6 +98,7 @@ class TestPathTraversal:
 # List sessions
 # ============================================================
 
+
 class TestListSessions:
     def test_list_empty(self, store):
         assert store.list() == []
@@ -109,8 +112,23 @@ class TestListSessions:
         assert "First chat" in titles
         assert "Second chat" in titles
 
+    def test_list_uses_metadata_sidecar_without_reading_history(self, store, sample_data):
+        store.save("s1", {**sample_data, "title": "Indexed chat"})
+        (store._base_dir / "s1.json").write_text("corrupted after indexing")
+
+        sessions = store.list()
+        assert sessions == [
+            {
+                "session_id": "s1",
+                "cwd": "/home/user/project",
+                "title": "Indexed chat",
+                "updated_at": sessions[0]["updated_at"],
+            }
+        ]
+
     def test_list_sorted_by_recency(self, store, sample_data):
         import time
+
         store.save("old", {**sample_data, "title": "Old"})
         time.sleep(0.05)
         store.save("new", {**sample_data, "title": "New"})
@@ -132,11 +150,13 @@ class TestListSessions:
 # Delete sessions
 # ============================================================
 
+
 class TestDeleteSession:
     def test_delete_existing(self, store, sample_data):
         store.save("session-1", sample_data)
         store.delete("session-1")
         assert store.load("session-1") is None
+        assert not (store._base_dir / "session-1.meta").exists()
 
     def test_delete_nonexistent_no_error(self, store):
         store.delete("nonexistent")  # should not raise
@@ -145,6 +165,7 @@ class TestDeleteSession:
 # ============================================================
 # Corrupted data handling
 # ============================================================
+
 
 class TestCorruptedData:
     def test_load_corrupted_json(self, store):

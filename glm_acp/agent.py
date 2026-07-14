@@ -31,6 +31,7 @@ from acp.schema import (
     PromptCapabilities,
     PromptResponse,
     ResumeSessionResponse,
+    SessionAdditionalDirectoriesCapabilities,
     SessionCapabilities,
     SessionCloseCapabilities,
     SessionConfigOptionSelect,
@@ -41,7 +42,6 @@ from acp.schema import (
     SessionListCapabilities,
     SessionMode,
     SessionModeState,
-    SessionAdditionalDirectoriesCapabilities,
     SessionResumeCapabilities,
     SetSessionConfigOptionResponse,
     TerminalAuthMethod,
@@ -67,7 +67,15 @@ from .config import (
 )
 from .glm_client import GlmClient
 from .session_store import SessionStore
-from .tools import TOOL_DEFINITIONS, TOOL_KINDS, Sandbox, ToolError, ToolResult, execute_tool
+from .tools import (
+    MAX_TOOL_OUTPUT_CHARS,
+    TOOL_DEFINITIONS,
+    TOOL_KINDS,
+    Sandbox,
+    ToolError,
+    ToolResult,
+    execute_tool,
+)
 
 logger = logging.getLogger("glm_acp")
 
@@ -77,11 +85,17 @@ editor via ACP. You have tools to read, write, and edit files, search code, \
 and run commands.
 
 Rules:
+- Before editing, locate and obey every applicable AGENTS.md or contributor \
+instruction from the repository root to the target file.
 - Read files before editing them. Understand the codebase structure first.
 - Make minimal, surgical changes. Match existing conventions.
+- Preserve unrelated user changes and avoid unrelated refactors.
 - Use run_command for builds, tests, and git operations.
 - When writing or editing files, briefly explain what you're changing.
 - If a task spans many files, work through them systematically.
+- Verify changed behavior with the narrowest relevant checks. Do not claim a \
+change is complete or working when verification was not run or failed; report \
+unverified work and remaining risk explicitly.
 
 Planning:
 - For any task with 3+ steps, call update_plan FIRST to lay out your plan.
@@ -95,9 +109,10 @@ Project context:
 {project_context}
 """
 
+
 def build_system_prompt(cwd: str, model: str = DEFAULT_MODEL) -> str:
     """Build the system prompt with auto-detected project context and model identity."""
-    from .config import MODELS
+
     model_name = MODELS.get(model, {}).get("name", model)
     context_parts: list[str] = []
 
@@ -115,12 +130,20 @@ def build_system_prompt(cwd: str, model: str = DEFAULT_MODEL) -> str:
     elif "package.json" in files:
         try:
             pkg = json.loads((cwd_path / "package.json").read_text())
-            lang = "TypeScript" if "typescript" in json.dumps(pkg.get("devDependencies", {})) else "JavaScript"
+            lang = (
+                "TypeScript"
+                if "typescript" in json.dumps(pkg.get("devDependencies", {}))
+                else "JavaScript"
+            )
             framework = pkg.get("dependencies", {})
-            if "next" in framework: context_parts.append(f"- {lang} project (Next.js)")
-            elif "react" in framework: context_parts.append(f"- {lang} project (React)")
-            elif "vue" in framework: context_parts.append(f"- {lang} project (Vue)")
-            else: context_parts.append(f"- {lang} project (Node.js)")
+            if "next" in framework:
+                context_parts.append(f"- {lang} project (Next.js)")
+            elif "react" in framework:
+                context_parts.append(f"- {lang} project (React)")
+            elif "vue" in framework:
+                context_parts.append(f"- {lang} project (Vue)")
+            else:
+                context_parts.append(f"- {lang} project (Node.js)")
         except (json.JSONDecodeError, OSError):
             context_parts.append("- Node.js project (package.json)")
     elif "Cargo.toml" in files:
@@ -133,11 +156,16 @@ def build_system_prompt(cwd: str, model: str = DEFAULT_MODEL) -> str:
         context_parts.append("- Java project (Maven/Gradle)")
 
     # Detect package manager
-    if "uv.lock" in files: context_parts.append("- Package manager: uv")
-    elif "poetry.lock" in files: context_parts.append("- Package manager: Poetry")
-    elif "yarn.lock" in files: context_parts.append("- Package manager: Yarn")
-    elif "pnpm-lock.yaml" in files: context_parts.append("- Package manager: pnpm")
-    elif "package-lock.json" in files: context_parts.append("- Package manager: npm")
+    if "uv.lock" in files:
+        context_parts.append("- Package manager: uv")
+    elif "poetry.lock" in files:
+        context_parts.append("- Package manager: Poetry")
+    elif "yarn.lock" in files:
+        context_parts.append("- Package manager: Yarn")
+    elif "pnpm-lock.yaml" in files:
+        context_parts.append("- Package manager: pnpm")
+    elif "package-lock.json" in files:
+        context_parts.append("- Package manager: npm")
 
     # Detect git
     try:
@@ -150,9 +178,14 @@ def build_system_prompt(cwd: str, model: str = DEFAULT_MODEL) -> str:
     project_context = "\n".join(context_parts) if context_parts else "(no project files detected)"
     return SYSTEM_PROMPT_TEMPLATE.format(project_context=project_context, model_name=model_name)
 
+
 MODE_LIST = [
-    SessionMode(id="ask", name="Ask", description="Answer questions and read files without making changes"),
-    SessionMode(id="code", name="Code", description="Full access: read, write, edit, and run commands"),
+    SessionMode(
+        id="ask", name="Ask", description="Answer questions and read files without making changes"
+    ),
+    SessionMode(
+        id="code", name="Code", description="Full access: read, write, edit, and run commands"
+    ),
 ]
 
 # Markers wrapping the compaction summary so the model knows it's a summary,
@@ -221,6 +254,18 @@ class Session:
         # Cumulative cost tracking per session
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
+        # Runtime-only state. These fields are intentionally not persisted.
+        self.prompt_lock = asyncio.Lock()
+        self.client: GlmClient | None = None
+        self.client_key: tuple[str, str, str, str | None] | None = None
+
+    def refresh_system_prompt(self) -> None:
+        """Keep the managed system prompt aligned with the selected model."""
+        prompt = {"role": "system", "content": build_system_prompt(self.cwd, self.model)}
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0] = prompt
+        else:
+            self.messages.insert(0, prompt)
 
     # ------------------------------------------------------------------
     # Serialization for persistence across process restarts
@@ -245,7 +290,7 @@ class Session:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], session_id: str) -> "Session":
+    def from_dict(cls, data: dict[str, Any], session_id: str) -> Session:
         """Rebuild a Session from persisted data.
 
         The cwd is taken from *data* so the sandbox matches the original
@@ -268,6 +313,7 @@ class Session:
         if messages:
             session.messages = messages
         session.context_size = CONTEXT_WINDOW_TOKENS.get(session.model, 1_000_000)
+        session.refresh_system_prompt()
         return session
 
 
@@ -278,6 +324,51 @@ class GlmAcpAgent(acp.Agent):
     def __init__(self) -> None:
         self._sessions = {}
         self._store = SessionStore()
+        self._tool_io_semaphore = asyncio.Semaphore(4)
+
+    async def _save_session(self, session: Session) -> None:
+        data = copy.deepcopy(session.to_dict())
+        await asyncio.to_thread(self._store.save, session.id, data)
+
+    async def _load_stored_session(self, session_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._store.load, session_id)
+
+    def _client_for_session(self, session: Session) -> GlmClient:
+        """Return a connection-pooled client matching the session config."""
+        thought_config = THOUGHT_LEVELS.get(session.thought_level, {})
+        base_url = API_ENDPOINTS.get(session.api_endpoint, {}).get(
+            "base_url", API_ENDPOINTS[DEFAULT_API_ENDPOINT]["base_url"]
+        )
+        key = (
+            session.model,
+            base_url,
+            thought_config.get("thinking_type", "enabled"),
+            thought_config.get("reasoning_effort"),
+        )
+        if session.client is None or session.client_key != key:
+            session.client = GlmClient(
+                session.model,
+                thought_level=key[2],
+                reasoning_effort=key[3],
+                base_url=base_url,
+            )
+            session.client_key = key
+        return session.client
+
+    async def _invalidate_session_client(self, session: Session) -> None:
+        client = session.client
+        session.client = None
+        session.client_key = None
+        if client is not None:
+            client.cancel()
+            await client.aclose()
+
+    async def aclose(self) -> None:
+        """Close pooled HTTP clients without deleting persisted sessions."""
+        await asyncio.gather(
+            *(self._invalidate_session_client(session) for session in self._sessions.values()),
+            return_exceptions=True,
+        )
 
     def on_connect(self, conn: Client) -> None:
         self._conn = conn
@@ -325,9 +416,7 @@ class GlmAcpAgent(acp.Agent):
             ],
         )
 
-    async def authenticate(
-        self, method_id: str, **kwargs: Any
-    ) -> AuthenticateResponse | None:
+    async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
         if method_id != AUTH_METHOD_ID or not has_api_key():
             return None
         return AuthenticateResponse()
@@ -341,7 +430,7 @@ class GlmAcpAgent(acp.Agent):
     ) -> NewSessionResponse:
         session = Session(str(uuid4()), cwd, additional_directories)
         self._sessions[session.id] = session
-        self._store.save(session.id, session.to_dict())
+        await self._save_session(session)
 
         await self._send_available_commands(session)
 
@@ -376,7 +465,10 @@ class GlmAcpAgent(acp.Agent):
         conversation.  If no saved state exists we fall back gracefully to
         a fresh session.
         """
-        data = self._store.load(session_id)
+        existing = self._sessions.get(session_id)
+        if existing is not None:
+            await self._invalidate_session_client(existing)
+        data = await self._load_stored_session(session_id)
         if data:
             session = Session.from_dict(data, session_id)
             logger.info(
@@ -430,7 +522,7 @@ class GlmAcpAgent(acp.Agent):
         **kwargs: Any,
     ) -> ListSessionsResponse:
         """Return persisted sessions so Zed can populate its history sidebar."""
-        all_sessions = self._store.list()
+        all_sessions = await asyncio.to_thread(self._store.list)
         # Filter by cwd if the client asked for a specific workspace.
         if cwd:
             all_sessions = [s for s in all_sessions if s.get("cwd") == cwd]
@@ -454,7 +546,10 @@ class GlmAcpAgent(acp.Agent):
         **kwargs: Any,
     ) -> ResumeSessionResponse:
         """Resume a session — same restore logic as load_session."""
-        data = self._store.load(session_id)
+        existing = self._sessions.get(session_id)
+        if existing is not None:
+            await self._invalidate_session_client(existing)
+        data = await self._load_stored_session(session_id)
         if data:
             session = Session.from_dict(data, session_id)
             logger.info(
@@ -502,8 +597,14 @@ class GlmAcpAgent(acp.Agent):
         **kwargs: Any,
     ) -> CloseSessionResponse:
         """Clean up a closed session and remove its persisted state."""
-        self._sessions.pop(session_id, None)
-        self._store.delete(session_id)
+        session = self._sessions.get(session_id)
+        if session is not None:
+            if session.client is not None:
+                session.client.cancel()
+            async with session.prompt_lock:
+                await self._invalidate_session_client(session)
+            self._sessions.pop(session_id, None)
+        await asyncio.to_thread(self._store.delete, session_id)
         return CloseSessionResponse()
 
     async def fork_session(
@@ -538,7 +639,7 @@ class GlmAcpAgent(acp.Agent):
         new_session.estimated_tokens = parent.estimated_tokens
 
         self._sessions[new_session.id] = new_session
-        self._store.save(new_session.id, new_session.to_dict())
+        await self._save_session(new_session)
 
         config_options = [
             self._build_model_option(new_session),
@@ -564,6 +665,18 @@ class GlmAcpAgent(acp.Agent):
         **kwargs: Any,
     ) -> SetSessionConfigOptionResponse | None:
         session = self._sessions[session_id]
+        async with session.prompt_lock:
+            return await self._set_config_option_locked(config_id, session_id, value, **kwargs)
+
+    async def _set_config_option_locked(
+        self,
+        config_id: str,
+        session_id: str,
+        value: str | bool,
+        **kwargs: Any,
+    ) -> SetSessionConfigOptionResponse | None:
+        session = self._sessions[session_id]
+        previous_client_key = (session.model, session.thought_level, session.api_endpoint)
         if config_id == "model":
             requested = str(value)
             # Validate that this model is available on the current plan
@@ -576,7 +689,11 @@ class GlmAcpAgent(acp.Agent):
                 # If the new model doesn't support the current thought level,
                 # fall back to the closest supported level.
                 if session.thought_level not in thought_levels_for_model(session.model):
-                    session.thought_level = "enabled" if "enabled" in thought_levels_for_model(session.model) else "disabled"
+                    session.thought_level = (
+                        "enabled"
+                        if "enabled" in thought_levels_for_model(session.model)
+                        else "disabled"
+                    )
         elif config_id == "thought_level":
             requested = str(value)
             # Validate that this thought level is available for the current model
@@ -592,11 +709,20 @@ class GlmAcpAgent(acp.Agent):
                 session.model = DEFAULT_MODEL
                 session.context_size = CONTEXT_WINDOW_TOKENS.get(session.model, 1_000_000)
                 if session.thought_level not in thought_levels_for_model(session.model):
-                    session.thought_level = "enabled" if "enabled" in thought_levels_for_model(session.model) else "disabled"
+                    session.thought_level = (
+                        "enabled"
+                        if "enabled" in thought_levels_for_model(session.model)
+                        else "disabled"
+                    )
         elif config_id == "permission_mode":
             session.permission_mode = str(value)
 
-        self._store.save(session.id, session.to_dict())
+        current_client_key = (session.model, session.thought_level, session.api_endpoint)
+        if current_client_key != previous_client_key:
+            session.refresh_system_prompt()
+            await self._invalidate_session_client(session)
+
+        await self._save_session(session)
 
         return SetSessionConfigOptionResponse(
             config_options=[
@@ -614,18 +740,41 @@ class GlmAcpAgent(acp.Agent):
         **kwargs: Any,
     ) -> Any:
         session = self._sessions[session_id]
+        async with session.prompt_lock:
+            return await self._set_session_mode_locked(mode_id, session_id, **kwargs)
+
+    async def _set_session_mode_locked(
+        self,
+        mode_id: str,
+        session_id: str,
+        **kwargs: Any,
+    ) -> Any:
+        session = self._sessions[session_id]
         # Validate mode_id against known modes
         valid_modes = {m.id for m in MODE_LIST}
         if mode_id not in valid_modes:
             logger.warning("Invalid mode %s — ignoring", mode_id)
             from acp.schema import SetSessionModeResponse
+
             return SetSessionModeResponse()
         session.mode = mode_id
-        self._store.save(session.id, session.to_dict())
+        await self._save_session(session)
         from acp.schema import SetSessionModeResponse
+
         return SetSessionModeResponse()
 
     async def prompt(
+        self,
+        prompt: list[Any],
+        session_id: str,
+        message_id: str | None = None,
+        **kwargs: Any,
+    ) -> PromptResponse:
+        session = self._sessions[session_id]
+        async with session.prompt_lock:
+            return await self._prompt_locked(prompt, session_id, message_id=message_id, **kwargs)
+
+    async def _prompt_locked(
         self,
         prompt: list[Any],
         session_id: str,
@@ -658,7 +807,6 @@ class GlmAcpAgent(acp.Agent):
         is_vision_model = session.model in VISION_MODELS
 
         if images:
-            saved_paths = await self._save_images(session, images)
             if is_vision_model:
                 # Vision model: store image data inline in the message as
                 # multipart content blocks so the API can process them.
@@ -667,16 +815,21 @@ class GlmAcpAgent(acp.Agent):
                     content_blocks.append({"type": "text", "text": content})
                 for img in images:
                     mime = img.get("mime_type", "image/png")
-                    content_blocks.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{img['data']}"},
-                    })
-                session.messages.append({
-                    "role": "user",
-                    "content": content_blocks,
-                })
+                    content_blocks.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{img['data']}"},
+                        }
+                    )
+                session.messages.append(
+                    {
+                        "role": "user",
+                        "content": content_blocks,
+                    }
+                )
             else:
                 # Text-only model: save to disk, tell the user
+                saved_paths = await self._save_images(session, images)
                 file_note = (
                     f"\n\n[The user shared {len(images)} screenshot"
                     f"{'s' if len(images) > 1 else ''}. "
@@ -714,142 +867,230 @@ class GlmAcpAgent(acp.Agent):
             return PromptResponse(stop_reason="end_turn")
         finally:
             # Persist the updated conversation so it survives restarts.
-            self._store.save(session.id, session.to_dict())
+            await self._save_session(session)
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         """Cancel the currently running turn for this session."""
         session = self._sessions.get(session_id)
-        if session and hasattr(session, "_active_client"):
-            session._active_client.cancel()
+        if session and session.client is not None:
+            session.client.cancel()
             logger.info("Cancellation requested for session %s", session_id)
 
     async def _run_turn(self, session: Session) -> str:
         """Execute the full model-turn loop: stream → tool calls → repeat."""
-        thought_config = THOUGHT_LEVELS.get(session.thought_level, {})
-        base_url = API_ENDPOINTS.get(session.api_endpoint, {}).get(
-            "base_url", API_ENDPOINTS[DEFAULT_API_ENDPOINT]["base_url"]
+        client = self._client_for_session(session)
+        client.begin_turn()
+        tools = (
+            TOOL_DEFINITIONS
+            if session.mode == "code"
+            else [
+                t
+                for t in TOOL_DEFINITIONS
+                if t["function"]["name"]
+                in ("read_file", "list_directory", "search_files", "grep", "update_plan")
+            ]
         )
-        client = GlmClient(
-            session.model,
-            thought_level=thought_config.get("thinking_type", "enabled"),
-            reasoning_effort=thought_config.get("reasoning_effort"),
-            base_url=base_url,
-        )
-        session._active_client = client  # for cancel support
-        tools = TOOL_DEFINITIONS if session.mode == "code" else [
-            t for t in TOOL_DEFINITIONS
-            if t["function"]["name"] in ("read_file", "list_directory", "search_files", "grep", "update_plan")
-        ]
 
-        try:
-            for turn_iter in range(50):
-                # --- Check for cancellation ---
-                if client.cancelled:
-                    await self._send_message(
-                        session.id,
-                        "\n\n_⏹ Generation cancelled by user._\n",
-                    )
-                    return "end_turn"
-
-                # --- Compaction check before each API call ---
-                await self._maybe_compact(session, client)
-
-                result = await client.stream_completion(
-                    messages=session.messages,
-                    tools=tools,
-                    on_reasoning=lambda chunk: self._send_thought(session.id, chunk),
-                    on_content=lambda chunk: self._send_message(session.id, chunk),
-                    on_tool_call_started=lambda tc_id, name: self._start_tool(session.id, tc_id, name),
+        for turn_iter in range(50):
+            # --- Check for cancellation ---
+            if client.cancelled:
+                await self._send_message(
+                    session.id,
+                    "\n\n_⏹ Generation cancelled by user._\n",
                 )
+                return "end_turn"
 
-                # --- Update token estimates and notify Zed ---
-                self._update_usage(session, result.usage)
-                await self._report_usage(session)
+            # --- Compaction check before each API call ---
+            await self._maybe_compact(session, client)
 
-                if result.reasoning and not result.content:
-                    pass
+            result = await client.stream_completion(
+                messages=session.messages,
+                tools=tools,
+                on_reasoning=lambda chunk: self._send_thought(session.id, chunk),
+                on_content=lambda chunk: self._send_message(session.id, chunk),
+                on_tool_call_started=lambda tc_id, name: self._start_tool(session.id, tc_id, name),
+            )
 
-                if not result.tool_calls:
-                    session.messages.append({"role": "assistant", "content": result.content})
-                    return "end_turn"
+            # --- Update token estimates and notify Zed ---
+            self._update_usage(session, result.usage)
+            await self._report_usage(session)
 
-                assistant_msg: dict[str, Any] = {"role": "assistant", "content": result.content or None}
-                if result.tool_calls:
-                    assistant_msg["tool_calls"] = [
-                        {"id": tc["id"], "type": "function",
-                         "function": {"name": tc["function"]["name"],
-                                      "arguments": json.dumps(tc["function"]["arguments"])}}
-                        for tc in result.tool_calls
-                    ]
-                session.messages.append(assistant_msg)
+            if result.reasoning and not result.content:
+                pass
 
+            if not result.tool_calls:
+                assistant_message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": result.content,
+                }
+                if getattr(client, "preserve_thinking", False) and result.reasoning:
+                    assistant_message["reasoning_content"] = result.reasoning
+                session.messages.append(assistant_message)
+                notice = self._finish_reason_notice(result.finish_reason)
+                if notice:
+                    await self._send_message(session.id, f"\n\n{notice}\n")
+                if result.finish_reason == "cancelled":
+                    return "cancelled"
+                return "end_turn"
+
+            assistant_msg: dict[str, Any] = {"role": "assistant", "content": result.content or None}
+            if getattr(client, "preserve_thinking", False) and result.reasoning:
+                assistant_msg["reasoning_content"] = result.reasoning
+            if result.tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": json.dumps(tc["function"]["arguments"]),
+                        },
+                    }
+                    for tc in result.tool_calls
+                ]
+            session.messages.append(assistant_msg)
+
+            # Independent read/search calls can run concurrently. Mixed
+            # batches remain ordered so edits and commands retain their
+            # original semantics.
+            read_only_batch = len(result.tool_calls) > 1 and all(
+                TOOL_KINDS.get(tc["function"]["name"]) in {"read", "search"}
+                for tc in result.tool_calls
+            )
+            if read_only_batch:
                 for tc in result.tool_calls:
-                    tool_name = tc["function"]["name"]
-                    tool_args = tc["function"]["arguments"]
-                    tc_id = tc["id"]
-
-                    # --- Plan tool: handled in-agent, not via sandbox ---
-                    if tool_name == "update_plan":
-                        try:
-                            output = await self._handle_update_plan(session, tc_id, tool_args)
-                            await self._complete_tool(session.id, tc_id, output)
-                        except Exception as e:
-                            logger.exception("update_plan failed")
-                            output = f"Error updating plan: {e}"
-                            await self._fail_tool(session.id, tc_id, output)
-                        session.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc_id,
-                            "content": output,
-                        })
-                        continue
-
-                    # Send location update for file tools (enables Zed follow)
-                    await self._start_tool_with_location(session.id, tc_id, tool_name, tool_args)
-
-                    await self._update_tool(session.id, tc_id, status="in_progress")
-
-                    # --- Permission check ---
-                    permitted, deny_reason = await self._check_permission(
-                        session, tc_id, tool_name, tool_args,
+                    await self._start_tool_with_location(
+                        session.id,
+                        tc["id"],
+                        tc["function"]["name"],
+                        tc["function"]["arguments"],
                     )
-                    if not permitted:
-                        output = deny_reason
-                        await self._fail_tool(session.id, tc_id, deny_reason)
-                        session.messages.append({
+                    await self._update_tool(session.id, tc["id"], status="in_progress")
+
+                async def execute_read(tc: dict[str, Any]):
+                    async with self._tool_io_semaphore:
+                        return await execute_tool(
+                            tc["function"]["name"],
+                            tc["function"]["arguments"],
+                            session.sandbox,
+                        )
+
+                read_results = await asyncio.gather(
+                    *(execute_read(tc) for tc in result.tool_calls),
+                    return_exceptions=True,
+                )
+                for tc, tool_result in zip(result.tool_calls, read_results):
+                    if isinstance(tool_result, BaseException):
+                        error_msg = str(tool_result)
+                        output = f"Error: {error_msg}"
+                        await self._fail_tool(session.id, tc["id"], error_msg)
+                    else:
+                        output = tool_result.output
+                        await self._complete_tool(session.id, tc["id"], tool_result)
+                    session.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": output,
+                        }
+                    )
+                continue
+
+            for tc in result.tool_calls:
+                tool_name = tc["function"]["name"]
+                tool_args = tc["function"]["arguments"]
+                tc_id = tc["id"]
+
+                # --- Plan tool: handled in-agent, not via sandbox ---
+                if tool_name == "update_plan":
+                    try:
+                        output = await self._handle_update_plan(session, tc_id, tool_args)
+                        await self._complete_tool(session.id, tc_id, output)
+                    except Exception as e:
+                        logger.exception("update_plan failed")
+                        output = f"Error updating plan: {e}"
+                        await self._fail_tool(session.id, tc_id, output)
+                    session.messages.append(
+                        {
                             "role": "tool",
                             "tool_call_id": tc_id,
                             "content": output,
-                        })
-                        continue
+                        }
+                    )
+                    continue
 
-                    try:
-                        tool_result = await execute_tool(tool_name, tool_args, session.sandbox)
-                        await self._complete_tool(session.id, tc_id, tool_result)
-                        output = tool_result.output
-                    except ToolError as e:
-                        error_msg = str(e)
-                        output = f"Error: {error_msg}"
-                        await self._fail_tool(session.id, tc_id, error_msg)
+                # Send location update for file tools (enables Zed follow)
+                await self._start_tool_with_location(session.id, tc_id, tool_name, tool_args)
 
-                    session.messages.append({
+                await self._update_tool(session.id, tc_id, status="in_progress")
+
+                # --- Permission check ---
+                permitted, deny_reason = await self._check_permission(
+                    session,
+                    tc_id,
+                    tool_name,
+                    tool_args,
+                )
+                if not permitted:
+                    output = deny_reason
+                    await self._fail_tool(session.id, tc_id, deny_reason)
+                    session.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": output,
+                        }
+                    )
+                    continue
+
+                try:
+                    tool_result = await execute_tool(tool_name, tool_args, session.sandbox)
+                    await self._complete_tool(session.id, tc_id, tool_result)
+                    output = tool_result.output
+                except ToolError as e:
+                    error_msg = str(e)
+                    output = f"Error: {error_msg}"
+                    await self._fail_tool(session.id, tc_id, error_msg)
+
+                session.messages.append(
+                    {
                         "role": "tool",
                         "tool_call_id": tc_id,
                         "content": output,
-                    })
-            else:
-                # Loop exhausted without break — hit the 50-iteration cap
-                await self._send_message(
-                    session.id,
-                    "\n\n⚠️ **Reached the maximum number of tool-call iterations (50).** "
-                    "The conversation will continue, but the current task may be incomplete. "
-                    "Ask me to continue if needed.\n",
+                    }
                 )
-                logger.warning("Turn ended: 50-iteration limit reached")
-        finally:
-            await client.aclose()
+        else:
+            # Loop exhausted without break — hit the 50-iteration cap
+            await self._send_message(
+                session.id,
+                "\n\n⚠️ **Reached the maximum number of tool-call iterations (50).** "
+                "The conversation will continue, but the current task may be incomplete. "
+                "Ask me to continue if needed.\n",
+            )
+            logger.warning("Turn ended: 50-iteration limit reached")
 
         return "end_turn"
+
+    @staticmethod
+    def _finish_reason_notice(finish_reason: str) -> str:
+        notices = {
+            "network_error": (
+                "⚠️ The model stream ended because of a network interruption. "
+                "The partial response was preserved; ask to continue or retry."
+            ),
+            "model_context_window_exceeded": (
+                "⚠️ The model exceeded its context window. Compact or clear older "
+                "history before retrying."
+            ),
+            "sensitive": (
+                "⚠️ The model stopped because the provider's safety filter was triggered."
+            ),
+            "continuation_limit": (
+                "⚠️ The response reached the automatic continuation limit and may be "
+                "incomplete. Ask to continue."
+            ),
+        }
+        return notices.get(finish_reason, "")
 
     # ------------------------------------------------------------------
     # Token estimation & usage reporting
@@ -869,8 +1110,21 @@ class GlmAcpAgent(acp.Agent):
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, list):
-                # Vision content blocks — estimate by serialized size
-                content = json.dumps(content)
+                # Base64 size is not a useful proxy for provider image-token
+                # accounting. Count text exactly and use a conservative fixed
+                # allowance per image block.
+                text_chars = sum(
+                    len(block.get("text", ""))
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+                image_count = sum(
+                    1
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "image_url"
+                )
+                total_chars += text_chars + image_count * int(chars_per_token * 1024)
+                content = ""
             else:
                 content = content or ""
             total_chars += len(content)
@@ -928,15 +1182,17 @@ class GlmAcpAgent(acp.Agent):
             if not isinstance(task, dict):
                 continue
             # Sanitize status/priority to valid ACP literals
-            entries.append({
-                "content": str(task.get("content", "")),
-                "priority": _sanitize_priority(task.get("priority", "medium")),
-                "status": _sanitize_status(task.get("status", "pending")),
-            })
+            entries.append(
+                {
+                    "content": str(task.get("content", "")),
+                    "priority": _sanitize_priority(task.get("priority", "medium")),
+                    "status": _sanitize_status(task.get("status", "pending")),
+                }
+            )
 
         session.plan = entries
         await self._send_plan(session)
-        self._store.save(session.id, session.to_dict())
+        await self._save_session(session)
 
         # Return a compact summary as the tool result
         n_pending = sum(1 for e in entries if e["status"] == "pending")
@@ -1089,16 +1345,7 @@ class GlmAcpAgent(acp.Agent):
                 session.id,
                 "\n\n_Manually compacting conversation context…_\n\n",
             )
-            thought_config = THOUGHT_LEVELS.get(session.thought_level, {})
-            base_url = API_ENDPOINTS.get(session.api_endpoint, {}).get(
-                "base_url", API_ENDPOINTS[DEFAULT_API_ENDPOINT]["base_url"]
-            )
-            client = GlmClient(
-                session.model,
-                thought_level=thought_config.get("thinking_type", "enabled"),
-                reasoning_effort=thought_config.get("reasoning_effort"),
-                base_url=base_url,
-            )
+            client = self._client_for_session(session)
             try:
                 await self._maybe_compact(session, client, force=True)
                 return ""
@@ -1106,17 +1353,20 @@ class GlmAcpAgent(acp.Agent):
                 logger.exception("/compact failed")
                 return f"❌ Compaction failed: {e}\nYour conversation is unchanged."
             finally:
-                await client.aclose()
-                self._store.save(session.id, session.to_dict())
+                await self._save_session(session)
 
         elif command == "/clear-plan":
             session.plan = []
             await self._send_plan(session)
-            self._store.save(session.id, session.to_dict())
+            await self._save_session(session)
             return "📋 Task plan cleared."
 
         elif command == "/clear-history":
-            system_msg = session.messages[0] if session.messages and session.messages[0].get("role") == "system" else None
+            system_msg = (
+                session.messages[0]
+                if session.messages and session.messages[0].get("role") == "system"
+                else None
+            )
             session.messages = [system_msg] if system_msg else []
             session.plan = []
             session.estimated_tokens = 0
@@ -1125,13 +1375,15 @@ class GlmAcpAgent(acp.Agent):
             session.last_reported_tokens = -1
             await self._send_plan(session)
             await self._report_usage(session)
-            self._store.save(session.id, session.to_dict())
+            await self._save_session(session)
             return "🧹 Conversation history cleared."
 
         elif command == "/diff":
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "git", "diff", "--stat",
+                    "git",
+                    "diff",
+                    "--stat",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=session.cwd,
@@ -1144,7 +1396,8 @@ class GlmAcpAgent(acp.Agent):
                     return "✅ No uncommitted changes in the working tree."
                 # Get full diff too
                 proc_full = await asyncio.create_subprocess_exec(
-                    "git", "diff",
+                    "git",
+                    "diff",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=session.cwd,
@@ -1157,16 +1410,17 @@ class GlmAcpAgent(acp.Agent):
 
         elif command == "/export":
             from datetime import datetime
+
             lines: list[str] = [
-                f"# Conversation Export",
-                f"",
+                "# Conversation Export",
+                "",
                 f"- **Model:** {session.model}",
                 f"- **API Plan:** {API_ENDPOINTS.get(session.api_endpoint, {}).get('name', session.api_endpoint)}",
                 f"- **Exported:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                 f"- **Total usage:** {session.total_input_tokens:,} input + {session.total_output_tokens:,} output tokens",
-                f"",
-                f"---",
-                f"",
+                "",
+                "---",
+                "",
             ]
             for msg in session.messages:
                 role = msg.get("role", "")
@@ -1176,7 +1430,9 @@ class GlmAcpAgent(acp.Agent):
                     content = ""
                 elif isinstance(content, list):
                     content = " ".join(
-                        b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
                     )
                 if role == "system":
                     continue
@@ -1184,14 +1440,23 @@ class GlmAcpAgent(acp.Agent):
                     lines.append(f"## 👤 User\n\n{content}\n")
                 elif role == "assistant":
                     if msg.get("tool_calls"):
-                        tc_names = [tc.get("function", {}).get("name", "?") for tc in msg["tool_calls"]]
-                        lines.append(f"## 🤖 Assistant _(tools: {', '.join(tc_names)})_\n\n{content or '*(no text)*'}\n")
+                        tc_names = [
+                            tc.get("function", {}).get("name", "?") for tc in msg["tool_calls"]
+                        ]
+                        lines.append(
+                            f"## 🤖 Assistant _(tools: {', '.join(tc_names)})_\n\n{content or '*(no text)*'}\n"
+                        )
                     else:
                         lines.append(f"## 🤖 Assistant\n\n{content}\n")
                 elif role == "tool":
-                    lines.append(f"<details><summary>🔧 Tool result</summary>\n\n```\n{content[:2000]}\n```\n\n</details>\n")
+                    lines.append(
+                        f"<details><summary>🔧 Tool result</summary>\n\n```\n{content[:2000]}\n```\n\n</details>\n"
+                    )
             md_text = "\n".join(lines)
-            export_path = Path(session.cwd) / f"conversation_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+            export_path = (
+                Path(session.cwd)
+                / f"conversation_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+            )
             export_path.write_text(md_text, encoding="utf-8")
             return f"📄 Conversation exported to: `{export_path}`"
 
@@ -1218,7 +1483,9 @@ class GlmAcpAgent(acp.Agent):
     # Context compaction
     # ------------------------------------------------------------------
 
-    async def _maybe_compact(self, session: Session, client: GlmClient, force: bool = False) -> None:
+    async def _maybe_compact(
+        self, session: Session, client: GlmClient, force: bool = False
+    ) -> None:
         """Trigger context compaction if estimated usage exceeds threshold.
 
         Mirrors Claude Code's approach: when the conversation approaches the
@@ -1276,18 +1543,20 @@ class GlmAcpAgent(acp.Agent):
 
         # --- Summarize ---
         summary = await client.summarize_messages(to_summarize)
+        if not summary or not summary.strip():
+            raise RuntimeError("Compaction summary was empty; conversation is unchanged")
 
         # --- Rebuild message list ---
         new_messages: list[dict[str, Any]] = []
         system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
         if system_msg:
             new_messages.append(system_msg)
-        new_messages.append({
-            "role": "user",
-            "content": _COMPACTION_MARKER_OPEN
-                       + summary
-                       + _COMPACTION_MARKER_CLOSE,
-        })
+        new_messages.append(
+            {
+                "role": "user",
+                "content": _COMPACTION_MARKER_OPEN + summary + _COMPACTION_MARKER_CLOSE,
+            }
+        )
         new_messages.extend(keep_recent)
 
         session.messages = new_messages
@@ -1314,7 +1583,7 @@ class GlmAcpAgent(acp.Agent):
                     res = block.get("resource", {})
                     uri = res.get("uri", "")
                     text = res.get("text", "")
-                    parts.append(f"[File: {uri}]\n{text}")
+                    parts.append(self._bounded_resource(uri, text))
             elif isinstance(block, str):
                 parts.append(block)
             else:
@@ -1323,9 +1592,7 @@ class GlmAcpAgent(acp.Agent):
                     parts.append(text)
         return "\n".join(parts) if parts else ""
 
-    def _extract_prompt_parts(
-        self, prompt: list[Any]
-    ) -> tuple[str, list[dict[str, str]]]:
+    def _extract_prompt_parts(self, prompt: list[Any]) -> tuple[str, list[dict[str, str]]]:
         """Extract text and image data from an ACP prompt list.
 
         Returns ``(text, images)`` where ``images`` is a list of dicts
@@ -1335,17 +1602,25 @@ class GlmAcpAgent(acp.Agent):
         images: list[dict[str, str]] = []
 
         for block in prompt:
-            btype = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+            btype = getattr(block, "type", None) or (
+                block.get("type") if isinstance(block, dict) else None
+            )
 
             if btype == "text":
-                txt = getattr(block, "text", None) or (block.get("text", "") if isinstance(block, dict) else "")
+                txt = getattr(block, "text", None) or (
+                    block.get("text", "") if isinstance(block, dict) else ""
+                )
                 if txt:
                     text_parts.append(txt)
             elif btype == "image":
-                data = getattr(block, "data", None) or (block.get("data") if isinstance(block, dict) else None)
-                mime = getattr(block, "mime_type", None) or (
-                    block.get("mime_type") if isinstance(block, dict) else None
-                ) or "image/png"
+                data = getattr(block, "data", None) or (
+                    block.get("data") if isinstance(block, dict) else None
+                )
+                mime = (
+                    getattr(block, "mime_type", None)
+                    or (block.get("mime_type") if isinstance(block, dict) else None)
+                    or "image/png"
+                )
                 if data:
                     images.append({"data": data, "mime_type": mime})
             elif btype == "resource":
@@ -1353,11 +1628,15 @@ class GlmAcpAgent(acp.Agent):
                     res = block.get("resource", {})
                     uri = res.get("uri", "")
                     rtext = res.get("text", "")
-                    text_parts.append(f"[File: {uri}]\n{rtext}")
+                    text_parts.append(self._bounded_resource(uri, rtext))
                 else:
                     res = getattr(block, "resource", None)
                     if res:
-                        text_parts.append(f"[File: {getattr(res, 'uri', '')}]\n{getattr(res, 'text', '')}")
+                        text_parts.append(
+                            self._bounded_resource(
+                                getattr(res, "uri", ""), getattr(res, "text", "")
+                            )
+                        )
             elif isinstance(block, str):
                 text_parts.append(block)
             else:
@@ -1367,13 +1646,25 @@ class GlmAcpAgent(acp.Agent):
 
         return "\n".join(text_parts) if text_parts else "", images
 
-    async def _save_images(
-        self, session: Session, images: list[dict[str, str]]
-    ) -> list[str]:
+    @staticmethod
+    def _bounded_resource(uri: str, text: str) -> str:
+        if len(text) <= MAX_TOOL_OUTPUT_CHARS:
+            return f"[File: {uri}]\n{text}"
+        return (
+            f"[File: {uri}]\n{text[:MAX_TOOL_OUTPUT_CHARS]}\n"
+            f"... (embedded resource truncated at {MAX_TOOL_OUTPUT_CHARS} characters)"
+        )
+
+    async def _save_images(self, session: Session, images: list[dict[str, str]]) -> list[str]:
         """Save pasted images to a temp directory inside the workspace.
 
         Returns the list of saved file paths.
         """
+        return await asyncio.to_thread(self._save_images_sync, session, images)
+
+    @staticmethod
+    def _save_images_sync(session: Session, images: list[dict[str, str]]) -> list[str]:
+        """Decode and persist pasted images outside the event-loop thread."""
         import base64
         from datetime import datetime
 
@@ -1449,7 +1740,8 @@ class GlmAcpAgent(acp.Agent):
             # Handle list content (vision messages with multipart blocks)
             if isinstance(content, list):
                 content = " ".join(
-                    b.get("text", "") for b in content
+                    b.get("text", "")
+                    for b in content
                     if isinstance(b, dict) and b.get("type") == "text"
                 )
             if not content:
@@ -1479,7 +1771,9 @@ class GlmAcpAgent(acp.Agent):
         )
         await self._conn.session_update(session_id=session_id, update=chunk)
 
-    async def _start_tool_with_location(self, session_id: str, tool_call_id: str, name: str, args: dict[str, Any]) -> None:
+    async def _start_tool_with_location(
+        self, session_id: str, tool_call_id: str, name: str, args: dict[str, Any]
+    ) -> None:
         """Send an update with file location when a tool starts executing.
 
         This fires after the tool call is streamed (we now have the full
@@ -1491,6 +1785,7 @@ class GlmAcpAgent(acp.Agent):
         if not path:
             return
         from acp.schema import ToolCallLocation
+
         loc_kwargs: dict[str, Any] = {"path": path}
         line = args.get("start_line") or args.get("line")
         if line:
@@ -1505,24 +1800,30 @@ class GlmAcpAgent(acp.Agent):
         chunk = acp.update_tool_call(tool_call_id=tool_call_id, status=status)
         await self._conn.session_update(session_id=session_id, update=chunk)
 
-    async def _complete_tool(self, session_id: str, tool_call_id: str, result: ToolResult | str) -> None:
+    async def _complete_tool(
+        self, session_id: str, tool_call_id: str, result: ToolResult | str
+    ) -> None:
         # Build content blocks based on tool result type
         if isinstance(result, ToolResult):
             content = []
             # If this is a file edit with diff info, send a diff block
             if result.file_path and result.old_text is not None and result.new_text is not None:
-                content.append(acp.tool_diff_content(
-                    path=result.file_path,
-                    new_text=result.new_text[:8000],
-                    old_text=result.old_text[:8000],
-                ))
+                content.append(
+                    acp.tool_diff_content(
+                        path=result.file_path,
+                        new_text=result.new_text[:8000],
+                        old_text=result.old_text[:8000],
+                    )
+                )
             elif result.file_path and result.new_text is not None:
                 # write_file creating a new file (old_text is None)
-                content.append(acp.tool_diff_content(
-                    path=result.file_path,
-                    new_text=result.new_text[:8000],
-                    old_text=None,
-                ))
+                content.append(
+                    acp.tool_diff_content(
+                        path=result.file_path,
+                        new_text=result.new_text[:8000],
+                        old_text=None,
+                    )
+                )
             # Always include the text output
             content.append(acp.tool_content(acp.text_block(result.output[:8000])))
         else:
@@ -1533,6 +1834,7 @@ class GlmAcpAgent(acp.Agent):
         locations = None
         if isinstance(result, ToolResult) and result.file_path:
             from acp.schema import ToolCallLocation
+
             loc_kwargs: dict[str, Any] = {"path": result.file_path}
             if result.line is not None:
                 loc_kwargs["line"] = result.line
@@ -1562,36 +1864,52 @@ class GlmAcpAgent(acp.Agent):
         if hasattr(error, "status_code"):
             code = error.status_code
             if code == 401:
-                return ("🔐 **Authentication failed.** Your API key is invalid or expired. "
-                        "Get a new key at https://z.ai/ and update `ZAI_API_KEY` in Zed settings.")
+                return (
+                    "🔐 **Authentication failed.** Your API key is invalid or expired. "
+                    "Get a new key at https://z.ai/ and update `ZAI_API_KEY` in Zed settings."
+                )
             elif code == 429:
-                return ("⏳ **Rate limited.** The API is throttling requests. "
-                        "Wait a moment and try again, or switch to a different model.")
+                return (
+                    "⏳ **Rate limited.** The API is throttling requests. "
+                    "Wait a moment and try again, or switch to a different model."
+                )
             elif code == 1301:
-                return ("🚫 **Content filtered.** The Z.ai content filter blocked this request. "
-                        "This is often a false positive — try rephrasing your request.")
+                return (
+                    "🚫 **Content filtered.** The Z.ai content filter blocked this request. "
+                    "This is often a false positive — try rephrasing your request."
+                )
             elif code == 1311:
-                return ("💳 **Plan limitation.** Your subscription doesn't include this model. "
-                        "Switch to a different API plan or model in the dropdown.")
+                return (
+                    "💳 **Plan limitation.** Your subscription doesn't include this model. "
+                    "Switch to a different API plan or model in the dropdown."
+                )
             elif code >= 500:
-                return (f"🔧 **Z.ai server error ({code}).** This is a temporary issue on Z.ai's side. "
-                        f"The agent already retried — try again in a moment.")
+                return (
+                    f"🔧 **Z.ai server error ({code}).** This is a temporary issue on Z.ai's side. "
+                    f"The agent already retried — try again in a moment."
+                )
             else:
                 return f"API error {code}: {error_str[:300]}"
 
         # Network errors
         if "timeout" in error_str.lower() or "timed out" in error_str.lower():
-            return ("⏱ **Request timed out.** The API didn't respond in time. "
-                    "Try again, or reduce the complexity of the request.")
+            return (
+                "⏱ **Request timed out.** The API didn't respond in time. "
+                "Try again, or reduce the complexity of the request."
+            )
 
         if "connection" in error_str.lower() or "network" in error_str.lower():
-            return ("📡 **Network error.** Could not reach the Z.ai API. "
-                    "Check your internet connection and try again.")
+            return (
+                "📡 **Network error.** Could not reach the Z.ai API. "
+                "Check your internet connection and try again."
+            )
 
         # API key missing
         if "ZAI_API_KEY" in error_str:
-            return ("🔑 **No API key.** Set `ZAI_API_KEY` in the agent server's "
-                    "`env` block in Zed settings. Get a key at https://z.ai/.")
+            return (
+                "🔑 **No API key.** Set `ZAI_API_KEY` in the agent server's "
+                "`env` block in Zed settings. Get a key at https://z.ai/."
+            )
 
         # Fallback — show the raw error but truncated
         return error_str[:500]
@@ -1623,7 +1941,7 @@ class GlmAcpAgent(acp.Agent):
                 SessionConfigSelectOption(
                     value=model_id,
                     name=info["name"],
-                    description=f'{info["description"]} ({info["context_window"]} context)',
+                    description=f"{info['description']} ({info['context_window']} context)",
                 )
                 for model_id, info in plan_models.items()
             ],
@@ -1703,4 +2021,8 @@ async def run() -> None:
     # use_unstable_protocol=True enables session/resume, session/fork,
     # session/close, and session/list which Zed relies on to restore
     # conversations after a restart.
-    await acp.run_agent(GlmAcpAgent(), use_unstable_protocol=True)
+    agent = GlmAcpAgent()
+    try:
+        await acp.run_agent(agent, use_unstable_protocol=True)
+    finally:
+        await agent.aclose()

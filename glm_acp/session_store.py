@@ -43,6 +43,7 @@ class SessionStore:
         alphanumeric, dash, and underscore are allowed in filenames.
         """
         import re
+
         safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
         return self._base_dir / f"{safe_id}.json"
 
@@ -65,6 +66,17 @@ class SessionStore:
                 json.dump(data, fh, ensure_ascii=False)
             # Atomic rename so a crash mid-write never leaves a corrupt file.
             os.replace(tmp, path)
+            metadata = {
+                "session_id": path.stem,
+                "cwd": data.get("cwd", ""),
+                "title": data.get("title"),
+                "updated_at": data.get("saved_at"),
+            }
+            meta_path = path.with_suffix(".meta")
+            meta_tmp = meta_path.with_suffix(".meta.tmp")
+            with open(meta_tmp, "w", encoding="utf-8") as fh:
+                json.dump(metadata, fh, ensure_ascii=False)
+            os.replace(meta_tmp, meta_path)
         except OSError:
             logger.warning("Could not persist session %s", session_id, exc_info=True)
 
@@ -74,7 +86,7 @@ class SessionStore:
         if not path.exists():
             return None
         try:
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, encoding="utf-8") as fh:
                 return json.load(fh)
         except (OSError, json.JSONDecodeError):
             logger.warning("Could not load session %s", session_id, exc_info=True)
@@ -85,17 +97,31 @@ class SessionStore:
         results: list[dict[str, Any]] = []
         if not self._base_dir.exists():
             return results
-        for path in self._base_dir.glob("*.json"):
+        indexed_ids: set[str] = set()
+        for path in self._base_dir.glob("*.meta"):
             try:
-                with open(path, "r", encoding="utf-8") as fh:
+                with open(path, encoding="utf-8") as fh:
+                    metadata = json.load(fh)
+                results.append(metadata)
+                indexed_ids.add(path.stem)
+            except (OSError, json.JSONDecodeError):
+                continue
+        # Backward compatibility for sessions written before metadata sidecars.
+        for path in self._base_dir.glob("*.json"):
+            if path.stem in indexed_ids:
+                continue
+            try:
+                with open(path, encoding="utf-8") as fh:
                     data = json.load(fh)
                 session_id = path.stem
-                results.append({
-                    "session_id": session_id,
-                    "cwd": data.get("cwd", ""),
-                    "title": data.get("title"),
-                    "updated_at": data.get("saved_at"),
-                })
+                results.append(
+                    {
+                        "session_id": session_id,
+                        "cwd": data.get("cwd", ""),
+                        "title": data.get("title"),
+                        "updated_at": data.get("saved_at"),
+                    }
+                )
             except (OSError, json.JSONDecodeError):
                 continue
         # Sort by updated_at descending (most recent first)
@@ -107,5 +133,6 @@ class SessionStore:
         path = self._path(session_id)
         try:
             path.unlink(missing_ok=True)
+            path.with_suffix(".meta").unlink(missing_ok=True)
         except OSError:
             logger.warning("Could not delete session %s", session_id, exc_info=True)

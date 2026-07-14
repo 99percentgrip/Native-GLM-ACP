@@ -1,24 +1,21 @@
 """Tests for glm_acp context compaction — automatic threshold, manual /compact,
 error handling, tool-call boundary adjustment, and persistence."""
 
-import asyncio
-import json
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 os = __import__("os")
 os.environ.setdefault("ZAI_API_KEY", "test-key")
 
 from glm_acp.agent import (
+    _COMPACTION_MARKER_CLOSE,
+    _COMPACTION_MARKER_OPEN,
     GlmAcpAgent,
     Session,
-    _COMPACTION_MARKER_OPEN,
-    _COMPACTION_MARKER_CLOSE,
 )
 from glm_acp.config import (
     COMPACTION_KEEP_RECENT,
-    COMPACTION_THRESHOLD,
-    CONTEXT_WINDOW_TOKENS,
 )
 from glm_acp.glm_client import GlmApiError
 
@@ -59,6 +56,7 @@ def _mock_client(summary: str = "This is a summary of the conversation."):
 # ============================================================
 # Threshold guard: doesn't compact when below threshold
 # ============================================================
+
 
 class TestCompactionThreshold:
     @pytest.mark.asyncio
@@ -103,6 +101,7 @@ class TestCompactionThreshold:
 # Force flag (used by /compact command)
 # ============================================================
 
+
 class TestCompactionForce:
     @pytest.mark.asyncio
     async def test_force_compacts_regardless_of_size(self, agent, session):
@@ -116,6 +115,7 @@ class TestCompactionForce:
 # ============================================================
 # Message partitioning and reconstruction
 # ============================================================
+
 
 class TestCompactionPartition:
     @pytest.mark.asyncio
@@ -169,6 +169,7 @@ class TestCompactionPartition:
 # Tool-call boundary adjustment
 # ============================================================
 
+
 class TestCompactionToolBoundary:
     @pytest.mark.asyncio
     async def test_tool_result_moved_to_summarize(self, agent, session):
@@ -183,9 +184,19 @@ class TestCompactionToolBoundary:
             messages.append({"role": "user", "content": f"msg {i}"})
             messages.append({"role": "assistant", "content": f"reply {i}"})
         # Now add assistant tool_call + tool result pairs as the "recent" messages
-        messages.append({"role": "assistant", "content": "", "tool_calls": [
-            {"id": "tc1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}
-        ]})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
+                    }
+                ],
+            }
+        )
         messages.append({"role": "tool", "tool_call_id": "tc1", "content": "file contents"})
         messages.append({"role": "assistant", "content": "Done."})
         messages.append({"role": "user", "content": "next question"})
@@ -198,8 +209,9 @@ class TestCompactionToolBoundary:
         summarized = client.summarize_messages.call_args[0][0]
         # The first kept message should NOT be a tool result
         kept = session.messages[2:]  # after system + summary
-        assert kept[0].get("role") != "tool", \
+        assert kept[0].get("role") != "tool", (
             "First kept message should not be an orphaned tool result"
+        )
 
     @pytest.mark.asyncio
     async def test_no_tool_result_orphaned(self, agent, session):
@@ -210,9 +222,19 @@ class TestCompactionToolBoundary:
         for i in range(15):
             messages.append({"role": "user", "content": f"msg {i}"})
             messages.append({"role": "assistant", "content": f"reply {i}"})
-        messages.append({"role": "assistant", "content": "", "tool_calls": [
-            {"id": "tc1", "type": "function", "function": {"name": "read_file", "arguments": '{}'}}
-        ]})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            }
+        )
         messages.append({"role": "tool", "tool_call_id": "tc1", "content": "result"})
         messages.append({"role": "assistant", "content": "Based on that..."})
         messages.append({"role": "user", "content": "continue"})
@@ -227,16 +249,17 @@ class TestCompactionToolBoundary:
             if msg.get("role") == "tool":
                 # Must have a preceding assistant with tool_calls in kept messages
                 has_tool_call_before = any(
-                    m.get("role") == "assistant" and m.get("tool_calls")
-                    for m in kept[:i]
+                    m.get("role") == "assistant" and m.get("tool_calls") for m in kept[:i]
                 )
-                assert has_tool_call_before, \
+                assert has_tool_call_before, (
                     "Tool result found without preceding tool_call in kept messages"
+                )
 
 
 # ============================================================
 # Token estimate updates after compaction
 # ============================================================
+
 
 class TestCompactionTokens:
     @pytest.mark.asyncio
@@ -271,7 +294,21 @@ class TestCompactionTokens:
 # Error handling
 # ============================================================
 
+
 class TestCompactionErrors:
+    @pytest.mark.asyncio
+    async def test_empty_summary_leaves_history_unchanged(self, agent, session):
+        """Compaction commits only a non-empty validated summary."""
+        session = _make_session_with_messages(20)
+        original = list(session.messages)
+        client = _mock_client()
+        client.summarize_messages = AsyncMock(return_value="")
+
+        with pytest.raises(RuntimeError, match="summary"):
+            await agent._maybe_compact(session, client, force=True)
+
+        assert session.messages == original
+
     @pytest.mark.asyncio
     async def test_api_error_in_auto_compact_propagates(self, agent, session):
         """In the _run_turn path, summarize failure should raise (caught by prompt)."""
@@ -302,9 +339,33 @@ class TestCompactionErrors:
 # Summarization prompt content
 # ============================================================
 
+
 class TestSummarizeTranscript:
+    def test_tool_results_keep_call_identity(self):
+        from glm_acp.glm_client import GlmClient
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_a",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"a.py"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_a", "content": "contents"},
+        ]
+
+        transcript = GlmClient._format_transcript(messages)
+        assert "call_a" in transcript
+        assert "read_file" in transcript
+
     def test_format_transcript_user_message(self):
         from glm_acp.glm_client import GlmClient
+
         messages = [
             {"role": "user", "content": "hello world"},
         ]
@@ -313,6 +374,7 @@ class TestSummarizeTranscript:
 
     def test_format_transcript_assistant_message(self):
         from glm_acp.glm_client import GlmClient
+
         messages = [
             {"role": "assistant", "content": "hi there"},
         ]
@@ -321,25 +383,35 @@ class TestSummarizeTranscript:
 
     def test_format_transcript_tool_call(self):
         from glm_acp.glm_client import GlmClient
+
         messages = [
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "tc1", "type": "function",
-                 "function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}
-            ]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
+                    }
+                ],
+            },
         ]
         transcript = GlmClient._format_transcript(messages)
         assert "read_file" in transcript
 
     def test_format_transcript_tool_result(self):
         from glm_acp.glm_client import GlmClient
+
         messages = [
             {"role": "tool", "tool_call_id": "tc1", "content": "file contents here"},
         ]
         transcript = GlmClient._format_transcript(messages)
-        assert "[Tool Result] file contents here" in transcript
+        assert "[Tool Result tc1 — unknown tool] file contents here" in transcript
 
     def test_format_transcript_skips_system(self):
         from glm_acp.glm_client import GlmClient
+
         messages = [
             {"role": "system", "content": "system prompt"},
             {"role": "user", "content": "hello"},
@@ -350,17 +422,26 @@ class TestSummarizeTranscript:
 
     def test_format_transcript_empty(self):
         from glm_acp.glm_client import GlmClient
+
         transcript = GlmClient._format_transcript([])
         assert transcript == ""
 
     def test_format_transcript_none_content(self):
         """Assistant message with content=None (tool_calls only)."""
         from glm_acp.glm_client import GlmClient
+
         messages = [
-            {"role": "assistant", "content": None, "tool_calls": [
-                {"id": "tc1", "type": "function",
-                 "function": {"name": "write_file", "arguments": '{}'}}
-            ]},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": "{}"},
+                    }
+                ],
+            },
         ]
         transcript = GlmClient._format_transcript(messages)
         assert "write_file" in transcript
@@ -369,11 +450,15 @@ class TestSummarizeTranscript:
     def test_format_transcript_list_content(self):
         """Vision message with list content (multipart blocks)."""
         from glm_acp.glm_client import GlmClient
+
         messages = [
-            {"role": "user", "content": [
-                {"type": "text", "text": "What is this image?"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this image?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            },
         ]
         transcript = GlmClient._format_transcript(messages)
         assert "What is this image?" in transcript
@@ -382,6 +467,7 @@ class TestSummarizeTranscript:
     def test_format_transcript_integer_content(self):
         """Non-string, non-list content should be coerced gracefully."""
         from glm_acp.glm_client import GlmClient
+
         messages = [
             {"role": "user", "content": 12345},
         ]

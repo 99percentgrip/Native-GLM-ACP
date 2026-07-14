@@ -18,6 +18,10 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
 - Secret tests must assert that credential values never appear in output.
 - Registry tests must fail when source, manifest, and archive versions diverge.
 - Platform-specific tests must skip when their operating-system semantics are unavailable.
+- Streaming tests must cover incomplete HTTP 200 responses, retry boundaries,
+  delta coalescing, continuation caps, and exact Deep High/Max request fields.
+- Tool tests must cover output bounds and make command exit status observable.
+- Persistence tests must verify metadata-sidecar listing and deletion behavior.
 
 ## Work Guidance
 

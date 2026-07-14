@@ -24,9 +24,9 @@ from .config import (
     DEFAULT_TIMEOUT,
     MAX_AUTO_CONTINUATIONS,
     MAX_RETRIES,
+    MAX_TOKENS_BY_MODEL,
     RETRY_BASE_DELAY,
     RETRYABLE_STATUS_CODES,
-    MAX_TOKENS_BY_MODEL,
     VISION_MODELS,
     get_api_key,
 )
@@ -38,6 +38,14 @@ class GlmApiError(RuntimeError):
     def __init__(self, status_code: int, message: str) -> None:
         self.status_code = status_code
         super().__init__(f"GLM API error {status_code}: {message}")
+
+
+class CompactionError(RuntimeError):
+    """Raised when a compaction response cannot safely replace history."""
+
+
+class IncompleteStreamError(RuntimeError):
+    """Raised when an HTTP 200 SSE response ends without a terminal reason."""
 
 
 logger = logging.getLogger("glm_acp")
@@ -66,14 +74,22 @@ class StreamResult:
 class GlmClient:
     """Low-level streaming client for the Z.ai BigModel API."""
 
-    def __init__(self, model: str = "glm-4.6", thought_level: str = "enabled", reasoning_effort: str | None = None, base_url: str | None = None):
+    def __init__(
+        self,
+        model: str = "glm-4.6",
+        thought_level: str = "enabled",
+        reasoning_effort: str | None = None,
+        base_url: str | None = None,
+    ):
         self.model = model
         self.thought_level = thought_level
         self.reasoning_effort = reasoning_effort
+        self.preserve_thinking = reasoning_effort in {"high", "max"}
         self._cancelled = False
         self._api_key = get_api_key()
         self._client = httpx.AsyncClient(
-            base_url=base_url or os.environ.get("ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4"),
+            base_url=base_url
+            or os.environ.get("ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4"),
             headers={"Authorization": f"Bearer {self._api_key}"},
             timeout=httpx.Timeout(DEFAULT_TIMEOUT, read=DEFAULT_TIMEOUT),
         )
@@ -81,6 +97,10 @@ class GlmClient:
     def cancel(self) -> None:
         """Signal that the current operation should be aborted."""
         self._cancelled = True
+
+    def begin_turn(self) -> None:
+        """Reset turn-local cancellation state before a serialized prompt."""
+        self._cancelled = False
 
     @property
     def cancelled(self) -> bool:
@@ -103,21 +123,39 @@ class GlmClient:
         result = StreamResult()
         working_messages = list(messages)
 
-        for _ in range(MAX_AUTO_CONTINUATIONS):
+        for request_index in range(MAX_AUTO_CONTINUATIONS + 1):
             if self._cancelled:
                 break
 
             await self._do_stream_request(
-                working_messages, tools, result,
-                on_reasoning, on_content, on_tool_call_started,
+                working_messages,
+                tools,
+                result,
+                on_reasoning,
+                on_content,
+                on_tool_call_started,
             )
 
             if result.finish_reason == "length" and not result.tool_calls:
+                if request_index >= MAX_AUTO_CONTINUATIONS:
+                    result.finish_reason = "continuation_limit"
+                    break
+                assistant_message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": result.content,
+                }
+                if self.preserve_thinking and result.reasoning:
+                    assistant_message["reasoning_content"] = result.reasoning
                 working_messages = list(messages) + [
-                    {"role": "assistant", "content": result.content},
-                    {"role": "user", "content": "Continue exactly where you left off. Do not repeat or summarize."},
+                    assistant_message,
+                    {
+                        "role": "user",
+                        "content": "Continue exactly where you left off. Do not repeat or summarize.",
+                    },
                 ]
                 result.content += "\n"
+                if on_content:
+                    await on_content("\n")
                 continue
 
             break
@@ -165,24 +203,27 @@ class GlmClient:
             last_error = GlmApiError(resp.status_code, err_text)
             if resp.status_code not in RETRYABLE_STATUS_CODES or attempt == MAX_RETRIES:
                 raise last_error
-            delay = RETRY_BASE_DELAY * (2 ** attempt)
+            delay = RETRY_BASE_DELAY * (2**attempt)
             await asyncio.sleep(delay)
 
         try:
             data = resp.json()
-        except Exception:
-            logger.warning("Compaction response was not valid JSON")
-            return "(compaction produced no summary)"
+        except Exception as exc:
+            raise CompactionError("Compaction response did not contain a valid summary") from exc
         choices = data.get("choices", [])
         if not choices:
-            return "(compaction produced no summary)"
+            raise CompactionError("Compaction response did not contain a summary")
         content = choices[0].get("message", {}).get("content", "")
-        return content.strip() or "(compaction produced no summary)"
+        content = content.strip()
+        if not content:
+            raise CompactionError("Compaction response contained an empty summary")
+        return content
 
     @staticmethod
     def _format_transcript(messages: list[dict[str, Any]]) -> str:
         """Render messages into a readable transcript for the summarizer."""
         lines: list[str] = []
+        tool_labels: dict[str, str] = {}
         for msg in messages:
             role = msg.get("role", "unknown")
             if role == "system":
@@ -193,7 +234,8 @@ class GlmClient:
                 content = ""
             elif isinstance(raw_content, list):
                 content = " ".join(
-                    b.get("text", "") for b in raw_content
+                    b.get("text", "")
+                    for b in raw_content
                     if isinstance(b, dict) and b.get("type") == "text"
                 )
             else:
@@ -202,12 +244,16 @@ class GlmClient:
             tool_call_id = msg.get("tool_call_id")
 
             if tool_call_id:
-                lines.append(f"[Tool Result] {content}")
+                label = tool_labels.get(str(tool_call_id), "unknown tool")
+                lines.append(f"[Tool Result {tool_call_id} — {label}] {content}")
             elif tool_calls:
                 tc_strs = []
                 for tc in tool_calls:
                     fn = tc.get("function", {})
-                    tc_strs.append(f"{fn.get('name', '?')}({fn.get('arguments', '')})")
+                    call_id = str(tc.get("id", "?"))
+                    label = f"{fn.get('name', '?')}({fn.get('arguments', '')})"
+                    tool_labels[call_id] = label
+                    tc_strs.append(f"{call_id}: {label}")
                 lines.append(f"[Assistant Tool Calls: {', '.join(tc_strs)}]")
                 if content:
                     lines.append(f"[Assistant Content] {content}")
@@ -241,7 +287,10 @@ class GlmClient:
         # not vision models.
         is_vision = self.model in VISION_MODELS
         if not is_vision:
-            body["thinking"] = {"type": self.thought_level}
+            body["thinking"] = {
+                "type": self.thought_level,
+                "clear_thinking": not self.preserve_thinking,
+            }
             if self.reasoning_effort:
                 body["reasoning_effort"] = self.reasoning_effort
         if tools:
@@ -252,35 +301,58 @@ class GlmClient:
             if self._cancelled:
                 return
 
+            attempt_result = StreamResult()
             try:
-                await self._execute_stream(body, result, on_reasoning, on_content, on_tool_call_started)
+                await self._execute_stream(
+                    body,
+                    attempt_result,
+                    on_reasoning,
+                    on_content,
+                    on_tool_call_started,
+                )
+                self._merge_result(result, attempt_result)
                 return  # success
+            except IncompleteStreamError:
+                if attempt_result.content or attempt_result.reasoning:
+                    self._merge_result(result, attempt_result)
+                    result.finish_reason = "network_error"
+                    return
+                if attempt == MAX_RETRIES:
+                    raise
+                await asyncio.sleep(RETRY_BASE_DELAY * (2**attempt))
             except GlmApiError as e:
                 if e.status_code not in RETRYABLE_STATUS_CODES or attempt == MAX_RETRIES:
                     raise
-                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                delay = RETRY_BASE_DELAY * (2**attempt)
                 logger.warning(
                     "API error %d, retrying in %.1fs (attempt %d/%d)",
-                    e.status_code, delay, attempt + 1, MAX_RETRIES,
+                    e.status_code,
+                    delay,
+                    attempt + 1,
+                    MAX_RETRIES,
                 )
-                # Clear partial results from the failed attempt so retry
-                # doesn't produce duplicate content or stale usage
-                result.content = ""
-                result.reasoning = ""
-                result.tool_calls = []
-                result.finish_reason = ""
-                result.usage = None
                 await asyncio.sleep(delay)
             except httpx.TransportError as e:
+                if attempt_result.content or attempt_result.reasoning:
+                    self._merge_result(result, attempt_result)
+                    result.finish_reason = "network_error"
+                    return
                 if attempt == MAX_RETRIES:
                     raise RuntimeError(f"Network error after {MAX_RETRIES} retries: {e}")
-                delay = RETRY_BASE_DELAY * (2 ** attempt)
-                result.content = ""
-                result.reasoning = ""
-                result.tool_calls = []
-                result.finish_reason = ""
-                result.usage = None
+                delay = RETRY_BASE_DELAY * (2**attempt)
                 await asyncio.sleep(delay)
+
+    @staticmethod
+    def _merge_result(result: StreamResult, attempt: StreamResult) -> None:
+        """Merge one completed HTTP attempt into a logical model turn."""
+        result.content += attempt.content
+        result.reasoning += attempt.reasoning
+        result.tool_calls.extend(attempt.tool_calls)
+        result.finish_reason = attempt.finish_reason
+        if attempt.usage:
+            previous_output = (result.usage or {}).get("output_tokens", 0)
+            result.usage = dict(attempt.usage)
+            result.usage["output_tokens"] = previous_output + attempt.usage.get("output_tokens", 0)
 
     async def _execute_stream(
         self,
@@ -292,36 +364,116 @@ class GlmClient:
     ) -> None:
         """Execute a single streaming request (no retry logic)."""
         tool_accs: dict[int, ToolCallAccumulator] = {}
+        tool_argument_parts: dict[int, list[str]] = {}
         announced: set[int] = set()
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        pending_content: list[str] = []
+        pending_reasoning: list[str] = []
+        pending_count = 0
+        emitted_any = False
+        terminal_seen = False
 
-        async with self._client.stream("POST", "/chat/completions", json=body) as resp:
-            if resp.status_code != 200:
-                text = await resp.aread()
-                raise GlmApiError(resp.status_code, text.decode(errors="replace")[:500])
+        def sync_result() -> None:
+            result.content = "".join(content_parts)
+            result.reasoning = "".join(reasoning_parts)
 
-            async for line in resp.aiter_lines():
-                if self._cancelled:
-                    result.finish_reason = "cancelled"
-                    return
+        async def flush(force: bool = False) -> None:
+            nonlocal pending_count, emitted_any
+            if not force and emitted_any and pending_count < 16:
+                return
+            reasoning_batch = "".join(pending_reasoning)
+            content_batch = "".join(pending_content)
+            pending_reasoning.clear()
+            pending_content.clear()
+            pending_count = 0
+            emitted_any = emitted_any or bool(reasoning_batch or content_batch)
+            if reasoning_batch and on_reasoning:
+                await on_reasoning(reasoning_batch)
+            if content_batch and on_content:
+                await on_content(content_batch)
 
-                if not line or not line.startswith("data:"):
-                    continue
+        try:
+            async with self._client.stream("POST", "/chat/completions", json=body) as resp:
+                if resp.status_code != 200:
+                    text = await resp.aread()
+                    raise GlmApiError(resp.status_code, text.decode(errors="replace")[:500])
 
-                data = line[len("data:"):].strip()
-                if data == "[DONE]":
-                    break
-                if not data:
-                    continue
+                async for line in resp.aiter_lines():
+                    if self._cancelled:
+                        result.finish_reason = "cancelled"
+                        terminal_seen = True
+                        return
 
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+                    if not line or not line.startswith("data:"):
+                        continue
 
-                choices = chunk.get("choices", [])
-                if not choices:
-                    # Still check for usage — Z.ai sends it in a separate
-                    # final chunk with empty choices.
+                    data = line[len("data:") :].strip()
+                    if data == "[DONE]":
+                        terminal_seen = True
+                        break
+                    if not data:
+                        continue
+
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        usage = chunk.get("usage")
+                        if usage:
+                            result.usage = {
+                                "input_tokens": usage.get("prompt_tokens", 0),
+                                "output_tokens": usage.get("completion_tokens", 0),
+                                "total_tokens": usage.get("total_tokens", 0),
+                            }
+                        continue
+                    delta = choices[0].get("delta", {})
+                    finish = choices[0].get("finish_reason")
+
+                    reasoning = delta.get("reasoning_content") or ""
+                    content = delta.get("content") or ""
+
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
+                        pending_reasoning.append(reasoning)
+                        pending_count += 1
+
+                    if content:
+                        content_parts.append(content)
+                        pending_content.append(content)
+                        pending_count += 1
+
+                    if reasoning or content:
+                        sync_result()
+                        await flush()
+
+                    tc_deltas = delta.get("tool_calls")
+                    if tc_deltas:
+                        await flush(force=True)
+                        for tc in tc_deltas:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_accs:
+                                tool_accs[idx] = ToolCallAccumulator(
+                                    id=tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                                )
+                                tool_argument_parts[idx] = []
+                            acc = tool_accs[idx]
+                            if tc.get("function", {}).get("name"):
+                                acc.name = tc["function"]["name"]
+                            if tc.get("function", {}).get("arguments"):
+                                tool_argument_parts[idx].append(tc["function"]["arguments"])
+
+                            if on_tool_call_started and acc.name and idx not in announced:
+                                announced.add(idx)
+                                await on_tool_call_started(acc.id, acc.name)
+
+                    if finish:
+                        result.finish_reason = finish
+                        terminal_seen = True
+
                     usage = chunk.get("usage")
                     if usage:
                         result.usage = {
@@ -329,67 +481,29 @@ class GlmClient:
                             "output_tokens": usage.get("completion_tokens", 0),
                             "total_tokens": usage.get("total_tokens", 0),
                         }
-                    continue
-                delta = choices[0].get("delta", {})
-                finish = choices[0].get("finish_reason")
+        finally:
+            sync_result()
+            await flush(force=True)
 
-                reasoning = delta.get("reasoning_content") or ""
-                content = delta.get("content") or ""
-
-                if reasoning:
-                    result.reasoning += reasoning
-                    if on_reasoning:
-                        await on_reasoning(reasoning)
-
-                if content:
-                    result.content += content
-                    if on_content:
-                        await on_content(content)
-
-                tc_deltas = delta.get("tool_calls")
-                if tc_deltas:
-                    for tc in tc_deltas:
-                        idx = tc.get("index", 0)
-                        if idx not in tool_accs:
-                            tool_accs[idx] = ToolCallAccumulator(
-                                id=tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
-                            )
-                        acc = tool_accs[idx]
-                        if tc.get("function", {}).get("name"):
-                            acc.name = tc["function"]["name"]
-                        if tc.get("function", {}).get("arguments"):
-                            acc.arguments += tc["function"]["arguments"]
-
-                        if on_tool_call_started and acc.name and idx not in announced:
-                            announced.add(idx)
-                            await on_tool_call_started(acc.id, acc.name)
-
-                if finish:
-                    result.finish_reason = finish
-
-                # Z.ai sends usage in the last chunk(s) — capture it whenever
-                # it appears rather than only after the loop ends.
-                usage = chunk.get("usage")
-                if usage:
-                    result.usage = {
-                        "input_tokens": usage.get("prompt_tokens", 0),
-                        "output_tokens": usage.get("completion_tokens", 0),
-                        "total_tokens": usage.get("total_tokens", 0),
-                    }
+        if not terminal_seen:
+            raise IncompleteStreamError("GLM stream ended before a terminal event")
 
         for idx in sorted(tool_accs):
             acc = tool_accs[idx]
             if not acc.name:
                 continue
             try:
+                acc.arguments = "".join(tool_argument_parts.get(idx, []))
                 args = json.loads(acc.arguments) if acc.arguments else {}
             except json.JSONDecodeError:
                 args = {"_raw": acc.arguments}
-            result.tool_calls.append({
-                "id": acc.id,
-                "type": "function",
-                "function": {"name": acc.name, "arguments": args},
-            })
+            result.tool_calls.append(
+                {
+                    "id": acc.id,
+                    "type": "function",
+                    "function": {"name": acc.name, "arguments": args},
+                }
+            )
 
     async def aclose(self) -> None:
         await self._client.aclose()

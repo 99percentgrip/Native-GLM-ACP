@@ -1,12 +1,13 @@
 """Tests for glm_acp.glm_client — GlmApiError, StreamResult, cancel, retry logic."""
 
-import pytest
 import os
+
+import pytest
 
 os.environ.setdefault("ZAI_API_KEY", "test-key")
 
-from glm_acp.glm_client import GlmClient, GlmApiError, StreamResult, ToolCallAccumulator
-from glm_acp.config import MAX_RETRIES, RETRYABLE_STATUS_CODES, VISION_MODELS
+from glm_acp.config import MAX_RETRIES
+from glm_acp.glm_client import GlmApiError, GlmClient, StreamResult, ToolCallAccumulator
 
 
 class TestGlmApiError:
@@ -61,6 +62,7 @@ class TestGlmClientInit:
     def test_vision_model_no_thinking(self):
         """Vision models should not send thinking params."""
         import inspect
+
         src = inspect.getsource(GlmClient._do_stream_request)
         assert "is_vision" in src
         assert "VISION_MODELS" in src or "not is_vision" in src
@@ -68,26 +70,29 @@ class TestGlmClientInit:
     def test_stream_options(self):
         """stream_options include_usage should be set."""
         import inspect
+
         src = inspect.getsource(GlmClient._do_stream_request)
         assert "include_usage" in src
 
-    def test_retry_clears_results(self):
-        """Retry should clear partial StreamResult fields including usage."""
+    def test_retries_use_attempt_local_results(self):
+        """Retries must not clear output from earlier successful continuations."""
         import inspect
+
         src = inspect.getsource(GlmClient._do_stream_request)
-        assert 'result.content = ""' in src
-        assert "result.tool_calls = []" in src
-        assert "result.usage = None" in src
+        assert "attempt_result = StreamResult()" in src
+        assert 'result.content = ""' not in src
 
     def test_retry_count(self):
         """Should retry MAX_RETRIES + 1 times."""
         import inspect
+
         src = inspect.getsource(GlmClient._do_stream_request)
-        assert f"range(MAX_RETRIES + 1)" in src or f"range({MAX_RETRIES} + 1)" in src
+        assert "range(MAX_RETRIES + 1)" in src or f"range({MAX_RETRIES} + 1)" in src
 
     def test_summarize_retry(self):
         """Summarization should also have retry logic."""
         import inspect
+
         src = inspect.getsource(GlmClient.summarize_messages)
         assert "attempt" in src
         assert "MAX_RETRIES" in src
@@ -95,6 +100,7 @@ class TestGlmClientInit:
     def test_cancel_check_in_stream(self):
         """Stream execution should check cancel flag."""
         import inspect
+
         src = inspect.getsource(GlmClient._execute_stream)
         assert "self._cancelled" in src
 
@@ -103,28 +109,40 @@ class TestGlmClientInit:
 # Summarize robustness
 # ============================================================
 
+
 class TestSummarizeRobustness:
     def test_summarize_handles_non_json_response(self):
         """summarize_messages should handle non-JSON 200 response gracefully."""
         import inspect
+
         src = inspect.getsource(GlmClient.summarize_messages)
         # Must have a try/except around resp.json()
         assert "except Exception" in src or "json.JSONDecodeError" in src
 
-    def test_summarize_returns_fallback_on_empty_choices(self):
-        """Should return fallback message when choices is empty."""
-        import inspect
-        src = inspect.getsource(GlmClient.summarize_messages)
-        assert "no summary" in src.lower()
+    @pytest.mark.asyncio
+    async def test_summarize_rejects_empty_choices(self):
+        """An empty compaction response must not become authoritative history."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        client = GlmClient(model="glm-5.2")
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"choices": []}
+        client._client.post = AsyncMock(return_value=response)
+
+        with pytest.raises(RuntimeError, match="summary"):
+            await client.summarize_messages([{"role": "user", "content": "keep me"}])
 
 
 # ============================================================
 # Error body decode robustness
 # ============================================================
 
+
 class TestErrorBodyDecode:
     def test_execute_stream_uses_replace_on_error_decode(self):
         """Error response body decode should use errors=replace."""
         import inspect
+
         src = inspect.getsource(GlmClient._execute_stream)
         assert 'errors="replace"' in src or "errors='replace'" in src
