@@ -236,9 +236,10 @@ def _read_utf8_text(path: Path, action: str) -> str:
     if b"\x00" in data:
         raise ToolError(f"Cannot {action} binary file: {path}")
     try:
-        return data.decode("utf-8")
+        text = data.decode("utf-8")
     except UnicodeDecodeError:
         raise ToolError(f"Cannot {action} binary file: {path}")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 @dataclass
