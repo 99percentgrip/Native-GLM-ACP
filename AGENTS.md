@@ -94,8 +94,8 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 
 ## Current Project Status
 
-- Package and ACP implementation version is `0.3.0` from `glm_acp.__version__`.
-- GitHub release `v0.3.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, and the icon.
+- Package and ACP implementation version is `0.4.0` from `glm_acp.__version__`.
+- GitHub release `v0.4.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, and the icon.
 - ACP Registry publication is tracked in `agentclientprotocol/registry#439` and remains pending until Registry maintainers merge it.
 - Source installs, the `glm-acp` console script, module execution, and frozen binaries share `cli.main()`.
 - ACP initialization advertises Registry-compatible `zai-api-key-setup` Terminal Auth.
@@ -103,6 +103,9 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 - GitHub Actions tests Python 3.10–3.13 and packages Linux x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x86-64 binaries.
 - Official Z.ai Web Search, Web Reader, and optional local Vision MCP capabilities are exposed alongside configurable MCP servers.
 - Root project instructions and permission-gated `.glm-acp/memory.md` knowledge are loaded into model context.
+- Repeated identical tool batches are interrupted before the 50-iteration ceiling, malformed JSON arguments receive corrective feedback, and shell tools do not inherit common credential environment variables.
+- Expired MCP HTTP sessions and restarted stdio servers reinitialize automatically with per-server initialization locking.
+- The opt-in quality harness provides 11 outcome-based Python, TypeScript, Go, and Rust cases plus comparable JSON and Markdown reports; live runs remain outside ordinary CI.
 
 ## Install and distribution (binding)
 
@@ -125,7 +128,7 @@ Verify the install:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: editable glm_acp metadata and glm_acp-0.3.0.dist-info
+# expect: editable glm_acp metadata and glm_acp-0.4.0.dist-info
 ```
 
 ## Verification
