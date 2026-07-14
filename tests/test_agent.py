@@ -64,6 +64,8 @@ class TestSystemPrompt:
     def test_permission_denied_cwd(self, tmp_path):
         """Should not crash when cwd has no read permission (skipped if root)."""
         import os
+        if not hasattr(os, "geteuid"):
+            pytest.skip("Unix permission semantics are unavailable")
         if os.geteuid() == 0:
             pytest.skip("Cannot test permission denial as root")
         restricted = tmp_path / "restricted"

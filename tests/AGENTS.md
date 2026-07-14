@@ -17,6 +17,7 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
 - Tests must not require a real Z.ai API key or make live model requests.
 - Secret tests must assert that credential values never appear in output.
 - Registry tests must fail when source, manifest, and archive versions diverge.
+- Platform-specific tests must skip when their operating-system semantics are unavailable.
 
 ## Work Guidance
 

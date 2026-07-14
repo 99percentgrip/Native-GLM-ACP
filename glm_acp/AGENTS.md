@@ -130,6 +130,8 @@ or manual inspection.
 
 All file tool operations validate paths against the session `cwd` and
 `additional_directories`. Paths outside workspace roots raise `ToolError`.
+Text-file tools decode strict UTF-8 and consistently treat invalid UTF-8 or
+NUL-containing data as binary on every supported platform.
 
 ### Session persistence & history replay
 
