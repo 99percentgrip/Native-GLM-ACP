@@ -250,7 +250,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-0.2.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-0.2.1.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

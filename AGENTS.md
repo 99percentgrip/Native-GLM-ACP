@@ -94,7 +94,7 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 
 ## Current Project Status
 
-- Package and ACP implementation version is `0.2.0` from `glm_acp.__version__`.
+- Package and ACP implementation version is `0.2.1` from `glm_acp.__version__`.
 - Source installs, the `glm-acp` console script, module execution, and frozen binaries share `cli.main()`.
 - ACP initialization advertises Registry-compatible `zai-api-key-setup` Terminal Auth.
 - Terminal setup stores credentials atomically without echoing or logging the key; environment credentials take precedence.
@@ -122,7 +122,7 @@ Verify the install:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: editable glm_acp metadata and glm_acp-0.2.0.dist-info
+# expect: editable glm_acp metadata and glm_acp-0.2.1.dist-info
 ```
 
 ## Verification
