@@ -117,7 +117,7 @@ jobs:
             id: "native-glm-acp",
             name: "Native GLM ACP",
             version: $version,
-            description: "Native GLM-5.2 ACP agent with 1M context, preserved reasoning, Z.ai MCP, secure tools, planning, memory, and no Python runtime.",
+            description: "Native GLM-5.2 ACP agent with 1M context, preserved reasoning, Z.ai MCP, secure tools, verified learning, session recall, and no Python runtime.",
             repository: $repository,
             website: $repository,
             authors: ["Aleksejs Kozlitins"],
