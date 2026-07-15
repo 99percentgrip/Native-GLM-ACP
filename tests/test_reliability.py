@@ -64,6 +64,17 @@ def test_project_facts_detect_repository_verification_commands(tmp_path: Path):
     assert facts.verify_commands == ("pnpm run test", "pnpm run typecheck")
 
 
+def test_non_git_project_detection_does_not_spawn_git(tmp_path: Path, monkeypatch):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'fast'\n")
+    run = MagicMock(side_effect=AssertionError("git subprocess must not run"))
+    monkeypatch.setattr("glm_acp.project_context.subprocess.run", run)
+
+    facts = detect_project_facts(tmp_path)
+
+    assert facts.root == str(tmp_path)
+    run.assert_not_called()
+
+
 def test_verification_ledger_rejects_spoof_and_invalidates_after_edit(tmp_path: Path):
     (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
     facts = detect_project_facts(tmp_path)

@@ -45,22 +45,8 @@ def _is_dir(path: Path) -> bool:
 
 
 def project_root(cwd: str | Path) -> Path:
-    """Return the git root, nearest marker root, or resolved cwd."""
+    """Return the nearest git/manifest root or resolved cwd without a subprocess."""
     current = Path(cwd).expanduser().resolve()
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=current,
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-        candidate = Path(result.stdout.strip()).resolve()
-        if result.returncode == 0 and candidate.is_dir():
-            return candidate
-    except (OSError, subprocess.TimeoutExpired):
-        pass
     for candidate in (current, *current.parents):
         if any(_exists(candidate / marker) for marker in _ROOT_MARKERS):
             return candidate
@@ -247,21 +233,22 @@ def detect_project_facts(cwd: str | Path) -> ProjectFacts:
             verify.append(f"make {name}")
     branch = ""
     dirty = False
-    try:
-        status = subprocess.run(
-            ["git", "status", "--porcelain=v1", "--branch"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-        if status.returncode == 0:
-            lines = status.stdout.splitlines()
-            branch = lines[0].removeprefix("## ").split("...")[0] if lines else ""
-            dirty = len(lines) > 1
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    if _exists(root / ".git"):
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain=v1", "--branch"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if status.returncode == 0:
+                lines = status.stdout.splitlines()
+                branch = lines[0].removeprefix("## ").split("...")[0] if lines else ""
+                dirty = len(lines) > 1
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     return ProjectFacts(
         root=str(root),
         manifests=manifests,
