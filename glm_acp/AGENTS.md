@@ -17,10 +17,10 @@ streaming, 1M context, and auto-continuation for long generations.
 - **ACP protocol**: `agent.py` — implements `acp.Agent` (initialize, new_session, load_session, resume_session, close_session, list_sessions, prompt, set_config_option, set_session_mode)
 - **GLM API client**: `glm_client.py` — SSE/tool streaming, preserved thinking, cancellation, retry, cache usage, auto-continuation
 - **MCP**: `mcp.py` — official Z.ai remote/local services and configured HTTP/stdio servers
-- **Project knowledge**: `memory.py` — root instructions and opt-in project-local memory
+- **Project knowledge and learning**: `memory.py` — root instructions, scoped memory, verified skills, telemetry, and lifecycle curation
 - **Tools**: `tools.py` — file/shell operations sandboxed to workspace roots
 - **Config**: `config.py` — model registry, API key, constants
-- **Persistence**: `session_store.py` — JSON file store for conversation state in `~/.glm-acp/sessions/`
+- **Persistence and recall**: `session_store.py` — JSON conversation state plus a local redacted SQLite FTS5 search index
 
 ### Entry point resolution
 
@@ -196,8 +196,29 @@ expiry performs one clean reinitialize-and-retry, while dead or timed-out stdio
 processes discard stale protocol state before restart.
 
 Root `AGENTS.md`, `CLAUDE.md`, and `GLM.md` are loaded into the managed system
-prompt. Reusable knowledge is opt-in and stored only after permission in the
+prompt. Reusable facts are opt-in and stored only after permission in the
 workspace's `.glm-acp/memory.md`; secrets and transient reasoning must not be stored.
+
+After a task passes a recognized verification command, the turn receives
+one bounded learning review. Non-obvious reusable procedures may be written only
+after permission to `.glm-acp/skills/<name>/SKILL.md`. Skill metadata is loaded
+into the managed prompt, full instructions are read on demand, credential-like
+content is rejected, and deletion is limited to this agent-owned directory.
+
+Explicit user facts and preferences may be stored after permission in private
+cross-project `user.md`; project facts remain in `.glm-acp/memory.md`. Both are
+bounded, secret-filtered, inspectable, and support exact forgetting.
+
+Learned-skill telemetry tracks views, uses, and revisions. Deterministic curation
+marks 30-day idle skills stale and reversibly archives 90-day idle skills only
+after permission. Pinned skills are protected by code and curation never deletes.
+Content hashes route manually changed skills to review, and deterministic
+description overlap evidence may suggest consolidation but never auto-merges.
+
+`session_store.py` indexes user, assistant, and tool content locally with FTS5
+for discovery and contextual scrolling. It excludes system prompts and reasoning
+fields, redacts credential-shaped content, backfills legacy JSON sessions, and
+removes index rows when a session is deleted.
 
 ### Session persistence & history replay
 
@@ -211,6 +232,9 @@ conversation histories. Disk persistence is dispatched off the event loop,
 turns are serialized per session, and one pooled GLM HTTP client is reused until
 the session's model, endpoint, or thinking configuration changes. Agent
 shutdown and session close must close pooled clients.
+Session close releases runtime resources but preserves persisted/searchable
+history; deletion is a separate storage operation and must never be inferred
+from close.
 
 **Critical:** The ACP `LoadSessionResponse` and `ResumeSessionResponse` only
 carry `modes`, `config_options`, and `models` — they do **not** include message
@@ -228,6 +252,8 @@ The server runs with `use_unstable_protocol=True` to expose
 - Keep `glm_client.py` free of ACP-specific imports — it's a pure API wrapper
 - Keep `agent.py` free of HTTP/SSE logic — it's a pure ACP layer
 - Never write reasoning text to files; it flows only through `agent_thought_chunk`
+- Do not weaken the verification prerequisite, permission gate, secret filter, size bounds, or project-local ownership boundary for learned skills.
+- Keep session recall local and bounded; never index system prompts, exact reasoning traces, or credential-like values.
 
 ## Verification
 

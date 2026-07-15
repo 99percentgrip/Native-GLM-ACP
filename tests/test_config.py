@@ -99,6 +99,12 @@ class TestConstants:
         assert "edit_file" in DESTRUCTIVE_TOOLS
         assert "run_command" in DESTRUCTIVE_TOOLS
         assert "apply_patch" in DESTRUCTIVE_TOOLS
+        assert "learn_skill" in DESTRUCTIVE_TOOLS
+        assert "forget_skill" in DESTRUCTIVE_TOOLS
+        assert "store_user_profile" in DESTRUCTIVE_TOOLS
+        assert "forget_memory" in DESTRUCTIVE_TOOLS
+        assert "manage_skill" in DESTRUCTIVE_TOOLS
+        assert "curate_skills" in DESTRUCTIVE_TOOLS
         assert "vision_analyze" in DESTRUCTIVE_TOOLS
         assert "read_file" not in DESTRUCTIVE_TOOLS
 

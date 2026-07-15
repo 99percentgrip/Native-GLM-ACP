@@ -1,13 +1,14 @@
 """Tests for glm_acp.session_store — persistence, path traversal, atomic writes."""
 
 import json
-import pytest
+import os
 from pathlib import Path
 
-os = __import__("os")
+import pytest
+
 os.environ.setdefault("ZAI_API_KEY", "test-key")
 
-from glm_acp.session_store import SessionStore
+from glm_acp.session_store import SessionStore  # noqa: E402
 
 
 @pytest.fixture
@@ -172,6 +173,79 @@ class TestDeleteSession:
 
     def test_delete_nonexistent_no_error(self, store):
         store.delete("nonexistent")  # should not raise
+
+
+class TestSessionSearch:
+    def test_full_text_search_returns_context_without_reasoning(self, store, sample_data):
+        store.save(
+            "cleanup-session",
+            {
+                **sample_data,
+                "title": "Async cleanup",
+                "messages": [
+                    {"role": "user", "content": "Fix async resource cleanup"},
+                    {"role": "user", "content": "api_key=super-secret-value"},
+                    {
+                        "role": "assistant",
+                        "content": "Added close in the finally block",
+                        "reasoning_content": "private-thought-marker",
+                    },
+                ],
+            },
+        )
+
+        results = store.search("async cleanup")
+
+        assert results[0]["session_id"] == "cleanup-session"
+        assert results[0]["title"] == "Async cleanup"
+        assert any("resource cleanup" in message["content"] for message in results[0]["messages"])
+        assert store.search("private-thought-marker") == []
+        assert store.search("super-secret-value") == []
+
+    def test_browse_and_scroll_session_history(self, store, sample_data):
+        store.save(
+            "browse-session",
+            {
+                **sample_data,
+                "title": "Browse me",
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "second"},
+                    {"role": "user", "content": "third"},
+                ],
+            },
+        )
+
+        assert store.search()[0]["title"] == "Browse me"
+        window = store.search(session_id="browse-session", around_ordinal=1, window=1)
+        assert [message["content"] for message in window] == ["first", "second", "third"]
+
+    def test_delete_removes_search_index(self, store, sample_data):
+        store.save(
+            "remove-index",
+            {**sample_data, "messages": [{"role": "user", "content": "unique zebra phrase"}]},
+        )
+        assert store.search("unique zebra")
+
+        store.delete("remove-index")
+
+        assert store.search("unique zebra") == []
+
+    def test_search_backfills_legacy_json_sessions(self, store, sample_data):
+        store._base_dir.mkdir(parents=True, exist_ok=True)
+        (store._base_dir / "legacy.json").write_text(
+            json.dumps(
+                {
+                    **sample_data,
+                    "title": "Legacy session",
+                    "messages": [{"role": "user", "content": "historical migration lesson"}],
+                }
+            )
+        )
+
+        results = store.search("migration lesson")
+
+        assert results[0]["session_id"] == "legacy"
 
 
 # ============================================================

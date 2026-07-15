@@ -27,6 +27,7 @@ from benchmarks.report import case_cell, load_report, row
 from benchmarks.run_live import BenchmarkAlreadyRunning, LiveRunLock, process_is_alive
 from glm_acp.agent import GlmAcpAgent, Session
 from glm_acp.glm_client import StreamResult
+from glm_acp.session_store import SessionStore
 
 
 class ScriptedClient:
@@ -260,18 +261,136 @@ async def test_successful_verification_clears_unverified_change(tmp_path):
         finish_reason="tool_calls",
     )
     client = ScriptedClient(
-        [changed_file, verification, StreamResult(content="Verified.", finish_reason="stop")]
+        [
+            changed_file,
+            verification,
+            StreamResult(content="Verified.", finish_reason="stop"),
+            StreamResult(content="No reusable lesson.", finish_reason="stop"),
+        ]
     )
     agent = configured_agent(client)
     session = Session("verified-change", str(tmp_path))
     session.permission_mode = "bypass"
 
     assert await agent._run_turn(session) == "end_turn"
-    assert client.calls == 3
+    assert client.calls == 4
     assert not any(
         item["role"] == "system" and "files were changed" in item["content"]
         for item in session.messages
     )
+    assert any(
+        item["role"] == "system" and "Learning review" in item["content"]
+        for item in session.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_verified_task_can_learn_project_skill(tmp_path):
+    def tool_call(call_id: str, name: str, arguments: dict) -> StreamResult:
+        return StreamResult(
+            tool_calls=[{"id": call_id, "function": {"name": name, "arguments": arguments}}],
+            finish_reason="tool_calls",
+        )
+
+    client = ScriptedClient(
+        [
+            tool_call(
+                "write-change",
+                "write_file",
+                {"path": "client.py", "content": "value = 1\n"},
+            ),
+            tool_call(
+                "successful-check",
+                "run_command",
+                {"command": f'"{sys.executable}" -c "print(\'pytest passed\')"'},
+            ),
+            StreamResult(content="Verified.", finish_reason="stop"),
+            tool_call(
+                "learn",
+                "learn_skill",
+                {
+                    "name": "verify-client",
+                    "description": "Verify client changes",
+                    "instructions": "Run the focused client test after edits.",
+                },
+            ),
+            StreamResult(content="Learned.", finish_reason="stop"),
+        ]
+    )
+    agent = configured_agent(client)
+    session = Session("learning", str(tmp_path))
+    session.permission_mode = "bypass"
+
+    assert await agent._run_turn(session) == "end_turn"
+    assert (tmp_path / ".glm-acp/skills/verify-client/SKILL.md").is_file()
+
+
+@pytest.mark.asyncio
+async def test_skill_learning_is_rejected_before_verification(tmp_path):
+    attempted_learning = StreamResult(
+        tool_calls=[
+            {
+                "id": "premature-learning",
+                "function": {
+                    "name": "learn_skill",
+                    "arguments": {
+                        "name": "guess",
+                        "description": "Unverified guess",
+                        "instructions": "Assume this works.",
+                    },
+                },
+            }
+        ],
+        finish_reason="tool_calls",
+    )
+    client = ScriptedClient(
+        [attempted_learning, StreamResult(content="Not learned.", finish_reason="stop")]
+    )
+    agent = configured_agent(client)
+    session = Session("unverified-learning", str(tmp_path))
+    session.permission_mode = "bypass"
+
+    assert await agent._run_turn(session) == "end_turn"
+    assert not (tmp_path / ".glm-acp/skills/guess/SKILL.md").exists()
+    assert any(
+        item["role"] == "tool" and "only after a successful verification" in item["content"]
+        for item in session.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_can_search_past_sessions_without_model_summarization(tmp_path):
+    store = SessionStore(tmp_path / "sessions")
+    store.save(
+        "prior-session",
+        {
+            "cwd": str(tmp_path),
+            "title": "Prior cleanup",
+            "messages": [{"role": "user", "content": "repair async cleanup regression"}],
+        },
+    )
+    search_call = StreamResult(
+        tool_calls=[
+            {
+                "id": "search-history",
+                "function": {
+                    "name": "session_search",
+                    "arguments": {"query": "async cleanup"},
+                },
+            }
+        ],
+        finish_reason="tool_calls",
+    )
+    client = ScriptedClient(
+        [search_call, StreamResult(content="I found the prior cleanup.", finish_reason="stop")]
+    )
+    agent = configured_agent(client)
+    agent._store = store
+    session = Session("current-session", str(tmp_path))
+
+    assert await agent._run_turn(session) == "end_turn"
+    results = [item["content"] for item in session.messages if item["role"] == "tool"]
+    assert any("prior-session" in result and "async cleanup" in result for result in results)
 
 
 def test_benchmark_catalog_is_broad_and_valid():

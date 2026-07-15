@@ -13,7 +13,8 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
 - `test_installers.py` covers the user-local command aliases, checksum enforcement, platform mapping, and release publication contract.
 - `test_uninstall.py` covers frozen-copy guards, default and installer-selected profile cleanup, command/PATH removal, credential preservation and purge, and surgical Zed JSONC cleanup with backup.
 - Remaining modules cover tools, sessions, streaming, compaction, and GLM HTTP behavior.
-- `test_mcp.py` and `test_memory.py` cover remote MCP protocol handling and opt-in project memory.
+- `test_mcp.py` and `test_memory.py` cover remote MCP, scoped memory, verified skills, telemetry, pinning, curation, and reversible archival.
+- `test_session_store.py` covers JSON persistence plus redacted FTS5 discovery, scrolling, legacy backfill, and deletion.
 - `test_quality.py` covers tool-loop, failed-verification and unverified-edit recovery, benchmark locking/incremental reports, million-token estimation, and real stdio/SDK ACP process lifecycles.
 
 ## Local Contracts
@@ -26,6 +27,10 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
   delta coalescing, continuation caps, and exact Deep High/Max request fields.
 - Tool tests must cover output bounds and make command exit status observable.
 - Persistence tests must verify metadata-sidecar listing and deletion behavior.
+- Learning tests must cover verification gating, progressive skill discovery, secret rejection, workspace containment, and deletion limited to agent-owned skills.
+- Learning lifecycle tests must cover profile privacy, exact forgetting, usage/revision telemetry, pinned protection, stale/archive thresholds, and restoration.
+- Curator tests must cover manual content drift and evidence-only overlap detection without automatic merging.
+- Session-search tests must prove system/reasoning/credential exclusion and legacy-session coverage.
 - Process-level ACP tests must use test credentials, isolated HOME state, and the official SDK lifecycle helpers where available.
 
 ## Work Guidance

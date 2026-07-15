@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import json
 import os
 import re
 import shutil
@@ -17,7 +18,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .memory import append_memory, memory_path, read_memory
+from .memory import (
+    append_memory,
+    append_user_profile,
+    curate_learned_skills,
+    forget_learned_skill,
+    forget_memory,
+    forget_user_profile,
+    learned_skills_path,
+    list_learned_skills,
+    manage_learned_skill,
+    memory_path,
+    read_learned_skill,
+    read_memory,
+    read_user_profile,
+    skill_curator_status,
+    write_learned_skill,
+)
 
 MAX_TOOL_OUTPUT_CHARS = 64_000
 _COMMAND_STREAM_LIMIT = MAX_TOOL_OUTPUT_CHARS // 2
@@ -343,7 +360,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "store_memory",
             "description": (
-                "Store one stable, reusable project fact or user preference. "
+                "Store one stable, reusable project fact. "
                 "Do not store secrets, transient task state, or reasoning."
             ),
             "parameters": {
@@ -351,6 +368,170 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "properties": {"entry": {"type": "string"}},
                 "required": ["entry"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_user_profile",
+            "description": "Read private cross-project facts and preferences approved by the user.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "store_user_profile",
+            "description": (
+                "Store one explicit durable user fact, preference, workflow, or environment "
+                "detail across projects. Never infer sensitive traits or store secrets."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entry": {"type": "string"},
+                    "category": {
+                        "type": "string",
+                        "enum": ["identity", "preference", "workflow", "environment"],
+                    },
+                },
+                "required": ["entry", "category"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_memory",
+            "description": "Remove one exact durable fact from project or user memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["project", "user"]},
+                    "entry": {"type": "string"},
+                },
+                "required": ["scope", "entry"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "session_search",
+            "description": (
+                "Search prior conversations when the user refers to earlier work. With no "
+                "arguments, browse recent sessions. Use session_id plus around_ordinal to "
+                "scroll around a previous match."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "session_id": {"type": "string"},
+                    "around_ordinal": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                    "window": {"type": "integer"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_skills",
+            "description": (
+                "List reusable project skills learned by this agent. Metadata only; "
+                "use read_skill to load instructions when relevant."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_skill",
+            "description": "Read one learned project's SKILL.md instructions on demand.",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "learn_skill",
+            "description": (
+                "Create or refine a reusable project SKILL.md after a non-trivial task "
+                "has passed verification. Store only concise procedures and pitfalls; "
+                "never credentials, raw reasoning, transient state, or routine steps."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Short lowercase/hyphen skill name",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What the skill does and when it should be used",
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "Concise reusable imperative workflow",
+                    },
+                },
+                "required": ["name", "description", "instructions"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_skill",
+            "description": (
+                "Remove one agent-learned project skill. This cannot remove user-authored "
+                ".agents or .codex skills."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_skill",
+            "description": (
+                "Pin, unpin, archive, or restore one agent-learned project skill. "
+                "Archiving is reversible and pinned skills cannot be archived."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["pin", "unpin", "archive", "restore"],
+                    },
+                },
+                "required": ["name", "action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "curate_skills",
+            "description": (
+                "Run deterministic skill maintenance: mark skills stale after 30 idle days "
+                "and archive unpinned skills after 90 idle days. Never deletes skills."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]
@@ -367,6 +548,16 @@ TOOL_KINDS: dict[str, str] = {
     "update_plan": "other",
     "recall_memory": "read",
     "store_memory": "edit",
+    "recall_user_profile": "read",
+    "store_user_profile": "edit",
+    "forget_memory": "edit",
+    "session_search": "search",
+    "list_skills": "read",
+    "read_skill": "read",
+    "learn_skill": "edit",
+    "forget_skill": "edit",
+    "manage_skill": "edit",
+    "curate_skills": "edit",
 }
 
 
@@ -462,6 +653,78 @@ async def execute_tool(
                 append_memory, str(sandbox.roots[0]), str(arguments.get("entry", ""))
             )
             return ToolResult(output=f"Stored project memory in {path}", file_path=str(path))
+        elif name == "recall_user_profile":
+            return ToolResult(output=read_user_profile())
+        elif name == "store_user_profile":
+            path = await asyncio.to_thread(
+                append_user_profile,
+                str(arguments.get("entry", "")),
+                str(arguments.get("category", "preference")),
+            )
+            return ToolResult(output=f"Stored private user profile entry in {path}")
+        elif name == "forget_memory":
+            scope = str(arguments.get("scope", ""))
+            entry = str(arguments.get("entry", ""))
+            if scope == "project":
+                sandbox.resolve(str(memory_path(str(sandbox.roots[0]))))
+                path = await asyncio.to_thread(forget_memory, str(sandbox.roots[0]), entry)
+            elif scope == "user":
+                path = await asyncio.to_thread(forget_user_profile, entry)
+            else:
+                raise ToolError("Memory scope must be project or user")
+            return ToolResult(output=f"Forgot {scope} memory entry from {path}")
+        elif name == "list_skills":
+            skills = await asyncio.to_thread(list_learned_skills, str(sandbox.roots[0]))
+            if not skills:
+                return ToolResult(output="No learned project skills have been recorded.")
+            status = await asyncio.to_thread(skill_curator_status, str(sandbox.roots[0]))
+            return ToolResult(
+                output=(
+                    f"Skills: {status['active']} active, {status['stale']} stale, "
+                    f"{status['archived']} archived, {status['pinned']} pinned\n"
+                    + "\n".join(
+                        f"- {skill['name']} [{skill['state']}]"
+                        f"{' [pinned]' if skill['pinned'] else ''}: "
+                        f"{skill['description']} ({skill['path']}; uses={skill['use_count']}, "
+                        f"revisions={skill['revision_count']})"
+                        for skill in skills
+                    )
+                )
+            )
+        elif name == "read_skill":
+            text = await asyncio.to_thread(
+                read_learned_skill, str(sandbox.roots[0]), str(arguments.get("name", ""))
+            )
+            return ToolResult(output=text)
+        elif name == "learn_skill":
+            sandbox.resolve(str(learned_skills_path(str(sandbox.roots[0]))))
+            path = await asyncio.to_thread(
+                write_learned_skill,
+                str(sandbox.roots[0]),
+                str(arguments.get("name", "")),
+                str(arguments.get("description", "")),
+                str(arguments.get("instructions", "")),
+            )
+            return ToolResult(output=f"Learned project skill in {path}", file_path=str(path))
+        elif name == "forget_skill":
+            sandbox.resolve(str(learned_skills_path(str(sandbox.roots[0]))))
+            path = await asyncio.to_thread(
+                forget_learned_skill,
+                str(sandbox.roots[0]),
+                str(arguments.get("name", "")),
+            )
+            return ToolResult(output=f"Forgot learned project skill at {path}")
+        elif name == "manage_skill":
+            result = await asyncio.to_thread(
+                manage_learned_skill,
+                str(sandbox.roots[0]),
+                str(arguments.get("name", "")),
+                str(arguments.get("action", "")),
+            )
+            return ToolResult(output=json.dumps(result, ensure_ascii=False, indent=2))
+        elif name == "curate_skills":
+            result = await asyncio.to_thread(curate_learned_skills, str(sandbox.roots[0]))
+            return ToolResult(output=json.dumps(result, ensure_ascii=False, indent=2))
         else:
             raise ToolError(f"Unknown tool: {name}")
     except ToolError:

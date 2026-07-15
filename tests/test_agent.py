@@ -56,6 +56,14 @@ class TestSystemPrompt:
         assert "AGENTS.md" in prompt
         assert "Do not claim" in prompt
 
+    def test_contains_approved_user_profile(self, tmp_path, monkeypatch):
+        from glm_acp.memory import append_user_profile
+
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+        append_user_profile("Prefers focused verification", "workflow")
+
+        assert "Prefers focused verification" in build_system_prompt(str(tmp_path))
+
     def test_nonexistent_cwd(self):
         """Should not crash when cwd doesn't exist."""
         prompt = build_system_prompt("/nonexistent/path/xyz")
@@ -388,6 +396,49 @@ class TestSlashCommands:
         result = await agent._handle_command(session, "/status")
         assert "Session Status" in result
         assert "1,000 input" in result
+        assert "Learned skills" in result
+
+    @pytest.mark.asyncio
+    async def test_memory_and_skills_commands(self, agent, session, tmp_path):
+        from glm_acp.memory import append_memory, write_learned_skill
+
+        session.cwd = str(tmp_path)
+        append_memory(str(tmp_path), "Tests use pytest")
+        write_learned_skill(str(tmp_path), "run-tests", "Run focused tests", "Use pytest -q.")
+
+        memory = await agent._handle_command(session, "/memory")
+        skills = await agent._handle_command(session, "/skills")
+
+        assert "Tests use pytest" in memory
+        assert "run-tests" in skills
+
+    @pytest.mark.asyncio
+    async def test_profile_curator_and_sessions_commands(
+        self, agent, session, tmp_path, monkeypatch
+    ):
+        from glm_acp.memory import append_user_profile
+        from glm_acp.session_store import SessionStore
+
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "config"))
+        append_user_profile("Uses concise reports", "preference")
+        session.cwd = str(tmp_path)
+        agent._store = SessionStore(tmp_path / "sessions")
+        agent._store.save(
+            "past-session",
+            {
+                "cwd": str(tmp_path),
+                "title": "Previous refactor",
+                "messages": [{"role": "user", "content": "refactor authentication"}],
+            },
+        )
+
+        profile = await agent._handle_command(session, "/profile")
+        curator = await agent._handle_command(session, "/curator")
+        sessions = await agent._handle_command(session, "/sessions authentication")
+
+        assert "Uses concise reports" in profile
+        assert "Skill Curator" in curator
+        assert "Previous refactor" in sessions
 
     @pytest.mark.asyncio
     async def test_clear_plan(self, agent, session):
@@ -866,6 +917,28 @@ class TestFork:
 
 
 # ============================================================
+# Close session
+# ============================================================
+
+
+class TestCloseSession:
+    @pytest.mark.asyncio
+    async def test_close_preserves_searchable_history(self, agent, tmp_path):
+        from glm_acp.session_store import SessionStore
+
+        agent._store = SessionStore(tmp_path / "sessions")
+        session = Session("closed-session", str(tmp_path))
+        session.messages.append({"role": "user", "content": "remember release checklist"})
+        agent._sessions[session.id] = session
+
+        await agent.close_session(session.id)
+
+        assert session.id not in agent._sessions
+        assert agent._store.load(session.id) is not None
+        assert agent._store.search("release checklist")[0]["session_id"] == session.id
+
+
+# ============================================================
 # Replay history (session restore)
 # ============================================================
 
@@ -957,7 +1030,13 @@ class TestPermissionSystem:
     @pytest.mark.asyncio
     async def test_read_mode_blocks_destructive(self, agent, session):
         session.permission_mode = "read"
-        for tool in ("write_file", "edit_file", "run_command"):
+        for tool in (
+            "write_file",
+            "edit_file",
+            "run_command",
+            "store_user_profile",
+            "curate_skills",
+        ):
             permitted, reason = await agent._check_permission(session, "tc1", tool, {})
             assert not permitted, f"{tool} should be blocked in read mode"
             assert "read-only" in reason.lower()

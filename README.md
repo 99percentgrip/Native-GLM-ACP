@@ -18,6 +18,7 @@ subprocess inside Zed's Agent Panel — no Zed recompilation required.
 - **Context compaction** — auto-summarizes older messages at 85% capacity (Claude Code–style)
 - **Persistent sessions** — conversations survive Zed restarts, replayed on load
 - **Multi-root workspaces** — full support for additional workspace directories
+- **Closed learning loop** — verified tasks refine reusable skills, preferences persist privately, and past sessions are searchable
 
 ### API Resilience
 
@@ -52,6 +53,11 @@ Type these in the chat input:
 | `/diff` | Show git diff of all uncommitted changes |
 | `/export` | Export the conversation as a Markdown file |
 | `/status` | Show model, plan, context usage, cost, message count |
+| `/memory` | Show approved durable project facts |
+| `/skills` | List skills learned from verified project work |
+| `/profile` | Show approved private preferences shared across projects |
+| `/curator` | Show skill usage, stale/archive candidates, and lifecycle state |
+| `/sessions [words]` | Browse or search persisted conversations |
 
 ### Task Plans
 
@@ -69,6 +75,35 @@ The system prompt auto-detects your project on session creation:
 - **VCS:** git detection
 - **Instructions:** root `AGENTS.md`, `CLAUDE.md`, and `GLM.md` are loaded into the system prompt
 - **Memory:** approved reusable facts can be stored in `.glm-acp/memory.md`
+- **Learned skills:** concise verified procedures are indexed from `.glm-acp/skills/*/SKILL.md` and loaded only when relevant
+- **User profile:** explicitly approved preferences are stored privately in the user configuration directory and loaded across projects
+- **Past work:** local FTS5 search recalls relevant user/assistant messages without indexing reasoning traces or credential-like values
+
+### Verified Learning
+
+After a task changes files and passes a recognized test, build, lint, audit, or
+verification command, the agent performs one learning review. It may propose a
+concise reusable `SKILL.md` only when the task revealed a non-obvious procedure
+or corrected pitfall likely to recur. Creating, refining, or removing a learned
+skill uses the normal ACP permission dialog in Ask mode.
+
+Learned skills are project-local under `.glm-acp/skills/`. Their metadata is
+included in project context, while full instructions are loaded on demand to
+avoid wasting tokens. Reading and refining skills records usage and revision
+metadata. A deterministic curator marks unused skills stale after 30 days and
+reversibly archives unpinned skills after 90 days; pinning is enforced in code.
+Curation mutations use the normal permission dialog and never auto-delete.
+Content hashes flag manually changed skills for review, and cheap description
+overlap detection surfaces consolidation candidates without auto-merging them.
+
+The model surveys existing skills before creating one and prefers refining a
+skill used during the successful task. Credential-like content is rejected,
+raw reasoning is never stored, and `forget_skill` can remove only agent-owned
+learned skills—not user-authored `.agents` or `.codex` skills.
+
+Private cross-project facts are stored only after permission in the platform's
+GLM ACP configuration directory as `user.md`. Project facts remain in
+`.glm-acp/memory.md`. Both support exact, explicit forgetting.
 
 ### Search Quality
 
@@ -289,6 +324,9 @@ When token usage exceeds **85%** of the context window:
 - On restart, `load_session` / `resume_session` replays history + plan + config
 - Sessions listed in Zed's history sidebar via `session/list`
 - Fork support: duplicate a session to experiment with different approaches
+- Closing an ACP session releases runtime resources without deleting searchable history
+- A user-only SQLite FTS5 index enables recent-session browsing, keyword search, and contextual scrolling
+- System prompts and `reasoning_content` are excluded from search; credential-like values are redacted before indexing
 
 Set `GLM_ACP_SESSION_PERSISTENCE=0` to keep sessions process-local. Set
 `GLM_ACP_PERSIST_REASONING=0` to persist messages without exact reasoning
@@ -309,6 +347,12 @@ preserved-thinking requests.
 | `run_command` | Live, bounded shell output; timeouts kill the process tree; inherited credentials are removed |
 | `update_plan` | Create/update the task plan checklist |
 | `recall_memory` / `store_memory` | Read or permission-gate durable project knowledge |
+| `recall_user_profile` / `store_user_profile` | Read or permission-gate private cross-project preferences |
+| `forget_memory` | Remove an exact approved project or user-memory entry |
+| `session_search` | Browse/search previous sessions and scroll around a matching message |
+| `list_skills` / `read_skill` | Discover and progressively load learned project procedures |
+| `learn_skill` / `forget_skill` | Permission-gate verified learning and removal of agent-owned skills |
+| `manage_skill` / `curate_skills` | Pin, archive, restore, and maintain learned skills without automatic deletion |
 | `web_search` / `web_reader` | Official Z.ai Coding Plan MCP services |
 | `vision_analyze` | Optional official local Z.ai Vision MCP |
 | `mcp_list_tools` / `mcp_call` | Generic configured MCP access |
@@ -316,6 +360,8 @@ preserved-thinking requests.
 After changing files, the agent requires a successful build, test, lint, or
 other verification command before normal completion. A failed command or an
 attempt to finish without verification triggers one focused recovery turn.
+After successful verification of an edited task, one bounded learning review
+decides whether a reusable skill is warranted; routine work stores nothing.
 
 All file paths are validated against workspace roots. `update_plan` is
 available in both Ask and Code modes.

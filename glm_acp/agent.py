@@ -73,7 +73,14 @@ from .config import (
 )
 from .glm_client import GlmClient
 from .mcp import MCP_TOOL_DEFINITIONS, McpError, McpManager
-from .memory import project_knowledge
+from .memory import (
+    list_learned_skills,
+    project_knowledge,
+    read_memory,
+    read_user_profile,
+    skill_curator_status,
+    user_knowledge,
+)
 from .session_store import SessionStore
 from .tools import (
     MAX_TOOL_OUTPUT_CHARS,
@@ -108,6 +115,19 @@ diagnose the output, fix the root cause, and rerun it. Do not claim a change is 
 complete or working when verification was not run or failed; report unverified \
 work and remaining risk explicitly.
 
+Learning:
+- Durable facts and learned skills are project-local, inspectable, and opt-in.
+- Explicit user preferences may be stored privately across projects only with permission.
+- When the user refers to past work, use session_search before asking them to repeat it.
+- After a non-trivial task passes verification, consider learn_skill only when \
+the successful procedure or corrected pitfall is likely to recur.
+- Survey existing skills first. Prefer refining a relevant skill over creating a \
+duplicate; create a new skill only as a last resort.
+- Keep learned skills concise and procedural. Do not learn routine steps, guesses, \
+credentials, raw reasoning, user content, or transient task state.
+- Read a relevant skill with read_skill before following it. Use store_memory for \
+project facts and store_user_profile for explicit cross-project preferences.
+
 Planning:
 - For any task with 3+ steps, call update_plan FIRST to lay out your plan.
 - Keep tasks concise (one action per entry). Break large work into sub-tasks.
@@ -118,6 +138,9 @@ finished ones 'completed'.
 
 Project context:
 {project_context}
+
+Approved cross-project user profile:
+{user_knowledge}
 
 Loaded project instructions and opt-in memory:
 {project_knowledge}
@@ -195,6 +218,7 @@ def build_system_prompt(cwd: str, model: str = DEFAULT_MODEL) -> str:
         project_context=project_context,
         project_knowledge=knowledge,
         model_name=model_name,
+        user_knowledge=user_knowledge() or "(none recorded)",
     )
 
 
@@ -639,15 +663,15 @@ class GlmAcpAgent(acp.Agent):
         session_id: str,
         **kwargs: Any,
     ) -> CloseSessionResponse:
-        """Clean up a closed session and remove its persisted state."""
+        """Release runtime resources while preserving searchable session history."""
         session = self._sessions.get(session_id)
         if session is not None:
             if session.client is not None:
                 session.client.cancel()
             async with session.prompt_lock:
+                await self._save_session(session)
                 await self._invalidate_session_client(session)
             self._sessions.pop(session_id, None)
-        await asyncio.to_thread(self._store.delete, session_id)
         return CloseSessionResponse()
 
     async def fork_session(
@@ -988,6 +1012,10 @@ class GlmAcpAgent(acp.Agent):
                     "search_files",
                     "grep",
                     "recall_memory",
+                    "recall_user_profile",
+                    "session_search",
+                    "list_skills",
+                    "read_skill",
                     "web_search",
                     "web_reader",
                     "mcp_list_tools",
@@ -1002,6 +1030,10 @@ class GlmAcpAgent(acp.Agent):
         failed_command_guard_used = False
         unverified_change_pending = False
         unverified_change_guard_used = False
+        successful_verification_observed = False
+        learning_review_pending = False
+        learning_review_guard_used = False
+        skills_used_this_turn: set[str] = set()
 
         for turn_iter in range(MAX_TOOL_ITERATIONS):
             # --- Check for cancellation ---
@@ -1117,6 +1149,26 @@ class GlmAcpAgent(acp.Agent):
                     )
                     unverified_change_guard_used = True
                     continue
+                if learning_review_pending and not learning_review_guard_used:
+                    used_skills = ", ".join(sorted(skills_used_this_turn)) or "none"
+                    session.messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Learning review: this task passed "
+                                "verification. If it revealed a non-obvious reusable "
+                                "procedure or corrected pitfall likely to recur in this "
+                                "project, call learn_skill with concise instructions. "
+                                f"Skills read during this task: {used_skills}. Prefer "
+                                "refining a relevant existing skill over creating a duplicate. "
+                                "Otherwise finish without storing anything. Never store "
+                                "credentials, raw reasoning, user content, or transient state."
+                            ),
+                        }
+                    )
+                    learning_review_pending = False
+                    learning_review_guard_used = True
+                    continue
                 notice = self._finish_reason_notice(result.finish_reason)
                 if notice:
                     await self._send_message(session.id, f"\n\n{notice}\n")
@@ -1144,9 +1196,13 @@ class GlmAcpAgent(acp.Agent):
             # Independent read/search calls can run concurrently. Mixed
             # batches remain ordered so edits and commands retain their
             # original semantics.
-            read_only_batch = len(result.tool_calls) > 1 and all(
-                TOOL_KINDS.get(tc["function"]["name"]) in {"read", "search"}
-                for tc in result.tool_calls
+            read_only_batch = (
+                len(result.tool_calls) > 1
+                and all(tc["function"]["name"] != "session_search" for tc in result.tool_calls)
+                and all(
+                    TOOL_KINDS.get(tc["function"]["name"]) in {"read", "search"}
+                    for tc in result.tool_calls
+                )
             )
             if read_only_batch:
                 for tc in result.tool_calls:
@@ -1181,6 +1237,11 @@ class GlmAcpAgent(acp.Agent):
                     else:
                         output = tool_result.output
                         await self._complete_tool(session.id, tc["id"], tool_result)
+                        if tc["function"]["name"] == "read_skill":
+                            skills_used_this_turn.add(
+                                str(tc["function"]["arguments"].get("name", ""))
+                            )
+                            session.refresh_system_prompt()
                     session.messages.append(
                         {
                             "role": "tool",
@@ -1204,6 +1265,43 @@ class GlmAcpAgent(acp.Agent):
                             "tool_call_id": tc_id,
                             "content": f"Error: {arguments_issue}",
                         }
+                    )
+                    continue
+
+                if tool_name == "learn_skill" and not successful_verification_observed:
+                    issue = (
+                        "A project skill may be learned only after a successful verification "
+                        "command in the current task. Verify the outcome first."
+                    )
+                    await self._fail_tool(session.id, tc_id, issue)
+                    session.messages.append(
+                        {"role": "tool", "tool_call_id": tc_id, "content": f"Error: {issue}"}
+                    )
+                    continue
+
+                if tool_name == "session_search":
+                    try:
+                        results = await asyncio.to_thread(
+                            self._store.search,
+                            str(tool_args.get("query", "")) or None,
+                            limit=tool_args.get("limit", 5),
+                            session_id=str(tool_args.get("session_id", "")) or None,
+                            around_ordinal=tool_args.get("around_ordinal"),
+                            window=tool_args.get("window", 5),
+                        )
+                        tool_result = ToolResult(
+                            output=json.dumps(results, ensure_ascii=False, indent=2)[
+                                :MAX_TOOL_OUTPUT_CHARS
+                            ]
+                        )
+                        await self._complete_tool(session.id, tc_id, tool_result)
+                        output = tool_result.output
+                    except Exception as e:
+                        logger.exception("session_search failed")
+                        output = f"Error searching sessions: {e}"
+                        await self._fail_tool(session.id, tc_id, output)
+                    session.messages.append(
+                        {"role": "tool", "tool_call_id": tc_id, "content": output}
                     )
                     continue
 
@@ -1294,12 +1392,27 @@ class GlmAcpAgent(acp.Agent):
                     output = tool_result.output
                     if tool_name in {"write_file", "edit_file", "apply_patch"}:
                         unverified_change_pending = True
+                    elif tool_name == "read_skill":
+                        skills_used_this_turn.add(str(tool_args.get("name", "")))
+                        session.refresh_system_prompt()
+                    elif tool_name in {
+                        "store_memory",
+                        "store_user_profile",
+                        "forget_memory",
+                        "learn_skill",
+                        "forget_skill",
+                        "manage_skill",
+                        "curate_skills",
+                    }:
+                        session.refresh_system_prompt()
                     elif tool_name == "run_command":
                         if tool_result.exit_code not in (None, 0):
                             failed_command_pending = True
                         elif self._is_verification_command(str(tool_args.get("command", ""))):
+                            successful_verification_observed = True
                             unverified_change_pending = False
                             unverified_change_guard_used = False
+                            learning_review_pending = True
                             if failed_command_pending:
                                 failed_command_pending = False
                                 failed_command_guard_used = False
@@ -1599,6 +1712,26 @@ class GlmAcpAgent(acp.Agent):
                     "Show current model, plan, API endpoint, permission mode, and context usage"
                 ),
             ),
+            AvailableCommand(
+                name="memory",
+                description="Show durable project facts learned with permission",
+            ),
+            AvailableCommand(
+                name="skills",
+                description="List reusable project skills learned after verification",
+            ),
+            AvailableCommand(
+                name="profile",
+                description="Show approved private preferences shared across projects",
+            ),
+            AvailableCommand(
+                name="curator",
+                description="Show learned-skill lifecycle and usage status",
+            ),
+            AvailableCommand(
+                name="sessions",
+                description="Browse recent sessions or search with /sessions <words>",
+            ),
         ]
         update = update_available_commands(commands)
         await self._conn.session_update(session_id=session.id, update=update)
@@ -1742,6 +1875,7 @@ class GlmAcpAgent(acp.Agent):
 
         elif command == "/status":
             n_msgs = len(session.messages)
+            curator = skill_curator_status(session.cwd)
             return (
                 f"\n📊 **Session Status**\n"
                 f"- **Model:** {session.model}\n"
@@ -1758,12 +1892,64 @@ class GlmAcpAgent(acp.Agent):
                 f"- **Total usage:** {session.total_input_tokens:,} input + "
                 f"{session.total_output_tokens:,} output tokens\n"
                 f"- **Cached input:** {session.total_cached_tokens:,} tokens\n"
+                f"- **Learned skills:** {curator['active']} active, "
+                f"{curator['stale']} stale, {curator['archived']} archived\n"
+            )
+
+        elif command == "/memory":
+            return f"\n🧠 **Durable Project Memory**\n\n{read_memory(session.cwd)}"
+
+        elif command == "/skills":
+            skills = list_learned_skills(session.cwd)
+            if not skills:
+                return "🧩 No learned project skills have been recorded."
+            lines = ["\n🧩 **Learned Project Skills**\n"]
+            lines.extend(
+                f"- **{skill['name']}** [{skill['state']}]"
+                f"{' [pinned]' if skill['pinned'] else ''} — {skill['description']} "
+                f"(uses: {skill['use_count']}, revisions: {skill['revision_count']}; "
+                f"`{skill['path']}`)"
+                for skill in skills
+            )
+            return "\n".join(lines)
+
+        elif command == "/profile":
+            return f"\n👤 **Private User Profile**\n\n{read_user_profile()}"
+
+        elif command == "/curator":
+            status = skill_curator_status(session.cwd)
+            return (
+                "\n🧹 **Skill Curator**\n"
+                f"- **Total:** {status['total']}\n"
+                f"- **Active:** {status['active']}\n"
+                f"- **Stale:** {status['stale']}\n"
+                f"- **Archived:** {status['archived']}\n"
+                f"- **Pinned:** {status['pinned']}\n\n"
+                f"- **Due stale:** {', '.join(status['due_stale']) or 'none'}\n"
+                f"- **Due archive:** {', '.join(status['due_archive']) or 'none'}\n\n"
+                f"- **Manual drift:** {', '.join(status['drifted']) or 'none'}\n"
+                "- **Possible overlaps:** "
+                f"{json.dumps(status['overlap_candidates'], ensure_ascii=False)}\n\n"
+                "Ask the agent to run skill curation, pin, archive, or restore a skill. "
+                "Mutations use the normal permission dialog."
+            )
+
+        elif command == "/sessions" or command.startswith("/sessions "):
+            query = command.removeprefix("/sessions").strip() or None
+            results = await asyncio.to_thread(self._store.search, query, limit=5)
+            if not results:
+                return "🕘 No matching persisted sessions were found."
+            return (
+                "\n🕘 **Past Sessions**\n\n```json\n"
+                + json.dumps(results, ensure_ascii=False, indent=2)[:8000]
+                + "\n```"
             )
 
         else:
             return (
                 f"Unknown command: {command}\nAvailable commands: /compact, "
-                "/clear-plan, /clear-history, /diff, /export, /status"
+                "/clear-plan, /clear-history, /diff, /export, /status, /memory, "
+                "/skills, /profile, /curator, /sessions"
             )
 
     # ------------------------------------------------------------------
@@ -2231,6 +2417,16 @@ class GlmAcpAgent(acp.Agent):
             "run_command": "Running command",
             "recall_memory": "Reading project memory",
             "store_memory": "Updating project memory",
+            "recall_user_profile": "Reading user profile",
+            "store_user_profile": "Updating user profile",
+            "forget_memory": "Forgetting durable memory",
+            "session_search": "Searching past sessions",
+            "list_skills": "Listing learned skills",
+            "read_skill": "Reading learned skill",
+            "learn_skill": "Learning verified skill",
+            "forget_skill": "Forgetting learned skill",
+            "manage_skill": "Managing learned skill",
+            "curate_skills": "Curating learned skills",
             "web_search": "Searching the web",
             "web_reader": "Reading web page",
             "vision_analyze": "Analyzing image",

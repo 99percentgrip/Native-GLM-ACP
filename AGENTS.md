@@ -83,6 +83,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - Public GitHub installation provides checksum-verifying, user-local installers that expose both `native-glm-acp` and `glm-acp` without requiring Python, Node.js, or administrator privileges.
 - Public frozen installs provide `glm-acp --uninstall`; credentials are preserved unless the user explicitly adds `--purge`, and source or Registry-managed copies must not self-delete.
 - Terminal authentication must never echo or log `ZAI_API_KEY`; environment credentials take precedence over the user-only stored credential file.
+- Agent learning is inspectable, permission-gated, secret-safe, and reversible: facts/skills stay project-local, while explicitly approved user preferences use private cross-project storage.
 
 ## Project Purpose
 
@@ -106,6 +107,8 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 - GitHub Actions tests Python 3.10–3.13 and packages Linux x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x86-64 binaries.
 - Official Z.ai Web Search, Web Reader, and optional local Vision MCP capabilities are exposed alongside configurable MCP servers.
 - Root project instructions and permission-gated `.glm-acp/memory.md` knowledge are loaded into model context.
+- Successfully verified tasks receive one bounded learning review; approved reusable procedures are progressively loaded, usage-tracked, refinable, pinnable, reversibly archivable, and forgettable.
+- Private user-profile memory and redacted FTS5 session recall provide cross-project and cross-session learning without indexing system prompts or reasoning traces.
 - Repeated identical tool batches are interrupted before the 50-iteration ceiling, malformed JSON arguments receive corrective feedback, edited files require a successful verification command before normal completion, and shell tools do not inherit common credential environment variables.
 - Expired MCP HTTP sessions and restarted stdio servers reinitialize automatically with per-server initialization locking.
 - The opt-in quality harness provides 11 outcome-based Python, TypeScript, Go, and Rust cases plus a credential-safe one-command runner with single-run locking, visible progress, and incremental JSON/Markdown handoff reports; live runs remain outside ordinary CI.
