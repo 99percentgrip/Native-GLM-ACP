@@ -7,12 +7,15 @@ import json
 import os
 import re
 import shutil
+import statistics
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .config import config_dir
+from .security import safe_context_text, scan_promptware
 
 MAX_INSTRUCTION_CHARS = 24_000
 MAX_MEMORY_CHARS = 32_000
@@ -26,8 +29,43 @@ MAX_USER_PROFILE_CHARS = 16_000
 USER_PROFILE_FILENAME = "user.md"
 SKILL_USAGE_FILENAME = ".usage.json"
 SKILL_ARCHIVE_DIRNAME = ".archive"
+SKILL_CANDIDATE_DIRNAME = ".candidates"
+SKILL_BUNDLES_FILENAME = ".bundles.json"
 SKILL_STALE_AFTER_DAYS = 30
 SKILL_ARCHIVE_AFTER_DAYS = 90
+SKILL_AVAILABLE_TOOLS = {
+    "apply_patch",
+    "curate_skills",
+    "delegate_task",
+    "edit_file",
+    "evolve_skill",
+    "forget_memory",
+    "forget_skill",
+    "grep",
+    "learn_skill",
+    "list_directory",
+    "list_skill_bundles",
+    "list_skills",
+    "manage_skill",
+    "manage_skill_bundle",
+    "mcp_call",
+    "mcp_list_tools",
+    "read_file",
+    "read_skill",
+    "read_skill_bundle",
+    "recall_memory",
+    "recall_user_profile",
+    "run_command",
+    "search_files",
+    "session_search",
+    "store_memory",
+    "store_user_profile",
+    "update_plan",
+    "vision_analyze",
+    "web_reader",
+    "web_search",
+    "write_file",
+}
 
 _SENSITIVE_LEARNING_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", re.IGNORECASE),
@@ -81,7 +119,81 @@ def _safe_path(root: Path, path: Path) -> Path | None:
     return resolved
 
 
-def project_knowledge(cwd: str) -> str:
+def _frontmatter_metadata(text: str) -> dict[str, Any]:
+    """Parse the bounded scalar/list subset used by project skill metadata."""
+    if not text.startswith("---\n"):
+        return {}
+    metadata: dict[str, Any] = {}
+    for line in text.splitlines()[1:]:
+        if line.strip() == "---":
+            break
+        if ":" not in line or line[:1].isspace():
+            continue
+        key, raw = line.split(":", 1)
+        value = raw.strip()
+        if value.startswith("[") and value.endswith("]"):
+            metadata[key.strip()] = [
+                item.strip().strip("'\"") for item in value[1:-1].split(",") if item.strip()
+            ]
+        else:
+            metadata[key.strip()] = value.strip("'\"")
+    return metadata
+
+
+def project_environments(cwd: str) -> set[str]:
+    """Return stable environment tags used to hide irrelevant skill metadata."""
+    root = Path(cwd)
+    tags = {"windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux"}
+    markers = {
+        "python": ("pyproject.toml", "setup.py", "requirements.txt"),
+        "node": ("package.json",),
+        "typescript": ("tsconfig.json",),
+        "rust": ("Cargo.toml",),
+        "go": ("go.mod",),
+        "java": ("pom.xml", "build.gradle", "build.gradle.kts"),
+    }
+    for tag, names in markers.items():
+        if any((root / name).is_file() for name in names):
+            tags.add(tag)
+    if (root / ".git").exists():
+        tags.add("git")
+    return tags
+
+
+def skill_is_relevant(
+    metadata: dict[str, Any],
+    cwd: str,
+    *,
+    available_tools: set[str] | None = None,
+    task: str | None = None,
+) -> bool:
+    """Apply opt-in platform, environment, and tool relevance gates."""
+    environments = project_environments(cwd)
+    platforms = {str(value).lower() for value in metadata.get("platforms", [])}
+    if platforms and not platforms.intersection(environments):
+        return False
+    required_envs = {str(value).lower() for value in metadata.get("environments", [])}
+    if required_envs and not required_envs.issubset(environments):
+        return False
+    required_tools = {str(value) for value in metadata.get("requires_tools", [])}
+    if (
+        required_tools
+        and available_tools is not None
+        and not required_tools.issubset(available_tools)
+    ):
+        return False
+    task_tags = [str(value).lower().strip() for value in metadata.get("tasks", [])]
+    if task_tags and task is not None:
+        normalized_task = " ".join(re.findall(r"[a-z0-9_+-]+", task.lower()))
+        task_terms = set(normalized_task.split())
+        if not normalized_task or not any(
+            tag in normalized_task or set(tag.split()).intersection(task_terms) for tag in task_tags
+        ):
+            return False
+    return True
+
+
+def project_knowledge(cwd: str, task: str = "") -> str:
     """Load explicit root instructions and opt-in project memory."""
     root = Path(cwd)
     remaining = MAX_INSTRUCTION_CHARS
@@ -90,14 +202,16 @@ def project_knowledge(cwd: str) -> str:
         path = _safe_path(root, root / name)
         text = _bounded_read(path, remaining) if path is not None else ""
         if text:
-            sections.append(f"### {name}\n{text}")
+            sections.append(f"### {name}\n{safe_context_text(text, name)}")
             remaining -= len(text)
         if remaining <= 0:
             break
     project_memory = _safe_path(root, root / MEMORY_RELATIVE_PATH)
     memory = _bounded_read(project_memory, MAX_MEMORY_CHARS) if project_memory is not None else ""
     if memory:
-        sections.append(f"### Durable project memory\n{memory}")
+        sections.append(
+            "### Durable project memory\n" + safe_context_text(memory, "project memory")
+        )
     skills: list[str] = []
     for candidate in (
         root / LEARNED_SKILLS_RELATIVE_PATH,
@@ -122,22 +236,39 @@ def project_knowledge(cwd: str) -> str:
             if safe_skill_file is None:
                 continue
             text = _bounded_read(safe_skill_file, 4000)
+            safe_text = safe_context_text(text, safe_skill_file.name)
+            if safe_text != text:
+                skills.append(f"- {safe_text}")
+                continue
+            metadata = _frontmatter_metadata(text)
+            if not skill_is_relevant(
+                metadata,
+                cwd,
+                available_tools=SKILL_AVAILABLE_TOOLS,
+                task=task,
+            ):
+                continue
             name = skill_file.parent.name
-            description = ""
-            if text.startswith("---"):
-                for line in text.splitlines()[1:]:
-                    if line == "---":
-                        break
-                    if line.startswith("name:"):
-                        name = line.split(":", 1)[1].strip().strip('"') or name
-                    elif line.startswith("description:"):
-                        description = line.split(":", 1)[1].strip().strip('"')
+            name = str(metadata.get("name") or name)
+            description = str(metadata.get("description") or "")
             relative = safe_skill_file.relative_to(root.resolve())
             skills.append(f"- {name}: {description} ({relative})")
     if skills:
         sections.append(
             "### Available project skills\n"
             "Read the matching SKILL.md before using a skill.\n" + "\n".join(skills)
+        )
+    bundles = list_skill_bundles(cwd)
+    if bundles:
+        sections.append(
+            "### Available skill bundles\n"
+            "Load a matching bundle only when the task needs all of its skills.\n"
+            + "\n".join(
+                f"- {bundle['name']}: "
+                f"{safe_context_text(bundle['description'], 'bundle:' + bundle['name'])} "
+                f"({', '.join(bundle['skills'])})"
+                for bundle in bundles
+            )
         )
     curator = skill_curator_status(cwd)
     if (
@@ -165,7 +296,9 @@ def read_memory(cwd: str) -> str:
     root = Path(cwd)
     path = _safe_path(root, memory_path(cwd))
     text = _bounded_read(path, MAX_MEMORY_CHARS) if path is not None else ""
-    return text or "No durable project memory has been recorded."
+    if not text:
+        return "No durable project memory has been recorded."
+    return safe_context_text(text, "project memory")
 
 
 def append_memory(cwd: str, entry: str) -> Path:
@@ -210,6 +343,8 @@ def _validate_learning_text(value: str, label: str, limit: int) -> str:
         raise ValueError(f"{label} exceeds the {limit:,}-character limit")
     if any(pattern.search(text) for pattern in _SENSITIVE_LEARNING_PATTERNS):
         raise ValueError(f"{label} appears to contain a credential or secret")
+    if scan_promptware(text):
+        raise ValueError(f"{label} appears to contain prompt-injection instructions")
     return text
 
 
@@ -232,13 +367,16 @@ def _safe_user_profile_path() -> Path | None:
 def read_user_profile() -> str:
     path = _safe_user_profile_path()
     text = _bounded_read(path, MAX_USER_PROFILE_CHARS) if path is not None else ""
-    return text or "No durable user profile has been recorded."
+    if not text:
+        return "No durable user profile has been recorded."
+    return safe_context_text(text, "user profile")
 
 
 def user_knowledge() -> str:
     """Return only recorded cross-project user knowledge for prompt injection."""
     path = _safe_user_profile_path()
-    return _bounded_read(path, MAX_USER_PROFILE_CHARS) if path is not None else ""
+    text = _bounded_read(path, MAX_USER_PROFILE_CHARS) if path is not None else ""
+    return safe_context_text(text, "user profile") if text else ""
 
 
 def append_user_profile(entry: str, category: str = "preference") -> Path:
@@ -377,19 +515,10 @@ def list_learned_skills(cwd: str) -> list[dict[str, Any]]:
         text = _bounded_read(safe, MAX_SKILL_INSTRUCTIONS_CHARS + 2000)
         if not text.startswith("---"):
             continue
+        metadata = _frontmatter_metadata(text)
         name = candidate.parent.name
-        description = ""
-        for line in text.splitlines()[1:]:
-            if line == "---":
-                break
-            if line.startswith("name:"):
-                name = line.split(":", 1)[1].strip().strip('"') or name
-            elif line.startswith("description:"):
-                raw = line.split(":", 1)[1].strip()
-                try:
-                    description = str(json.loads(raw))
-                except (json.JSONDecodeError, TypeError):
-                    description = raw.strip('"')
+        name = str(metadata.get("name") or name)
+        description = str(metadata.get("description") or "")
         record = usage.get(candidate.parent.name, {})
         current_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         recorded_hash = record.get("content_sha256")
@@ -397,6 +526,11 @@ def list_learned_skills(cwd: str) -> list[dict[str, Any]]:
             {
                 "name": name,
                 "description": description,
+                "environments": list(metadata.get("environments", [])),
+                "requires_tools": list(metadata.get("requires_tools", [])),
+                "platforms": list(metadata.get("platforms", [])),
+                "tasks": list(metadata.get("tasks", [])),
+                "relevant": skill_is_relevant(metadata, cwd, available_tools=SKILL_AVAILABLE_TOOLS),
                 "path": safe.relative_to(workspace).as_posix(),
                 "state": "archived"
                 if location_state == "archived"
@@ -421,6 +555,12 @@ def read_learned_skill(cwd: str, name: str) -> str:
     text = _bounded_read(path, MAX_SKILL_INSTRUCTIONS_CHARS + 2000) if path else ""
     if not text:
         raise ValueError(f"Learned skill not found: {slug}")
+    if scan_promptware(text):
+        raise ValueError(f"Learned skill {slug} was blocked by promptware defense")
+    if not skill_is_relevant(
+        _frontmatter_metadata(text), cwd, available_tools=SKILL_AVAILABLE_TOOLS
+    ):
+        raise ValueError(f"Learned skill {slug} is not relevant to this project environment")
     usage = _load_skill_usage(root)
     record = _skill_record(usage, slug)
     record["view_count"] = int(record.get("view_count", 0)) + 1
@@ -431,7 +571,15 @@ def read_learned_skill(cwd: str, name: str) -> str:
     return text
 
 
-def write_learned_skill(cwd: str, name: str, description: str, instructions: str) -> Path:
+def write_learned_skill(
+    cwd: str,
+    name: str,
+    description: str,
+    instructions: str,
+    environments: list[str] | None = None,
+    requires_tools: list[str] | None = None,
+    tasks: list[str] | None = None,
+) -> Path:
     """Atomically create or refine a verified, agent-owned project skill."""
     slug = _skill_slug(name)
     clean_description = _validate_learning_text(
@@ -455,10 +603,27 @@ def write_learned_skill(cwd: str, name: str, description: str, instructions: str
     if path is None:
         raise ValueError("Learned skill file escapes the workspace")
     title = " ".join(word.capitalize() for word in slug.split("-"))
+    clean_environments = sorted(
+        {re.sub(r"[^a-z0-9-]", "", item.lower()) for item in environments or []} - {""}
+    )
+    clean_tools = sorted(
+        {re.sub(r"[^a-zA-Z0-9_-]", "", item) for item in requires_tools or []} - {""}
+    )
+    clean_tasks = sorted(
+        {" ".join(re.findall(r"[a-z0-9_+-]+", item.lower())) for item in tasks or []} - {""}
+    )
+    relevance_metadata = ""
+    if clean_environments:
+        relevance_metadata += f"environments: {json.dumps(clean_environments)}\n"
+    if clean_tools:
+        relevance_metadata += f"requires_tools: {json.dumps(clean_tools)}\n"
+    if clean_tasks:
+        relevance_metadata += f"tasks: {json.dumps(clean_tasks)}\n"
     content = (
         "---\n"
         f"name: {slug}\n"
         f"description: {json.dumps(clean_description, ensure_ascii=False)}\n"
+        f"{relevance_metadata}"
         "---\n\n"
         f"# {title}\n\n"
         f"{clean_instructions}\n\n"
@@ -634,3 +799,352 @@ def skill_curator_status(cwd: str) -> dict[str, Any]:
         "overlap_candidates": overlap_candidates[:20],
         "skills": skills,
     }
+
+
+def _skill_bundles_path(root: Path) -> Path:
+    return root / SKILL_BUNDLES_FILENAME
+
+
+def _load_skill_bundles(root: Path) -> dict[str, dict[str, Any]]:
+    try:
+        payload = json.loads(_bounded_read(_skill_bundles_path(root), 128_000))
+    except json.JSONDecodeError:
+        return {}
+    bundles = payload.get("bundles") if isinstance(payload, dict) else None
+    return bundles if isinstance(bundles, dict) else {}
+
+
+def list_skill_bundles(cwd: str) -> list[dict[str, Any]]:
+    """List bounded project-local skill bundle metadata."""
+    try:
+        root = _learned_skills_root(cwd)
+    except ValueError:
+        return []
+    try:
+        is_directory = root.is_dir()
+    except OSError:
+        return []
+    if not is_directory:
+        return []
+    bundles = _load_skill_bundles(root)
+    return [
+        {
+            "name": name,
+            "description": str(value.get("description", "")),
+            "skills": [str(skill) for skill in value.get("skills", [])][:12],
+            "instruction": str(value.get("instruction", ""))[:2000],
+        }
+        for name, value in sorted(bundles.items())
+        if isinstance(value, dict)
+    ][:50]
+
+
+def write_skill_bundle(
+    cwd: str,
+    name: str,
+    description: str,
+    skills: list[str],
+    instruction: str = "",
+) -> Path:
+    """Create or replace an agent-owned bundle of existing active skills."""
+    slug = _skill_slug(name)
+    clean_description = _validate_learning_text(description, "Bundle description", 500)
+    clean_instruction = (
+        _validate_learning_text(instruction, "Bundle instruction", 2000) if instruction else ""
+    )
+    requested = list(dict.fromkeys(_skill_slug(skill) for skill in skills))[:12]
+    if not requested:
+        raise ValueError("A skill bundle must contain at least one skill")
+    available = {
+        skill["name"]
+        for skill in list_learned_skills(cwd)
+        if skill["state"] != "archived" and skill["relevant"]
+    }
+    missing = [skill for skill in requested if skill not in available]
+    if missing:
+        raise ValueError(
+            f"Bundle skills are missing, archived, or irrelevant: {', '.join(missing)}"
+        )
+    root = _learned_skills_root(cwd, create=True)
+    bundles = _load_skill_bundles(root)
+    bundles[slug] = {
+        "description": clean_description,
+        "skills": requested,
+        "instruction": clean_instruction,
+        "updated_at": _now_iso(),
+    }
+    path = _skill_bundles_path(root)
+    _atomic_write(
+        path,
+        json.dumps({"version": 1, "bundles": bundles}, ensure_ascii=False, indent=2) + "\n",
+    )
+    return path
+
+
+def read_skill_bundle(cwd: str, name: str) -> str:
+    """Load all relevant skills in a bundle, preserving progressive disclosure."""
+    slug = _skill_slug(name)
+    bundle = next((item for item in list_skill_bundles(cwd) if item["name"] == slug), None)
+    if bundle is None:
+        raise ValueError(f"Skill bundle not found: {slug}")
+    if scan_promptware(bundle["instruction"]):
+        raise ValueError(f"Skill bundle {slug} was blocked by promptware defense")
+    sections = [f"# Skill bundle: {slug}"]
+    if bundle["instruction"]:
+        sections.append(f"## Bundle instruction\n{bundle['instruction']}")
+    for skill in bundle["skills"]:
+        sections.append(f"## Skill: {skill}\n{read_learned_skill(cwd, skill)}")
+    return "\n\n".join(sections)
+
+
+def forget_skill_bundle(cwd: str, name: str) -> Path:
+    slug = _skill_slug(name)
+    root = _learned_skills_root(cwd, create=True)
+    bundles = _load_skill_bundles(root)
+    if slug not in bundles:
+        raise ValueError(f"Skill bundle not found: {slug}")
+    bundles.pop(slug)
+    path = _skill_bundles_path(root)
+    _atomic_write(
+        path,
+        json.dumps({"version": 1, "bundles": bundles}, ensure_ascii=False, indent=2) + "\n",
+    )
+    return path
+
+
+def _benchmark_metrics(cwd: str, report_path: str) -> dict[str, Any]:
+    path = _safe_path(Path(cwd), Path(cwd) / report_path)
+    if path is None or not path.is_file():
+        raise ValueError("Benchmark report must be a JSON file inside the workspace")
+    try:
+        report = json.loads(_bounded_read(path, 5_000_000))
+    except json.JSONDecodeError as error:
+        raise ValueError("Benchmark report is not valid JSON") from error
+    if report.get("schema_version") != 1 or report.get("status") != "completed":
+        raise ValueError("Benchmark report must be a completed schema-version 1 run")
+    results = [item for item in report.get("results", []) if isinstance(item, dict)]
+    scored = [item for item in results if not item.get("verification", {}).get("skipped")]
+    if not scored:
+        raise ValueError("Benchmark report contains no scored attempts")
+    per_case: dict[str, int] = {}
+    per_case_total: dict[str, int] = {}
+    for item in scored:
+        case_id = str(item.get("id", ""))
+        per_case_total[case_id] = per_case_total.get(case_id, 0) + 1
+        if item.get("verification", {}).get("passed"):
+            per_case[case_id] = per_case.get(case_id, 0) + 1
+        else:
+            per_case.setdefault(case_id, 0)
+    elapsed = [float(item.get("elapsed_seconds", 0.0)) for item in scored]
+    input_tokens = sum(int(item.get("input_tokens", 0) or 0) for item in scored)
+    output_tokens = sum(int(item.get("output_tokens", 0) or 0) for item in scored)
+    failed_traces = [
+        {
+            "case": str(item.get("id", "")),
+            "attempt": int(item.get("attempt", 0) or 0),
+            "stop_reason": str(item.get("stop_reason", ""))[:100],
+            "verification": safe_context_text(
+                str(item.get("verification", {}).get("summary", ""))[:1200],
+                "benchmark failure",
+            ),
+        }
+        for item in scored
+        if not item.get("verification", {}).get("passed")
+    ][:20]
+    passed = sum(per_case.values())
+    return {
+        "path": path.relative_to(Path(cwd).resolve()).as_posix(),
+        "total": len(scored),
+        "passed": passed,
+        "pass_rate": passed / len(scored),
+        "median_elapsed_seconds": statistics.median(elapsed),
+        "per_case": per_case,
+        "per_case_total": per_case_total,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "failed_traces": failed_traces,
+    }
+
+
+def draft_skill_evolution(cwd: str, name: str, failed_report: str) -> Path:
+    """Generate a non-promotable skill draft from bounded failed benchmark traces."""
+    slug = _skill_slug(name)
+    metrics = _benchmark_metrics(cwd, failed_report)
+    traces = metrics["failed_traces"]
+    if not traces:
+        raise ValueError("Failed benchmark report contains no failed attempts to learn from")
+    try:
+        current = read_learned_skill(cwd, slug)
+    except ValueError:
+        current = ""
+    metadata = _frontmatter_metadata(current)
+    description = str(metadata.get("description") or f"Prevent regressions in {slug}")
+    body = current.split("---", 2)[-1].strip() if current else ""
+    safeguards = []
+    for trace in traces:
+        summary = " ".join(str(trace["verification"]).split())
+        safeguards.append(
+            f"- Case {trace['case']} attempt {trace['attempt']}: {summary or trace['stop_reason']}"
+        )
+    instructions = (
+        (body + "\n\n" if body else "")
+        + "## Regression-derived safeguards\n\n"
+        + "\n".join(safeguards)
+        + "\n\nVerify these safeguards on held-out benchmark attempts before promotion."
+    )
+    clean_description = _validate_learning_text(
+        description, "Skill description", MAX_SKILL_DESCRIPTION_CHARS
+    )
+    clean_instructions = _validate_learning_text(
+        instructions, "Skill instructions", MAX_SKILL_INSTRUCTIONS_CHARS
+    )
+    root = _learned_skills_root(cwd, create=True)
+    candidate_root = root / SKILL_CANDIDATE_DIRNAME
+    candidate_root.mkdir(parents=True, exist_ok=True)
+    path = _safe_path(Path(cwd), candidate_root / f"{slug}.draft.json")
+    if path is None:
+        raise ValueError("Skill draft path escapes the workspace")
+    payload = {
+        "version": 1,
+        "name": slug,
+        "description": clean_description,
+        "instructions": clean_instructions,
+        "source_report": metrics,
+        "state": "draft",
+        "created_at": _now_iso(),
+    }
+    _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    return path
+
+
+def propose_skill_evolution(
+    cwd: str,
+    name: str,
+    description: str,
+    instructions: str,
+    baseline_report: str,
+    candidate_report: str,
+) -> Path:
+    """Stage a skill candidate only after objective held-out improvement."""
+    slug = _skill_slug(name)
+    draft_path = _safe_path(
+        Path(cwd),
+        _learned_skills_root(cwd, create=True) / SKILL_CANDIDATE_DIRNAME / f"{slug}.draft.json",
+    )
+    if (
+        (not description.strip() or not instructions.strip())
+        and draft_path
+        and draft_path.is_file()
+    ):
+        try:
+            draft = json.loads(_bounded_read(draft_path, 64_000))
+        except json.JSONDecodeError as error:
+            raise ValueError("Skill draft is corrupt") from error
+        description = description.strip() or str(draft.get("description", ""))
+        instructions = instructions.strip() or str(draft.get("instructions", ""))
+    clean_description = _validate_learning_text(
+        description, "Skill description", MAX_SKILL_DESCRIPTION_CHARS
+    )
+    clean_instructions = _validate_learning_text(
+        instructions, "Skill instructions", MAX_SKILL_INSTRUCTIONS_CHARS
+    )
+    baseline = _benchmark_metrics(cwd, baseline_report)
+    candidate = _benchmark_metrics(cwd, candidate_report)
+    if (
+        baseline["total"] != candidate["total"]
+        or baseline["per_case_total"] != candidate["per_case_total"]
+    ):
+        raise ValueError("Baseline and candidate reports must cover the same scored cases")
+    regressions = [
+        case_id
+        for case_id, passed in baseline["per_case"].items()
+        if candidate["per_case"].get(case_id, 0) < passed
+    ]
+    if regressions:
+        raise ValueError(f"Candidate regressed cases: {', '.join(regressions)}")
+    if candidate["pass_rate"] <= baseline["pass_rate"]:
+        raise ValueError("Candidate must improve held-out pass rate")
+    if candidate["median_elapsed_seconds"] > baseline["median_elapsed_seconds"]:
+        raise ValueError("Candidate median latency regressed")
+    if candidate["total_tokens"] > baseline["total_tokens"]:
+        raise ValueError("Candidate token cost regressed")
+    root = _learned_skills_root(cwd, create=True)
+    candidate_root = root / SKILL_CANDIDATE_DIRNAME
+    candidate_root.mkdir(parents=True, exist_ok=True)
+    path = _safe_path(Path(cwd), candidate_root / f"{slug}.json")
+    if path is None:
+        raise ValueError("Skill candidate path escapes the workspace")
+    payload = {
+        "version": 1,
+        "name": slug,
+        "description": clean_description,
+        "instructions": clean_instructions,
+        "baseline": baseline,
+        "candidate": candidate,
+        "state": "validated",
+        "created_at": _now_iso(),
+    }
+    candidate_content = json.dumps(
+        {
+            "description": clean_description,
+            "instructions": clean_instructions,
+            "baseline": baseline,
+            "candidate": candidate,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload["content_sha256"] = hashlib.sha256(candidate_content.encode("utf-8")).hexdigest()
+    _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    if draft_path is not None:
+        draft_path.unlink(missing_ok=True)
+    return path
+
+
+def promote_skill_evolution(cwd: str, name: str) -> Path:
+    """Promote a previously validated candidate; never optimize in place."""
+    slug = _skill_slug(name)
+    root = _learned_skills_root(cwd, create=True)
+    candidate_path = _safe_path(Path(cwd), root / SKILL_CANDIDATE_DIRNAME / f"{slug}.json")
+    if candidate_path is None or not candidate_path.is_file():
+        raise ValueError(f"Validated skill candidate not found: {slug}")
+    try:
+        payload = json.loads(_bounded_read(candidate_path, 64_000))
+    except json.JSONDecodeError as error:
+        raise ValueError("Skill candidate is corrupt") from error
+    if payload.get("state") != "validated" or payload.get("name") != slug:
+        raise ValueError("Skill candidate has not passed evaluation")
+    candidate_content = json.dumps(
+        {
+            "description": payload.get("description", ""),
+            "instructions": payload.get("instructions", ""),
+            "baseline": payload.get("baseline"),
+            "candidate": payload.get("candidate"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected_hash = hashlib.sha256(candidate_content.encode("utf-8")).hexdigest()
+    if payload.get("content_sha256") != expected_hash:
+        raise ValueError("Skill candidate changed after evaluation")
+    path = write_learned_skill(
+        cwd,
+        slug,
+        str(payload.get("description", "")),
+        str(payload.get("instructions", "")),
+    )
+    candidate_path.unlink()
+    return path
+
+
+def discard_skill_evolution(cwd: str, name: str) -> Path:
+    slug = _skill_slug(name)
+    root = _learned_skills_root(cwd, create=True)
+    path = _safe_path(Path(cwd), root / SKILL_CANDIDATE_DIRNAME / f"{slug}.json")
+    if path is None or not path.is_file():
+        raise ValueError(f"Skill candidate not found: {slug}")
+    path.unlink()
+    return path

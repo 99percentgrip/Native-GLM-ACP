@@ -76,6 +76,14 @@ class StreamResult:
     usage: dict[str, int] | None = None  # input_tokens, output_tokens, total_tokens
 
 
+@dataclass
+class AuxiliaryResult:
+    """Text and provider usage returned by a bounded non-streaming request."""
+
+    content: str
+    usage: dict[str, int] = field(default_factory=dict)
+
+
 class GlmClient:
     """Low-level streaming client for the Z.ai BigModel API."""
 
@@ -99,6 +107,7 @@ class GlmClient:
         )
         self._cancelled = False
         self._active_request_task: asyncio.Task[Any] | None = None
+        self.last_auxiliary_usage: dict[str, int] = {}
         self._api_key = get_api_key()
         self._client = httpx.AsyncClient(
             base_url=endpoint,
@@ -128,6 +137,7 @@ class GlmClient:
         on_reasoning: Any,
         on_content: Any,
         on_tool_call_started: Any,
+        max_output_tokens: int | None = None,
     ) -> StreamResult:
         """Stream one model turn, calling back for each token delta.
 
@@ -149,9 +159,13 @@ class GlmClient:
                 on_reasoning,
                 on_content,
                 on_tool_call_started,
+                max_output_tokens,
             )
 
             if result.finish_reason == "length" and not result.tool_calls:
+                if max_output_tokens is not None:
+                    result.finish_reason = "continuation_limit"
+                    break
                 if request_index >= MAX_AUTO_CONTINUATIONS:
                     result.finish_reason = "continuation_limit"
                     break
@@ -182,6 +196,9 @@ class GlmClient:
     async def summarize_messages(
         self,
         messages: list[dict[str, Any]],
+        *,
+        focus: str = "",
+        preserved_context: str = "",
     ) -> str:
         """Summarize a conversation into a compact context-preserving block.
 
@@ -193,11 +210,27 @@ class GlmClient:
             COMPACTION_SUMMARY_MAX_TOKENS,
             MAX_TOKENS_BY_MODEL.get(self.model, DEFAULT_MAX_TOKENS),
         )
+        guidance_parts: list[str] = []
+        if focus.strip():
+            guidance_parts.append(
+                "The user requested this compression focus; prioritize it without dropping "
+                f"other required state:\n{focus.strip()[:2000]}"
+            )
+        if preserved_context.strip():
+            guidance_parts.append(
+                "Deterministically extracted pre-compression evidence follows. Preserve it "
+                f"unless contradicted by the transcript:\n{preserved_context.strip()[:8000]}"
+            )
+        guidance = "\n\n".join(guidance_parts)
+        user_content = COMPACTION_USER_PREFIX
+        if guidance:
+            user_content += guidance + "\n\n"
+        user_content += transcript
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": COMPACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": COMPACTION_USER_PREFIX + transcript},
+                {"role": "user", "content": user_content},
             ],
             "stream": False,
             "max_tokens": max_tokens,
@@ -238,7 +271,68 @@ class GlmClient:
         content = content.strip()
         if not content:
             raise CompactionError("Compaction response contained an empty summary")
+        self.last_auxiliary_usage = self._normalize_usage(data.get("usage", {}))
         return content
+
+    async def complete_auxiliary(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        max_tokens: int = 1200,
+    ) -> AuxiliaryResult:
+        """Run one bounded, thinking-disabled request for internal auxiliary work."""
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt[:4000]},
+                {"role": "user", "content": user_prompt[:24_000]},
+            ],
+            "stream": False,
+            "max_tokens": min(max(1, max_tokens), 4096),
+        }
+        if self.model not in THINKING_UNSUPPORTED_MODELS:
+            body["thinking"] = {"type": "disabled"}
+        last_error: Exception | None = None
+        for attempt in range(MAX_RETRIES + 1):
+            response = await self._client.post("/chat/completions", json=body)
+            if response.status_code == 200:
+                break
+            try:
+                error_text = response.text[:500]
+            except Exception:
+                error_text = response.content[:500].decode(errors="replace")
+            last_error = GlmApiError(
+                response.status_code,
+                error_text,
+                getattr(response, "headers", {}).get("Retry-After"),
+            )
+            if response.status_code not in RETRYABLE_STATUS_CODES or attempt == MAX_RETRIES:
+                raise last_error
+            await asyncio.sleep(self._retry_delay(attempt, last_error.retry_after))
+        try:
+            data = response.json()
+            content = str(data.get("choices", [])[0].get("message", {}).get("content", "")).strip()
+        except (AttributeError, IndexError, TypeError, ValueError) as error:
+            raise GlmApiError(502, "Auxiliary response was malformed") from error
+        if not content:
+            raise GlmApiError(502, "Auxiliary response was empty")
+        usage = self._normalize_usage(data.get("usage", {}))
+        self.last_auxiliary_usage = usage
+        return AuxiliaryResult(content=content, usage=usage)
+
+    @staticmethod
+    def _normalize_usage(usage: dict[str, Any]) -> dict[str, int]:
+        details = usage.get("prompt_tokens_details") or {}
+        input_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+        output_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+        return {
+            "input_tokens": input_tokens,
+            "api_input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": int(usage.get("total_tokens", input_tokens + output_tokens) or 0),
+            "cached_tokens": int(details.get("cached_tokens", 0) or 0),
+        }
 
     @staticmethod
     def _format_transcript(messages: list[dict[str, Any]]) -> str:
@@ -294,8 +388,11 @@ class GlmClient:
         on_reasoning: Any,
         on_content: Any,
         on_tool_call_started: Any,
+        max_output_tokens: int | None = None,
     ) -> None:
         max_tokens = MAX_TOKENS_BY_MODEL.get(self.model, DEFAULT_MAX_TOKENS)
+        if max_output_tokens is not None:
+            max_tokens = min(max_tokens, max(1, int(max_output_tokens)))
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,

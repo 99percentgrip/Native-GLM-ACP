@@ -14,6 +14,12 @@ DEFAULT_MAX_TOKENS = 128_000
 MAX_AUTO_CONTINUATIONS = 20
 MAX_TOOL_ITERATIONS = 50
 MAX_REPEATED_TOOL_BATCHES = 3
+MAX_DELEGATIONS_PER_TURN = 3
+MAX_DELEGATE_TOOL_ITERATIONS = 6
+DELEGATE_TIMEOUT_SECONDS = 180
+MAX_DELEGATE_TOOL_CALLS_PER_TURN = 24
+MAX_DELEGATE_INPUT_TOKENS_PER_TURN = 120_000
+MAX_DELEGATE_OUTPUT_TOKENS_PER_TURN = 16_000
 
 # Retry configuration for transient API errors (429, 500, 502, 503, 504)
 MAX_RETRIES = 3
@@ -76,6 +82,7 @@ GENERATION_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 DEFAULT_GENERATION_PROFILE = "balanced"
+DEFAULT_AUXILIARY_MODEL = "main"
 
 # --- Token estimation (heuristic) ---
 # _estimate_tokens uses 3.5 chars/token (code is denser than natural
@@ -90,6 +97,9 @@ COMPACTION_THRESHOLD = 0.85
 COMPACTION_KEEP_RECENT = 4
 # Max tokens for the summarization call itself.
 COMPACTION_SUMMARY_MAX_TOKENS = 16_384
+CONTEXT_PRESSURE_THRESHOLDS = (0.60, 0.75, 0.85)
+MAX_COMPACTION_QUALITY_HISTORY = 20
+COMPACTION_QUALITY_DECLINE = 0.15
 
 # Context window sizes in tokens, keyed by model id.
 CONTEXT_WINDOW_TOKENS: dict[str, int] = {
@@ -248,6 +258,9 @@ DESTRUCTIVE_TOOLS = frozenset(
         "forget_skill",
         "manage_skill",
         "curate_skills",
+        "manage_skill_bundle",
+        "evolve_skill",
+        "delegate_task",
         "mcp_call",
         "mcp_list_tools",
         "vision_analyze",

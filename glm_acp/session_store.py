@@ -207,6 +207,8 @@ class SessionStore:
                 "cwd": data.get("cwd", ""),
                 "title": data.get("title"),
                 "updated_at": data.get("saved_at"),
+                "parent_session_id": data.get("parent_session_id"),
+                "branch_root_id": data.get("branch_root_id") or path.stem,
             }
             meta_path = path.with_suffix(".meta")
             meta_tmp = meta_path.with_suffix(".meta.tmp")
@@ -263,6 +265,8 @@ class SessionStore:
                         "cwd": data.get("cwd", ""),
                         "title": data.get("title"),
                         "updated_at": data.get("saved_at"),
+                        "parent_session_id": data.get("parent_session_id"),
+                        "branch_root_id": data.get("branch_root_id") or session_id,
                     }
                 )
             except (OSError, json.JSONDecodeError):

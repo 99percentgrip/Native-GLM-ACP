@@ -151,6 +151,29 @@ class TestSummarizeRobustness:
         with pytest.raises(RuntimeError, match="summary"):
             await client.summarize_messages([{"role": "user", "content": "keep me"}])
 
+    @pytest.mark.asyncio
+    async def test_auxiliary_completion_is_bounded_and_returns_usage(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        client = GlmClient(model="glm-5.2")
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": "Useful title"}}],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 3,
+                "total_tokens": 15,
+            },
+        }
+        client._client.post = AsyncMock(return_value=response)
+
+        result = await client.complete_auxiliary("system", "user", max_tokens=50_000)
+
+        assert result.content == "Useful title"
+        assert result.usage["input_tokens"] == 12
+        assert client._client.post.call_args.kwargs["json"]["max_tokens"] == 4096
+
 
 # ============================================================
 # Error body decode robustness

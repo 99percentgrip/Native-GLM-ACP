@@ -17,7 +17,8 @@ streaming, 1M context, and auto-continuation for long generations.
 - **ACP protocol**: `agent.py` — implements `acp.Agent` (initialize, new_session, load_session, resume_session, close_session, list_sessions, prompt, set_config_option, set_session_mode)
 - **GLM API client**: `glm_client.py` — SSE/tool streaming, preserved thinking, cancellation, retry, cache usage, auto-continuation
 - **MCP**: `mcp.py` — official Z.ai remote/local services and configured HTTP/stdio servers
-- **Project knowledge and learning**: `memory.py` — root instructions, scoped memory, verified skills, telemetry, and lifecycle curation
+- **Project knowledge and learning**: `memory.py` — scoped memory, relevant skills/bundles, telemetry, curation, and evaluated candidates
+- **Untrusted-context defense**: `security.py` — promptware findings, stored-context blocking, and tool/MCP/recall delimiters
 - **Tools**: `tools.py` — file/shell operations sandboxed to workspace roots
 - **Config**: `config.py` — model registry, API key, constants
 - **Persistence and recall**: `session_store.py` — JSON conversation state plus a local redacted SQLite FTS5 search index
@@ -77,16 +78,51 @@ context window, `_maybe_compact()` in `agent.py` fires:
 
 1. The system prompt is preserved verbatim.
 2. The most recent `COMPACTION_KEEP_RECENT` (4) messages are kept verbatim.
-3. Everything else is sent to `GlmClient.summarize_messages()` which makes a
+3. Decisions, fixes, unresolved work, plan state, edited paths, command outcomes,
+   and session lineage are extracted deterministically before older messages are
+   discarded. Verified decisions/fixes become inspectable, permission-required
+   memory proposals rather than automatic writes.
+4. Everything else is sent to `GlmClient.summarize_messages()` which makes a
    dedicated non-streaming API call with a structured summarization prompt
-   (disabled thinking, `COMPACTION_SUMMARY_MAX_TOKENS` ceiling).
-4. The summary is wrapped in `<conversation_summary>` tags and inserted as a
+   (disabled thinking, `COMPACTION_SUMMARY_MAX_TOKENS` ceiling). The optional
+   auxiliary model performs this call when its context can hold the source;
+   otherwise compaction falls back to the main model. `/compact <focus>` adds
+   bounded guidance.
+5. The summary is wrapped in `<conversation_summary>` tags and inserted as a
    user message between the system prompt and the preserved recent messages.
 
 This mirrors Claude Code's compaction: summarize the past, keep the present.
 Compaction is transactional: invalid, missing, or empty summaries leave the
 original history unchanged. Tool call IDs and names remain explicit in the
 summary transcript so results cannot be detached from their calls.
+Context-pressure messages fire once at 60%, 75%, and 85% until compaction
+reduces the tier. Completion reports the exact retained categories and a
+persisted deterministic summary-quality score; a 15-point decline from the
+previous compaction produces a warning.
+
+### Promptware defense
+
+- Root instructions, project/user memory, and learned skills are scanned before
+  prompt injection; suspicious stored sections are blocked.
+- File, tool, MCP, embedded-resource, delegated-worker, session-recall output,
+  and context passed into a delegate are wrapped in `untrusted_context`
+  delimiters before the receiving model sees them.
+- Findings are defense in depth and never replace sandboxing, secret removal,
+  destructive-tool permissions, or operator review.
+- Learning rejects credential-shaped and prompt-injection content before writing.
+
+### Auxiliary routing and delegation
+
+- `auxiliary_model=main` uses the primary model; another non-vision GLM model on
+  the active API plan handles titles, compression, recall ranking, advisory skill
+  evaluation, and delegated analysis, with local/deterministic fallback where
+  possible.
+- `delegate_task` is permission-gated and limited to three workers per parent
+  turn. All workers share 24 tool calls, 120K input tokens, and 16K output tokens.
+  Each worker has six read/search iterations and 180 seconds; it cannot edit,
+  execute, call MCP, access credentials, or delegate recursively, so depth is one.
+- Auxiliary usage contributes to parent totals. Compression clients are pooled;
+  delegated clients are transient and all clients close with the session.
 
 ### Usage reporting
 
@@ -106,6 +142,7 @@ Session config options advertised to the client:
 - `thought_level` (category: `thought_level`) — reasoning depth: Off / Standard (all models); Deep · High / Deep · Max (GLM-5.2 only, maps to `reasoning_effort: high|max`)
 - `permission_mode` (category: `permissions`) — tool execution permission: Ask / Read Only / Bypass
 - `generation_profile` (category: `other`) — Balanced provider defaults, Precise temperature 0.7, or Exploratory top-p 0.98; non-default profiles adjust only one sampling control
+- `auxiliary_model` (category: `other`) — main model or a non-vision GLM model on the active plan for titles, compaction, recall ranking, skill evaluation, and bounded delegation
 
 ### Deep Thinking (GLM-5.2)
 
@@ -215,6 +252,21 @@ after permission. Pinned skills are protected by code and curation never deletes
 Content hashes route manually changed skills to review, and deterministic
 description overlap evidence may suggest consolidation but never auto-merges.
 
+Optional `platforms`, `environments`, `requires_tools`, and semantic `tasks`
+frontmatter gates keep irrelevant learned skills out of the managed prompt.
+Task-gated metadata is re-evaluated against every current user request.
+Project-local bundles group up to 12 existing relevant skills without copying
+their bodies and load them progressively through `read_skill_bundle`; stored
+bundle instructions are re-scanned when read.
+
+Skill evolution is candidate-based. Failed benchmark traces can create a bounded
+non-promotable `.draft.json` safeguard proposal. Compatible completed held-out
+baseline/candidate reports must cover identical attempts, improve pass rate,
+avoid every per-case regression, avoid any median-latency regression, and avoid
+any input-plus-output token-cost regression. Passing only stages
+`.candidates/<name>.json`; promotion still requires permission, verifies the
+staged content hash, and keeps the active skill unchanged until that action.
+
 `session_store.py` indexes user, assistant, and tool content locally with FTS5
 for discovery and contextual scrolling. It excludes system prompts and reasoning
 fields, redacts credential-shaped content, backfills legacy JSON sessions, and
@@ -235,6 +287,8 @@ shutdown and session close must close pooled clients.
 Session close releases runtime resources but preserves persisted/searchable
 history; deletion is a separate storage operation and must never be inferred
 from close.
+Forks persist `parent_session_id` plus `branch_root_id`; `/lineage` exposes direct
+children and identifies the parent session as the rollback path.
 
 **Critical:** The ACP `LoadSessionResponse` and `ResumeSessionResponse` only
 carry `modes`, `config_options`, and `models` — they do **not** include message
@@ -253,6 +307,7 @@ The server runs with `use_unstable_protocol=True` to expose
 - Keep `agent.py` free of HTTP/SSE logic — it's a pure ACP layer
 - Never write reasoning text to files; it flows only through `agent_thought_chunk`
 - Do not weaken the verification prerequisite, permission gate, secret filter, size bounds, or project-local ownership boundary for learned skills.
+- Do not auto-promote evolved skills, let delegates mutate state, or treat promptware heuristics as a security boundary.
 - Keep session recall local and bounded; never index system prompts, exact reasoning traces, or credential-like values.
 
 ## Verification

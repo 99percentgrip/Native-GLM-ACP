@@ -15,10 +15,13 @@ subprocess inside Zed's Agent Panel — no Zed recompilation required.
 - **Live reasoning traces** — `reasoning_content` streams into Zed's thinking view
 - **No mid-generation stalls** — auto-continues on `finish_reason=length`
 - **Usage reporting** — live token usage in Zed's context bar
-- **Context compaction** — auto-summarizes older messages at 85% capacity (Claude Code–style)
-- **Persistent sessions** — conversations survive Zed restarts, replayed on load
+- **Structured context compaction** — preserves plans, edits, verification evidence, and an optional user focus
+- **Context-pressure diagnostics** — one-time 60%/75%/85% warnings explain when compaction approaches
+- **Persistent session lineage** — conversations survive restarts; forks retain parent/root rollback paths
 - **Multi-root workspaces** — full support for additional workspace directories
-- **Closed learning loop** — verified tasks refine reusable skills, preferences persist privately, and past sessions are searchable
+- **Measured learning loop** — relevant skills, bundles, and benchmark-gated candidates improve without silent promotion
+- **Promptware defense** — stored context and untrusted tool/MCP/recall output are scanned and delimited
+- **Bounded delegation** — permission-gated read-only GLM workers investigate or review with strict budgets
 
 ### API Resilience
 
@@ -40,6 +43,7 @@ All configurable from the Zed agent panel — no restart needed:
 | **API Plan** | Coding Plan, Standard API, BigModel (CN) | Switch endpoints; vision models appear on Standard/BigModel |
 | **Permissions** | Ask, Read Only, Bypass | Gate destructive tools (write/edit/run) |
 | **Generation Style** | Balanced, Precise, Exploratory | Provider defaults, lower-temperature precision, or broader nucleus sampling |
+| **Auxiliary Model** | Main model, GLM-5.2, GLM-5-Turbo, GLM-4.7 | Optional model for titles, compaction, recall ranking, skill evaluation, and delegated analysis |
 
 ### Slash Commands
 
@@ -47,7 +51,7 @@ Type these in the chat input:
 
 | Command | Description |
 |---|---|
-| `/compact` | Manually trigger context compaction |
+| `/compact [focus]` | Trigger structured compaction, optionally prioritizing a topic |
 | `/clear-plan` | Clear the current task plan / todo list |
 | `/clear-history` | Wipe conversation history (keeps settings) |
 | `/diff` | Show git diff of all uncommitted changes |
@@ -58,6 +62,7 @@ Type these in the chat input:
 | `/profile` | Show approved private preferences shared across projects |
 | `/curator` | Show skill usage, stale/archive candidates, and lifecycle state |
 | `/sessions [words]` | Browse or search persisted conversations |
+| `/lineage` | Show the current session's parent, branch root, and direct children |
 
 ### Task Plans
 
@@ -76,8 +81,11 @@ The system prompt auto-detects your project on session creation:
 - **Instructions:** root `AGENTS.md`, `CLAUDE.md`, and `GLM.md` are loaded into the system prompt
 - **Memory:** approved reusable facts can be stored in `.glm-acp/memory.md`
 - **Learned skills:** concise verified procedures are indexed from `.glm-acp/skills/*/SKILL.md` and loaded only when relevant
+- **Relevance gates:** optional platform, project-environment, and required-tool metadata keeps unrelated skills out of context
+- **Skill bundles:** related learned procedures can be progressively loaded as one bounded bundle
 - **User profile:** explicitly approved preferences are stored privately in the user configuration directory and loaded across projects
 - **Past work:** local FTS5 search recalls relevant user/assistant messages without indexing reasoning traces or credential-like values
+- **Untrusted boundaries:** project context is scanned before prompt injection; tool, MCP, resource, and recalled text is explicitly delimited as data
 
 ### Verified Learning
 
@@ -100,6 +108,22 @@ The model surveys existing skills before creating one and prefers refining a
 skill used during the successful task. Credential-like content is rejected,
 raw reasoning is never stored, and `forget_skill` can remove only agent-owned
 learned skills—not user-authored `.agents` or `.codex` skills.
+
+Skill refinement can also use an evaluator-gated candidate workflow. `evolve_skill`
+can first create a non-promotable draft directly from bounded failed benchmark
+traces. Promotion then requires compatible completed held-out reports, a higher
+pass rate, no per-case regression, no worse median latency, and no increase in
+input-plus-output token cost. Passing creates a separate integrity-checked
+candidate file; promotion still uses the normal permission gate and is never
+automatic. An auxiliary model may provide an advisory critique, but cannot
+override the objective gates or replace the original rollback point.
+
+Skill metadata may declare `environments: [python, git]`, `platforms: [linux]`,
+`requires_tools: [run_command]`, or semantic `tasks: [security review]` tags.
+Task-tagged skills enter the managed prompt only when the current request matches.
+Irrelevant skills remain inspectable but are not loaded. Project-local bundles
+group up to 12 relevant learned skills and an optional shared instruction without
+duplicating their bodies.
 
 Private cross-project facts are stored only after permission in the platform's
 GLM ACP configuration directory as `user.md`. Project facts remain in
@@ -161,10 +185,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v0.7.0` before running the Unix
-installer, or pass `-Version v0.7.0` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v0.8.0` before running the Unix
+installer, or pass `-Version v0.8.0` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v0.7.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v0.7.0).
+[v0.8.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v0.8.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -290,7 +314,8 @@ glm_acp/
 ├── config.py        # Model registry, API endpoints, constants
 ├── glm_client.py    # Streaming Z.ai API client (SSE, retry, reasoning, tools)
 ├── mcp.py           # Z.ai and user-configured MCP transports
-├── memory.py        # Project instructions and opt-in durable memory
+├── memory.py        # Memory, relevant skills/bundles, and evaluated candidates
+├── security.py      # Promptware scanning and untrusted-context delimiters
 ├── session_store.py # Persistent JSON session storage (~/.glm-acp/sessions/)
 └── tools.py         # File/shell/search tools sandboxed to workspace roots
 ```
@@ -310,12 +335,16 @@ Z.ai API ──SSE──> glm_client.py ──callbacks──> agent.py ──se
 
 ### Context compaction
 
-When token usage exceeds **85%** of the context window:
+At 60%, 75%, and 85% usage the agent emits a single pressure diagnostic. When
+usage exceeds **85%** of the context window:
 
 1. System prompt preserved verbatim
 2. 4 most recent messages kept (boundary adjusted to never split tool-call pairs)
-3. Older messages summarized via a dedicated API call
-4. Summary wrapped in `<conversation_summary>` tags
+3. Decisions, fixes, edited paths, command outcomes, unresolved work, plan state, and session lineage extracted deterministically
+4. Older messages summarized via the selected auxiliary model, with optional `/compact <focus>` guidance
+5. Verified decisions/fixes surfaced as permission-required memory proposals
+6. Summary wrapped in `<conversation_summary>` tags with exact retained evidence
+7. A persisted quality score is compared with prior compactions; declines trigger a warning and retained categories are reported
 
 ### Session persistence
 
@@ -323,7 +352,8 @@ When token usage exceeds **85%** of the context window:
 - Session directories/files are created with user-only permissions on POSIX
 - On restart, `load_session` / `resume_session` replays history + plan + config
 - Sessions listed in Zed's history sidebar via `session/list`
-- Fork support: duplicate a session to experiment with different approaches
+- Fork support: duplicate a session to experiment while persisting parent and branch-root lineage
+- `/lineage` identifies direct children and the parent session to resume for rollback
 - Closing an ACP session releases runtime resources without deleting searchable history
 - A user-only SQLite FTS5 index enables recent-session browsing, keyword search, and contextual scrolling
 - System prompts and `reasoning_content` are excluded from search; credential-like values are redacted before indexing
@@ -353,6 +383,10 @@ preserved-thinking requests.
 | `list_skills` / `read_skill` | Discover and progressively load learned project procedures |
 | `learn_skill` / `forget_skill` | Permission-gate verified learning and removal of agent-owned skills |
 | `manage_skill` / `curate_skills` | Pin, archive, restore, and maintain learned skills without automatic deletion |
+| `list_skill_bundles` / `read_skill_bundle` | Discover and progressively load related relevant skills |
+| `manage_skill_bundle` | Permission-gate creation or removal of project-local bundles |
+| `evolve_skill` | Stage, promote, or discard objectively benchmarked skill candidates |
+| `delegate_task` | Run one permission-gated, read-only auxiliary GLM investigation or review |
 | `web_search` / `web_reader` | Official Z.ai Coding Plan MCP services |
 | `vision_analyze` | Optional official local Z.ai Vision MCP |
 | `mcp_list_tools` / `mcp_call` | Generic configured MCP access |
@@ -365,6 +399,14 @@ decides whether a reusable skill is warranted; routine work stores nothing.
 
 All file paths are validated against workspace roots. `update_plan` is
 available in both Ask and Code modes.
+
+Delegated workers cannot edit files, execute commands, call MCP, access
+credentials, or delegate again, fixing delegation depth at one. Each worker is
+limited to six read/search iterations and 180 seconds. One parent turn shares a
+three-worker, 24-tool-call, 120K-input-token, and 16K-output-token budget across
+all delegates. Their API usage is added to the parent session totals. Promptware
+scanning is defense in depth: destructive operations still rely on ACP
+permissions and workspace sandboxing.
 
 ## Testing
 
@@ -433,7 +475,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-0.7.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-0.8.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

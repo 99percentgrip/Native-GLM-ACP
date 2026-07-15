@@ -16,6 +16,7 @@ from glm_acp.agent import (
 )
 from glm_acp.config import (
     COMPACTION_KEEP_RECENT,
+    CONTEXT_WINDOW_TOKENS,
 )
 from glm_acp.glm_client import GlmApiError
 
@@ -110,6 +111,129 @@ class TestCompactionForce:
         client = _mock_client()
         await agent._maybe_compact(session, client, force=True)
         client.summarize_messages.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_focused_compaction_passes_precompression_evidence(self, agent, session):
+        session = _make_session_with_messages(10)
+        session.plan = [
+            {"content": "Verify the cleanup fix", "status": "in_progress", "priority": "high"}
+        ]
+        session.messages.insert(
+            -5,
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "edit-1",
+                        "type": "function",
+                        "function": {
+                            "name": "edit_file",
+                            "arguments": '{"path": "client.py"}',
+                        },
+                    }
+                ],
+            },
+        )
+        client = _mock_client()
+
+        await agent._maybe_compact(
+            session,
+            client,
+            force=True,
+            focus="Preserve the async cleanup contract",
+        )
+
+        kwargs = client.summarize_messages.call_args.kwargs
+        assert kwargs["focus"] == "Preserve the async cleanup contract"
+        assert "Verify the cleanup fix" in kwargs["preserved_context"]
+        assert "client.py" in kwargs["preserved_context"]
+
+    @pytest.mark.asyncio
+    async def test_compaction_falls_back_when_auxiliary_context_is_too_small(
+        self, agent, monkeypatch
+    ):
+        session = _make_session_with_messages(20)
+        for message in session.messages:
+            message["content"] += "x" * 2000
+        auxiliary = _mock_client()
+        auxiliary.model = "tiny-auxiliary"
+        main = _mock_client()
+        main.model = session.model
+        session.client = main
+        session.client_key = ("existing",)
+        monkeypatch.setitem(CONTEXT_WINDOW_TOKENS, "tiny-auxiliary", 100)
+        monkeypatch.setattr(agent, "_client_for_session", lambda _session: main)
+
+        await agent._maybe_compact(session, auxiliary, force=True)
+
+        auxiliary.summarize_messages.assert_not_called()
+        main.summarize_messages.assert_called_once()
+
+    def test_precompaction_extracts_decisions_fixes_pending_and_learning(self, session):
+        session.plan = [{"content": "Publish release", "status": "pending"}]
+        messages = [
+            {
+                "role": "assistant",
+                "content": (
+                    "Decision: keep the public API stable.\n"
+                    "Fixed: close resources from finally.\n"
+                    "Remaining: run the package test."
+                ),
+                "tool_calls": [
+                    {
+                        "id": "run-1",
+                        "function": {
+                            "name": "run_command",
+                            "arguments": '{"command":"pytest -q"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "run-1",
+                "content": "exit code: 0\n12 passed",
+            },
+        ]
+
+        evidence = GlmAcpAgent._pre_compaction_evidence(session, messages)
+
+        assert "Decisions:" in evidence
+        assert "Fixes and root causes:" in evidence
+        assert "Unresolved and pending work:" in evidence
+        assert "Proposed durable learning" in evidence
+        assert session.compaction_learning_proposals == [
+            "Decision: keep the public API stable.",
+            "Fixed: close resources from finally.",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_successive_compaction_detects_quality_decline(self, agent):
+        session = _make_session_with_messages(20)
+        session.plan = [{"content": "Finish verification", "status": "pending"}]
+        strong = _mock_client(summary=("Plan pending and verification details preserved. " * 30))
+        await agent._maybe_compact(session, strong, force=True)
+
+        session.messages = _make_session_with_messages(20).messages
+        weak = _mock_client(summary="Too short.")
+        await agent._maybe_compact(session, weak, force=True)
+
+        assert len(session.compaction_quality_history) == 2
+        assert session.compaction_quality_history[-1]["declined"] is True
+        assert "<retained_evidence>" in session.messages[1]["content"]
+
+
+class TestContextPressure:
+    @pytest.mark.asyncio
+    async def test_pressure_tiers_are_reported_once(self, agent, session):
+        session.context_size = 100
+        for used in (60, 75, 85, 90):
+            session.estimated_tokens = used
+            await agent._report_context_pressure(session)
+
+        assert session.context_pressure_level == 3
+        assert agent._conn.session_update.await_count == 3
 
 
 # ============================================================

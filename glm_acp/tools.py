@@ -22,18 +22,26 @@ from .memory import (
     append_memory,
     append_user_profile,
     curate_learned_skills,
+    discard_skill_evolution,
+    draft_skill_evolution,
     forget_learned_skill,
     forget_memory,
+    forget_skill_bundle,
     forget_user_profile,
     learned_skills_path,
     list_learned_skills,
+    list_skill_bundles,
     manage_learned_skill,
     memory_path,
+    promote_skill_evolution,
+    propose_skill_evolution,
     read_learned_skill,
     read_memory,
+    read_skill_bundle,
     read_user_profile,
     skill_curator_status,
     write_learned_skill,
+    write_skill_bundle,
 )
 
 MAX_TOOL_OUTPUT_CHARS = 64_000
@@ -482,6 +490,21 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "Concise reusable imperative workflow",
                     },
+                    "environments": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional project tags such as python, node, rust, or git",
+                    },
+                    "requires_tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional core tool names required by this skill",
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional semantic task tags that must match the request",
+                    },
                 },
                 "required": ["name", "description", "instructions"],
             },
@@ -534,6 +557,93 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_skill_bundles",
+            "description": "List project-local groups of related learned skills.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_skill_bundle",
+            "description": "Load every relevant learned skill in one project bundle.",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_skill_bundle",
+            "description": "Create or delete a project-local skill bundle with permission.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "delete"]},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "skills": {"type": "array", "items": {"type": "string"}},
+                    "instruction": {"type": "string"},
+                },
+                "required": ["action", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "evolve_skill",
+            "description": (
+                "Draft a candidate from failed traces, then stage, promote, or discard it. "
+                "Proposals require compatible completed baseline and candidate benchmark "
+                "reports with no quality, latency, or token-cost regression."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["draft", "propose", "promote", "discard"],
+                    },
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "instructions": {"type": "string"},
+                    "baseline_report": {"type": "string"},
+                    "candidate_report": {"type": "string"},
+                    "failed_report": {"type": "string"},
+                },
+                "required": ["action", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_task",
+            "description": (
+                "Delegate one bounded read-only investigation or review to an independent "
+                "auxiliary GLM worker. The worker cannot edit files or run commands."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string"},
+                    "context": {"type": "string"},
+                    "role": {
+                        "type": "string",
+                        "enum": ["investigator", "reviewer", "test-analyst"],
+                    },
+                },
+                "required": ["goal"],
+            },
+        },
+    },
 ]
 
 TOOL_KINDS: dict[str, str] = {
@@ -558,6 +668,11 @@ TOOL_KINDS: dict[str, str] = {
     "forget_skill": "edit",
     "manage_skill": "edit",
     "curate_skills": "edit",
+    "list_skill_bundles": "read",
+    "read_skill_bundle": "read",
+    "manage_skill_bundle": "edit",
+    "evolve_skill": "edit",
+    "delegate_task": "other",
 }
 
 
@@ -704,6 +819,9 @@ async def execute_tool(
                 str(arguments.get("name", "")),
                 str(arguments.get("description", "")),
                 str(arguments.get("instructions", "")),
+                [str(value) for value in arguments.get("environments", [])],
+                [str(value) for value in arguments.get("requires_tools", [])],
+                [str(value) for value in arguments.get("tasks", [])],
             )
             return ToolResult(output=f"Learned project skill in {path}", file_path=str(path))
         elif name == "forget_skill":
@@ -725,6 +843,69 @@ async def execute_tool(
         elif name == "curate_skills":
             result = await asyncio.to_thread(curate_learned_skills, str(sandbox.roots[0]))
             return ToolResult(output=json.dumps(result, ensure_ascii=False, indent=2))
+        elif name == "list_skill_bundles":
+            bundles = await asyncio.to_thread(list_skill_bundles, str(sandbox.roots[0]))
+            return ToolResult(output=json.dumps(bundles, ensure_ascii=False, indent=2))
+        elif name == "read_skill_bundle":
+            text = await asyncio.to_thread(
+                read_skill_bundle,
+                str(sandbox.roots[0]),
+                str(arguments.get("name", "")),
+            )
+            return ToolResult(output=text)
+        elif name == "manage_skill_bundle":
+            action = str(arguments.get("action", ""))
+            if action == "create":
+                path = await asyncio.to_thread(
+                    write_skill_bundle,
+                    str(sandbox.roots[0]),
+                    str(arguments.get("name", "")),
+                    str(arguments.get("description", "")),
+                    [str(value) for value in arguments.get("skills", [])],
+                    str(arguments.get("instruction", "")),
+                )
+                return ToolResult(output=f"Stored skill bundle in {path}", file_path=str(path))
+            if action == "delete":
+                path = await asyncio.to_thread(
+                    forget_skill_bundle,
+                    str(sandbox.roots[0]),
+                    str(arguments.get("name", "")),
+                )
+                return ToolResult(output=f"Deleted skill bundle from {path}")
+            raise ToolError("Bundle action must be create or delete")
+        elif name == "evolve_skill":
+            action = str(arguments.get("action", ""))
+            skill_name = str(arguments.get("name", ""))
+            if action == "draft":
+                path = await asyncio.to_thread(
+                    draft_skill_evolution,
+                    str(sandbox.roots[0]),
+                    skill_name,
+                    str(arguments.get("failed_report", "")),
+                )
+                return ToolResult(output=f"Regression-derived skill draft staged in {path}")
+            if action == "propose":
+                path = await asyncio.to_thread(
+                    propose_skill_evolution,
+                    str(sandbox.roots[0]),
+                    skill_name,
+                    str(arguments.get("description", "")),
+                    str(arguments.get("instructions", "")),
+                    str(arguments.get("baseline_report", "")),
+                    str(arguments.get("candidate_report", "")),
+                )
+                return ToolResult(output=f"Validated skill candidate staged in {path}")
+            if action == "promote":
+                path = await asyncio.to_thread(
+                    promote_skill_evolution, str(sandbox.roots[0]), skill_name
+                )
+                return ToolResult(output=f"Promoted validated skill candidate to {path}")
+            if action == "discard":
+                path = await asyncio.to_thread(
+                    discard_skill_evolution, str(sandbox.roots[0]), skill_name
+                )
+                return ToolResult(output=f"Discarded skill candidate {path}")
+            raise ToolError("Evolution action must be draft, propose, promote, or discard")
         else:
             raise ToolError(f"Unknown tool: {name}")
     except ToolError:

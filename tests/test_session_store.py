@@ -136,6 +136,8 @@ class TestListSessions:
                 "cwd": "/home/user/project",
                 "title": "Indexed chat",
                 "updated_at": sessions[0]["updated_at"],
+                "parent_session_id": None,
+                "branch_root_id": "s1",
             }
         ]
 
