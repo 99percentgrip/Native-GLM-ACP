@@ -236,6 +236,8 @@ async def test_file_change_forces_one_verification_turn(tmp_path):
 
 @pytest.mark.asyncio
 async def test_successful_verification_clears_unverified_change(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+    (tmp_path / "test_smoke.py").write_text("def test_smoke():\n    assert True\n")
     changed_file = StreamResult(
         tool_calls=[
             {
@@ -254,7 +256,7 @@ async def test_successful_verification_clears_unverified_change(tmp_path):
                 "id": "successful-check",
                 "function": {
                     "name": "run_command",
-                    "arguments": {"command": f'"{sys.executable}" -c "print(\'pytest passed\')"'},
+                    "arguments": {"command": f'"{sys.executable}" -m pytest -q test_smoke.py'},
                 },
             }
         ],
@@ -286,6 +288,8 @@ async def test_successful_verification_clears_unverified_change(tmp_path):
 
 @pytest.mark.asyncio
 async def test_verified_task_can_learn_project_skill(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+    (tmp_path / "test_smoke.py").write_text("def test_smoke():\n    assert True\n")
     def tool_call(call_id: str, name: str, arguments: dict) -> StreamResult:
         return StreamResult(
             tool_calls=[{"id": call_id, "function": {"name": name, "arguments": arguments}}],
@@ -302,7 +306,7 @@ async def test_verified_task_can_learn_project_skill(tmp_path):
             tool_call(
                 "successful-check",
                 "run_command",
-                {"command": f'"{sys.executable}" -c "print(\'pytest passed\')"'},
+                    {"command": f'"{sys.executable}" -m pytest -q test_smoke.py'},
             ),
             StreamResult(content="Verified.", finish_reason="stop"),
             tool_call(

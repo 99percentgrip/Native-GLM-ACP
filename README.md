@@ -18,7 +18,12 @@ subprocess inside Zed's Agent Panel — no Zed recompilation required.
 - **Structured context compaction** — preserves plans, edits, verification evidence, and an optional user focus
 - **Context-pressure diagnostics** — one-time 60%/75%/85% warnings explain when compaction approaches
 - **Persistent session lineage** — conversations survive restarts; forks retain parent/root rollback paths
+- **Persistent goals and criteria** — `/goal` plus `/subgoal` continue across restarts and use a bounded auxiliary completion judge
 - **Multi-root workspaces** — full support for additional workspace directories
+- **Progressive repository rules** — scoped AGENTS, Claude, Hermes, and Cursor instructions load before affected edits
+- **Evidence-led verification** — canonical project checks are recorded with scope and invalidated by later edits
+- **Post-write diagnostics** — syntax checks always run for supported formats; installed language servers add semantic diagnostics
+- **Optional Mixture of Agents** — two independent GLM references advise the acting model once per user turn
 - **Measured learning loop** — relevant skills, bundles, and benchmark-gated candidates improve without silent promotion
 - **Promptware defense** — stored context and untrusted tool/MCP/recall output are scanned and delimited
 - **Bounded delegation** — permission-gated read-only GLM workers investigate or review with strict budgets
@@ -31,6 +36,8 @@ subprocess inside Zed's Agent Panel — no Zed recompilation required.
 - **Real cancellation** — the Cancel button actually aborts in-flight API requests
 - **Token estimation** — calibrated 3.5 chars/token heuristic, handles vision content blocks
 - **Tool-loop recovery** — repeated identical tool batches are interrupted with corrective feedback
+- **Result-aware loop recovery** — repeated failures and unchanged read-only results warn, then halt boundedly
+- **Unchanged-read deduplication** — repeated identical file/search results are replaced by a compact content fingerprint
 - **MCP recovery** — expired HTTP sessions and restarted stdio servers reinitialize automatically
 
 ### Chat Dropdown Config Options
@@ -45,6 +52,7 @@ All configurable from the Zed agent panel — no restart needed:
 | **Permissions** | Ask, Read Only, Bypass | Gate destructive tools (write/edit/run) |
 | **Generation Style** | Balanced, Precise, Exploratory | Provider defaults, lower-temperature precision, or broader nucleus sampling |
 | **Auxiliary Model** | Main model, GLM-5.2, GLM-5-Turbo, GLM-4.7 | Optional model for titles, compaction, recall ranking, skill evaluation, and delegated analysis |
+| **Mixture of Agents** | Off, Reference review | Optionally run up to two independent non-vision GLM references; the acting model aggregates their private advice |
 
 ### Slash Commands
 
@@ -57,13 +65,15 @@ Type these in the chat input:
 | `/clear-history` | Wipe conversation history (keeps settings) |
 | `/diff` | Show git diff of all uncommitted changes |
 | `/export` | Export the conversation as a Markdown file |
-| `/status` | Show model, plan, context usage, cost, message count |
+| `/status` | Show model, project facts, goal, fresh verification evidence, context usage, and cost |
 | `/memory` | Show approved durable project facts |
 | `/skills` | List skills learned from verified project work |
 | `/profile` | Show approved private preferences shared across projects |
 | `/curator` | Show skill usage, stale/archive candidates, and lifecycle state |
 | `/sessions [words]` | Browse or search persisted conversations |
 | `/lineage` | Show the current session's parent, branch root, and direct children |
+| `/goal [objective\|pause\|resume\|clear]` | Set, inspect, pause, resume, or clear a persistent coding goal |
+| `/subgoal [criterion\|remove N\|clear]` | Manage persistent acceptance criteria for the active goal |
 
 ### Task Plans
 
@@ -121,13 +131,15 @@ ACP server's scope.
 
 ### Project Context
 
-The system prompt auto-detects your project on session creation:
+The managed prompt detects the project root, manifests, package managers, git
+branch/dirty state, and repository-defined verification commands. Facts refresh
+after edits instead of relying on model guesses.
 
 - **Languages:** Python, JavaScript/TypeScript, Rust, Go, Ruby, Java
 - **Frameworks:** Next.js, React, Vue
 - **Package managers:** uv, Poetry, npm, Yarn, pnpm
 - **VCS:** git detection
-- **Instructions:** root `AGENTS.md`, `CLAUDE.md`, and `GLM.md` are loaded into the system prompt
+- **Instructions:** `.hermes.md`, `HERMES.md`, `AGENTS.md`, `CLAUDE.md`, `GLM.md`, `.cursorrules`, and `.cursor/rules/*.mdc` are discovered from the project root toward accessed paths; newly applicable scoped rules are loaded before mutation
 - **Memory:** approved reusable facts can be stored in `.glm-acp/memory.md`
 - **Learned skills:** concise verified procedures are indexed from `.glm-acp/skills/*/SKILL.md` and loaded only when relevant
 - **Relevance gates:** optional platform, project-environment, and required-tool metadata keeps unrelated skills out of context
@@ -135,6 +147,27 @@ The system prompt auto-detects your project on session creation:
 - **User profile:** explicitly approved preferences are stored privately in the user configuration directory and loaded across projects
 - **Past work:** local FTS5 search recalls relevant user/assistant messages without indexing reasoning traces or credential-like values
 - **Untrusted boundaries:** project context is scanned before prompt injection; tool, MCP, resource, and recalled text is explicitly delimited as data
+
+### Coding Reliability
+
+Every successful write is read back immediately. Python, JSON, and TOML receive
+deterministic syntax checks; Python, JavaScript/TypeScript, Go, and Rust also use
+`pyright-langserver`, `typescript-language-server`, `gopls`, or `rust-analyzer`
+when that executable is already on `PATH`. Missing or failed language servers do
+not block the syntax fallback and are never installed automatically.
+
+Verification evidence is project-scoped and persistent. Only commands matching
+auto-detected canonical checks are ledgered; output text such as `echo pytest
+passed`, non-executing flags, and status-masking pipelines, fallbacks, or command
+sequences cannot satisfy the edit guard. Each later edit invalidates prior passing evidence,
+and `/status` exposes the latest event plus whether a fresh pass exists.
+
+Repeated unchanged file/search results are fingerprinted instead of re-injected.
+The result-aware loop guard separately tracks identical failures, same-tool
+failure streaks, and unchanged read-only outcomes, warning before a bounded stop.
+Mixture of Agents is opt-in because it spends extra API tokens: reference reviews
+run in parallel once per user turn, while the selected primary model remains the
+only acting model and aggregates the private advice.
 
 ### Verified Learning
 
@@ -234,10 +267,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v0.9.0` before running the Unix
-installer, or pass `-Version v0.9.0` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v1.0.0` before running the Unix
+installer, or pass `-Version v1.0.0` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v0.9.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v0.9.0).
+[v1.0.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v1.0.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -367,6 +400,10 @@ glm_acp/
 ├── glm_client.py    # Streaming Z.ai API client (SSE, retry, reasoning, tools)
 ├── mcp.py           # Z.ai and user-configured MCP transports
 ├── memory.py        # Memory, relevant skills/bundles, and evaluated candidates
+├── project_context.py # Progressive instructions and detected project facts
+├── verification.py # Persistent, edit-fresh verification evidence ledger
+├── diagnostics.py  # Syntax checks and optional LSP semantic diagnostics
+├── guardrails.py    # Result-aware repeated-failure/no-progress detection
 ├── security.py      # Promptware scanning and untrusted-context delimiters
 ├── session_store.py # Persistent JSON session storage (~/.glm-acp/sessions/)
 └── tools.py         # File/shell/search tools sandboxed to workspace roots
@@ -406,6 +443,7 @@ usage exceeds **85%** of the context window:
 - Sessions listed in Zed's history sidebar via `session/list`
 - Fork support: duplicate a session to experiment while persisting parent and branch-root lineage
 - `/lineage` identifies direct children and the parent session to resume for rollback
+- Goals, subgoal acceptance criteria, judge budget, Mixture-of-Agents selection, and verification evidence persist with the session
 - Closing an ACP session releases runtime resources without deleting searchable history
 - A user-only SQLite FTS5 index enables recent-session browsing, keyword search, and contextual scrolling
 - System prompts and `reasoning_content` are excluded from search; credential-like values are redacted before indexing
@@ -444,8 +482,8 @@ preserved-thinking requests.
 | `vision_analyze` | Optional official local Z.ai Vision MCP |
 | `mcp_list_tools` / `mcp_call` | Generic configured MCP access |
 
-After changing files, the agent requires a successful build, test, lint, or
-other verification command before normal completion. A failed command or an
+After changing files, the agent requires a successful auto-detected canonical
+build, test, lint, or other verification command before normal completion. A failed command or an
 attempt to finish without verification triggers one focused recovery turn.
 After successful verification of an edited task, one bounded learning review
 decides whether a reusable skill is warranted; routine work stores nothing.
@@ -528,7 +566,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-0.9.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-1.0.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

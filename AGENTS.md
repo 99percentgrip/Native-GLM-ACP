@@ -85,6 +85,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - Terminal authentication must never echo or log `ZAI_API_KEY`; environment credentials take precedence over the user-only stored credential file.
 - Agent learning is inspectable, permission-gated, secret-safe, and reversible: facts/skills stay project-local, while explicitly approved user preferences use private cross-project storage.
 - Advanced learning remains evidence-gated: failed traces may produce drafts, but candidates require higher held-out pass rate with no per-case, median-latency, or token-cost regression and explicit promotion; delegation is read-only, depth-one, shared-budgeted, and permission-gated.
+- Coding reliability prioritizes progressively scoped repository instructions, edit-fresh verification evidence, persistent judged goals and acceptance criteria, post-write syntax/semantic diagnostics, unchanged-read deduplication, opt-in reference-model aggregation, and result-aware loop stops.
 
 ## Project Purpose
 
@@ -98,8 +99,8 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 
 ## Current Project Status
 
-- Package and ACP implementation version is `0.9.0` from `glm_acp.__version__`.
-- GitHub release `v0.9.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
+- Package and ACP implementation version is `1.0.0` from `glm_acp.__version__`.
+- GitHub release `v1.0.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
 - ACP Registry publication is tracked in `agentclientprotocol/registry#439` and remains pending until Registry maintainers merge it.
 - Source installs, the `glm-acp` console script, module execution, and frozen binaries share `cli.main()`.
 - Public frozen binaries support one-command removal of installer-owned commands, PATH markers, and matching custom Zed configuration with an automatic settings backup.
@@ -107,14 +108,16 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 - Terminal setup stores credentials atomically without echoing or logging the key; environment credentials take precedence.
 - GitHub Actions tests Python 3.10–3.13 and packages Linux x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x86-64 binaries.
 - Official Z.ai Web Search, Web Reader, and optional local Vision MCP capabilities are exposed alongside configurable MCP servers.
-- Root project instructions and permission-gated `.glm-acp/memory.md` knowledge are loaded into model context.
+- Root-to-target `.hermes.md`/Hermes, AGENTS, Claude, GLM, and Cursor instructions plus permission-gated `.glm-acp/memory.md` knowledge are progressively loaded into model context; direct writes defer when they first reveal closer rules.
 - Successfully verified tasks receive one bounded learning review; approved reusable procedures are progressively loaded, usage-tracked, refinable, pinnable, reversibly archivable, and forgettable.
 - Private user-profile memory and redacted FTS5 session recall provide cross-project and cross-session learning without indexing system prompts or reasoning traces.
 - Promptware scanning blocks suspicious stored context and delimits tool, MCP, embedded-resource, and recalled output as untrusted data.
 - Structured compaction preserves decisions, fixes, unresolved work, plan/edit/verification evidence, and memory proposals; it accepts an optional focus, scores summary quality over time, reports retained categories and pressure at 60%/75%/85%, and may use a configurable auxiliary GLM model.
 - The auxiliary GLM path covers titles, compression, recall ranking, skill evaluation, and bounded workers. Workers provide permission-gated read-only investigation/review under shared token/tool budgets, strict iteration/time limits, and no recursive delegation.
 - ACP forks persist parent/root lineage, while relevant skill metadata, bundles, and benchmark-gated candidate promotion extend learning without automatic replacement.
-- Repeated identical tool batches are interrupted before the 50-iteration ceiling, malformed JSON arguments receive corrective feedback, edited files require a successful verification command before normal completion, and shell tools do not inherit common credential environment variables.
+- Project facts and canonical checks are auto-detected; edit-fresh verification evidence persists, and post-write Python/JSON/TOML syntax plus optional Python/TypeScript/Go/Rust LSP diagnostics feed the acting model.
+- Persistent goals and subgoal acceptance criteria use a bounded auxiliary completion judge. Opt-in Mixture-of-Agents runs cached parallel reference reviews while the primary GLM remains the aggregator and sole actor.
+- Repeated identical tool batches, repeated failures, and unchanged read-only results are interrupted before the 50-iteration ceiling; unchanged reads are deduplicated, malformed JSON arguments receive corrective feedback, and shell tools do not inherit common credential environment variables.
 - Expired MCP HTTP sessions and restarted stdio servers reinitialize automatically with per-server initialization locking.
 - The opt-in quality harness provides 11 outcome-based Python, TypeScript, Go, and Rust cases plus a credential-safe one-command runner with single-run locking, visible progress, and incremental JSON/Markdown handoff reports; live runs remain outside ordinary CI.
 - Persistent scheduled automation supports relative one-shots, intervals, timezone-aware five-field cron, and aware ISO timestamps; permission-gated management, fresh non-persisted runs, skills/bundles, script prechecks, script-only mode, `[SILENT]`, renewable cross-process claims, and bounded redacted artifacts are available through ACP and `glm-acp cron`.
@@ -140,7 +143,7 @@ Verify the install:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: editable glm_acp metadata and glm_acp-0.9.0.dist-info
+# expect: editable glm_acp metadata and glm_acp-1.0.0.dist-info
 ```
 
 ## Verification

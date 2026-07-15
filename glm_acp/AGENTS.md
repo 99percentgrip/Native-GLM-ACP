@@ -18,6 +18,10 @@ streaming, 1M context, and auto-continuation for long generations.
 - **GLM API client**: `glm_client.py` — SSE/tool streaming, preserved thinking, cancellation, retry, cache usage, auto-continuation
 - **MCP**: `mcp.py` — official Z.ai remote/local services and configured HTTP/stdio servers
 - **Project knowledge and learning**: `memory.py` — scoped memory, relevant skills/bundles, telemetry, curation, and evaluated candidates
+- **Project discovery**: `project_context.py` — repository roots, progressive instruction files, manifests, package managers, git state, and canonical verification commands
+- **Verification evidence**: `verification.py` — persistent edit generations and bounded canonical command outcomes
+- **Post-write diagnostics**: `diagnostics.py` — deterministic syntax checks and lazy optional LSP clients
+- **Loop guardrails**: `guardrails.py` — repeated failure and unchanged read-only result detection
 - **Untrusted-context defense**: `security.py` — promptware findings, stored-context blocking, and tool/MCP/recall delimiters
 - **Tools**: `tools.py` — file/shell operations sandboxed to workspace roots
 - **Config**: `config.py` — model registry, API key, constants
@@ -144,6 +148,7 @@ Session config options advertised to the client:
 - `permission_mode` (category: `permissions`) — tool execution permission: Ask / Read Only / Bypass
 - `generation_profile` (category: `other`) — Balanced provider defaults, Precise temperature 0.7, or Exploratory top-p 0.98; non-default profiles adjust only one sampling control
 - `auxiliary_model` (category: `other`) — main model or a non-vision GLM model on the active plan for titles, compaction, recall ranking, skill evaluation, and bounded delegation
+- `mixture_mode` (category: `other`) — off by default; Reference review runs up to two independent non-vision GLM advisers once per user turn and leaves the primary model as aggregator/actor
 
 ### Deep Thinking (GLM-5.2)
 
@@ -225,12 +230,35 @@ instead of consuming the full iteration budget. Malformed JSON tool arguments
 are rejected with schema-oriented corrective feedback before permission or
 execution.
 
-Command results carry structured exit codes. After a failed or timed-out
+Result-aware loop detection also tracks identical-argument failures, same-tool
+failure streaks with changed arguments, and unchanged read/search output hashes.
+It emits corrective warnings before its bounded stop thresholds. Repeated
+unchanged read/search results are replaced in model context by a compact digest.
+
+Project facts detect repository manifests, package managers, git state, and
+canonical checks. Command results carry structured exit codes into a persisted
+verification ledger. Only structurally matched checks count; output claims,
+non-executing flags, and shell constructs that can mask verifier status do not.
+Every successful edit advances the edit generation, invalidating older passes.
+After a failed or timed-out
 command, the model receives one automatic verification-recovery turn before it
 may finish, directing it to inspect the failure, preserve tests, correct the
 root cause, and rerun the narrowest relevant check or report a genuine blocker.
 After a successful file edit, the model likewise receives one recovery turn if
 it tries to finish before a successful verification command has been observed.
+
+Each successful write is read back before the model continues. Python, JSON,
+and TOML receive deterministic syntax validation. If already installed,
+`pyright-langserver`, `typescript-language-server`, `gopls`, or `rust-analyzer`
+also receives the versioned document over LSP stdio and returns semantic
+diagnostics. Missing, timed-out, or failed servers fall back safely and are never
+installed by the agent.
+
+Persistent `/goal` state and `/subgoal` acceptance criteria survive session
+reloads and forks. A strict-JSON auxiliary judge evaluates the response, changed
+paths, and fresh verification evidence after each candidate completion. It may
+continue the same tool loop, pause on completion or a genuine blocker, and
+automatically pauses after 20 judged turns; explicit resume resets that budget.
 
 ### MCP and durable memory
 
@@ -242,8 +270,11 @@ Concurrent MCP discovery initializes each server once. HTTP 404/410 session
 expiry performs one clean reinitialize-and-retry, while dead or timed-out stdio
 processes discard stale protocol state before restart.
 
-Root `AGENTS.md`, `CLAUDE.md`, and `GLM.md` are loaded into the managed system
-prompt. Reusable facts are opt-in and stored only after permission in the
+`.hermes.md`, `HERMES.md`, `AGENTS.md`, `CLAUDE.md`, `GLM.md`, `.cursorrules`,
+and `.cursor/rules/*.mdc` files are discovered progressively from the
+project root toward accessed paths. When a direct mutation first reveals a
+closer scoped instruction file, that call is deferred without changing the file
+so the acting model can retry with the updated managed prompt. Reusable facts are opt-in and stored only after permission in the
 workspace's `.glm-acp/memory.md`; secrets and transient reasoning must not be stored.
 
 After a task passes a recognized verification command, the turn receives
@@ -299,6 +330,9 @@ history; deletion is a separate storage operation and must never be inferred
 from close.
 Forks persist `parent_session_id` plus `branch_root_id`; `/lineage` exposes direct
 children and identifies the parent session as the rollback path.
+Instruction targets, verification ledger, persistent goal/subgoals, judge
+budget, and Mixture-of-Agents selection are serialized with the session; read
+fingerprints and reference-response caches remain runtime-only.
 
 **Critical:** The ACP `LoadSessionResponse` and `ResumeSessionResponse` only
 carry `modes`, `config_options`, and `models` — they do **not** include message

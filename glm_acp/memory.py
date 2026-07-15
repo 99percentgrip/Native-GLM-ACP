@@ -15,11 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from .config import config_dir
+from .project_context import progressive_instructions
 from .security import safe_context_text, scan_promptware
 
 MAX_INSTRUCTION_CHARS = 24_000
 MAX_MEMORY_CHARS = 32_000
-INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md", "GLM.md")
+INSTRUCTION_FILES = (".hermes.md", "HERMES.md", "AGENTS.md", "CLAUDE.md", "GLM.md", ".cursorrules")
 MEMORY_RELATIVE_PATH = Path(".glm-acp") / "memory.md"
 LEARNED_SKILLS_RELATIVE_PATH = Path(".glm-acp") / "skills"
 MAX_LEARNED_SKILLS = 100
@@ -193,19 +194,13 @@ def skill_is_relevant(
     return True
 
 
-def project_knowledge(cwd: str, task: str = "") -> str:
-    """Load explicit root instructions and opt-in project memory."""
+def project_knowledge(cwd: str, task: str = "", targets: list[str] | None = None) -> str:
+    """Load progressive project instructions and opt-in project memory."""
     root = Path(cwd)
-    remaining = MAX_INSTRUCTION_CHARS
     sections: list[str] = []
-    for name in INSTRUCTION_FILES:
-        path = _safe_path(root, root / name)
-        text = _bounded_read(path, remaining) if path is not None else ""
-        if text:
-            sections.append(f"### {name}\n{safe_context_text(text, name)}")
-            remaining -= len(text)
-        if remaining <= 0:
-            break
+    instructions = progressive_instructions(cwd, targets)
+    if instructions:
+        sections.append(instructions[:MAX_INSTRUCTION_CHARS])
     project_memory = _safe_path(root, root / MEMORY_RELATIVE_PATH)
     memory = _bounded_read(project_memory, MAX_MEMORY_CHARS) if project_memory is not None else ""
     if memory:

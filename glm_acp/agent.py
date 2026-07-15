@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -83,7 +84,9 @@ from .config import (
     persist_reasoning,
     thought_levels_for_model,
 )
+from .diagnostics import DiagnosticsManager
 from .glm_client import GlmClient
+from .guardrails import ToolLoopGuard
 from .mcp import MCP_TOOL_DEFINITIONS, McpError, McpManager
 from .memory import (
     list_learned_skills,
@@ -93,6 +96,7 @@ from .memory import (
     skill_curator_status,
     user_knowledge,
 )
+from .project_context import detect_project_facts, instruction_files
 from .security import wrap_untrusted_output
 from .session_store import SessionStore
 from .tools import (
@@ -104,6 +108,7 @@ from .tools import (
     ToolResult,
     execute_tool,
 )
+from .verification import VerificationLedger
 
 logger = logging.getLogger("glm_acp")
 
@@ -115,6 +120,8 @@ and run commands.
 Rules:
 - Before editing, locate and obey every applicable AGENTS.md or contributor \
 instruction from the repository root to the target file.
+- Progressive instruction sections are ordered root-to-target; when compatible, \
+the closest scoped instruction controls the target path.
 - Read files before editing them. Understand the codebase structure first.
 - Make minimal, surgical changes. Match existing conventions.
 - Preserve unrelated user changes and avoid unrelated refactors.
@@ -166,73 +173,17 @@ Loaded project instructions and opt-in memory:
 """
 
 
-def build_system_prompt(cwd: str, model: str = DEFAULT_MODEL, task: str = "") -> str:
+def build_system_prompt(
+    cwd: str,
+    model: str = DEFAULT_MODEL,
+    task: str = "",
+    instruction_targets: list[str] | None = None,
+) -> str:
     """Build the system prompt with auto-detected project context and model identity."""
 
     model_name = MODELS.get(model, {}).get("name", model)
-    context_parts: list[str] = []
-
-    # Detect language / framework
-    cwd_path = Path(cwd)
-    try:
-        files = {f.name for f in cwd_path.iterdir() if f.is_file()} if cwd_path.exists() else set()
-    except (PermissionError, OSError):
-        files = set()
-
-    if "pyproject.toml" in files:
-        context_parts.append("- Python project (pyproject.toml detected)")
-    elif "setup.py" in files or "setup.cfg" in files:
-        context_parts.append("- Python project (setup.py detected)")
-    elif "package.json" in files:
-        try:
-            pkg = json.loads((cwd_path / "package.json").read_text())
-            lang = (
-                "TypeScript"
-                if "typescript" in json.dumps(pkg.get("devDependencies", {}))
-                else "JavaScript"
-            )
-            framework = pkg.get("dependencies", {})
-            if "next" in framework:
-                context_parts.append(f"- {lang} project (Next.js)")
-            elif "react" in framework:
-                context_parts.append(f"- {lang} project (React)")
-            elif "vue" in framework:
-                context_parts.append(f"- {lang} project (Vue)")
-            else:
-                context_parts.append(f"- {lang} project (Node.js)")
-        except (json.JSONDecodeError, OSError):
-            context_parts.append("- Node.js project (package.json)")
-    elif "Cargo.toml" in files:
-        context_parts.append("- Rust project (Cargo.toml)")
-    elif "go.mod" in files:
-        context_parts.append("- Go project (go.mod)")
-    elif "Gemfile" in files:
-        context_parts.append("- Ruby project (Gemfile)")
-    elif "pom.xml" in files or "build.gradle" in files:
-        context_parts.append("- Java project (Maven/Gradle)")
-
-    # Detect package manager
-    if "uv.lock" in files:
-        context_parts.append("- Package manager: uv")
-    elif "poetry.lock" in files:
-        context_parts.append("- Package manager: Poetry")
-    elif "yarn.lock" in files:
-        context_parts.append("- Package manager: Yarn")
-    elif "pnpm-lock.yaml" in files:
-        context_parts.append("- Package manager: pnpm")
-    elif "package-lock.json" in files:
-        context_parts.append("- Package manager: npm")
-
-    # Detect git
-    try:
-        git_dir = cwd_path / ".git"
-        if git_dir.exists():
-            context_parts.append("- Version control: git")
-    except (PermissionError, OSError):
-        pass
-
-    project_context = "\n".join(context_parts) if context_parts else "(no project files detected)"
-    knowledge = project_knowledge(cwd, task) or (
+    project_context = detect_project_facts(cwd).render()
+    knowledge = project_knowledge(cwd, task, instruction_targets) or (
         "(none loaded; inspect nested instructions before edits)"
     )
     return SYSTEM_PROMPT_TEMPLATE.format(
@@ -323,6 +274,13 @@ class Session:
         self.task_context: str = ""
         self.compaction_learning_proposals: list[str] = []
         self.compaction_quality_history: list[dict[str, Any]] = []
+        self.instruction_targets: list[str] = []
+        self.verification = VerificationLedger()
+        self.goal: str = ""
+        self.subgoals: list[str] = []
+        self.goal_paused = False
+        self.goal_turns = 0
+        self.mixture_mode = "off"
         self.scheduled_run = False
         # Cumulative cost tracking per session
         self.total_input_tokens: int = 0
@@ -334,15 +292,29 @@ class Session:
         self.client_key: tuple[str, str, str, str | None, float | None, float | None] | None = None
         self.aux_client: GlmClient | None = None
         self.aux_client_key: tuple[str, str] | None = None
+        self.read_cache: dict[str, str] = {}
+        self.moa_cache_key = ""
+        self.moa_cache_advice: list[str] = []
 
     def refresh_system_prompt(self, task: str | None = None) -> None:
         """Keep the managed system prompt aligned with the selected model."""
         if task is not None:
             self.task_context = task[:2000]
-        prompt = {
-            "role": "system",
-            "content": build_system_prompt(self.cwd, self.model, self.task_context),
-        }
+        content = build_system_prompt(
+            self.cwd, self.model, self.task_context, self.instruction_targets
+        )
+        if self.goal:
+            criteria = (
+                "\n".join(f"{index}. {value}" for index, value in enumerate(self.subgoals, 1))
+                or "(none)"
+            )
+            content += (
+                "\n\nPersistent goal:\n"
+                f"{self.goal}\nAdditional acceptance criteria:\n{criteria}\n"
+                "Continue until the goal and every criterion are evidenced, blocked, paused, "
+                "or the bounded goal budget is exhausted."
+            )
+        prompt = {"role": "system", "content": content}
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = prompt
         else:
@@ -383,6 +355,13 @@ class Session:
             "task_context": self.task_context,
             "compaction_learning_proposals": self.compaction_learning_proposals,
             "compaction_quality_history": self.compaction_quality_history,
+            "instruction_targets": self.instruction_targets,
+            "verification": self.verification.to_dict(),
+            "goal": self.goal,
+            "subgoals": self.subgoals,
+            "goal_paused": self.goal_paused,
+            "goal_turns": self.goal_turns,
+            "mixture_mode": self.mixture_mode,
         }
 
     @classmethod
@@ -425,6 +404,17 @@ class Session:
         session.compaction_quality_history = [
             value for value in data.get("compaction_quality_history", []) if isinstance(value, dict)
         ][-MAX_COMPACTION_QUALITY_HISTORY:]
+        session.instruction_targets = [
+            str(value) for value in data.get("instruction_targets", []) if isinstance(value, str)
+        ][-100:]
+        session.verification = VerificationLedger(data.get("verification"))
+        session.goal = str(data.get("goal", ""))[:4000]
+        session.subgoals = [
+            str(value)[:1000] for value in data.get("subgoals", []) if isinstance(value, str)
+        ][:50]
+        session.goal_paused = bool(data.get("goal_paused", False))
+        session.goal_turns = int(data.get("goal_turns", 0))
+        session.mixture_mode = str(data.get("mixture_mode", "off"))
         messages = data.get("messages")
         if messages:
             session.messages = messages
@@ -442,6 +432,7 @@ class GlmAcpAgent(acp.Agent):
         self._store = SessionStore()
         self._tool_io_semaphore = asyncio.Semaphore(4)
         self._mcp = McpManager()
+        self._diagnostics = DiagnosticsManager()
         self._cron_task: asyncio.Task[None] | None = None
         self._cron_stop: asyncio.Event | None = None
 
@@ -621,6 +612,135 @@ class GlmAcpAgent(acp.Agent):
             logger.warning("Auxiliary skill evaluation failed", exc_info=True)
             return ""
 
+    async def _messages_with_references(self, session: Session) -> list[dict[str, Any]]:
+        """Return a private MoA-enriched message copy without mutating session history."""
+        if session.mixture_mode != "enabled":
+            return session.messages
+        available = [
+            model
+            for model in models_for_plan(session.api_endpoint)
+            if model not in VISION_MODELS and model != session.model
+        ][:2]
+        if not available:
+            available = [session.model]
+        latest = ""
+        latest_index = -1
+        for index in range(len(session.messages) - 1, -1, -1):
+            message = session.messages[index]
+            if message.get("role") == "user":
+                latest = str(message.get("content", ""))[-16_000:]
+                latest_index = index
+                break
+        cache_key = hashlib.sha256(
+            json.dumps(
+                [session.api_endpoint, session.model, latest_index, latest],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        cache_hit = session.moa_cache_key == cache_key
+        if cache_hit:
+            advice = list(session.moa_cache_advice)
+        else:
+            advice = []
+        endpoint = API_ENDPOINTS[session.api_endpoint]["base_url"]
+
+        async def reference(model: str) -> tuple[str, dict[str, int]]:
+            client = GlmClient(model, thought_level="disabled", base_url=endpoint)
+            try:
+                response = await client.complete_auxiliary(
+                    "Act as an independent coding reference. Analyze correctness, missing "
+                    "requirements, repository evidence, and likely failure modes. Do not call "
+                    "tools or claim that actions occurred. Return concise advice to the acting "
+                    "model.",
+                    wrap_untrusted_output(latest, "moa-source"),
+                    max_tokens=600,
+                )
+                return response.content, response.usage
+            finally:
+                await client.aclose()
+
+        if not cache_hit:
+            results = await asyncio.gather(
+                *(reference(model) for model in available), return_exceptions=True
+            )
+            for model, value in zip(available, results):
+                if isinstance(value, BaseException):
+                    logger.warning("MoA reference %s failed", model)
+                    continue
+                content, usage = value
+                self._record_auxiliary_usage(session, usage)
+                advice.append(f"Reference {model}:\n{content[:4000]}")
+            session.moa_cache_key = cache_key
+            session.moa_cache_advice = list(advice)
+        if not advice:
+            return session.messages
+        messages = copy.deepcopy(session.messages)
+        private = wrap_untrusted_output("\n\n".join(advice), "moa-references")
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = (
+                    content + "\n\nPrivate independent reference analyses:\n" + private
+                )
+            elif isinstance(content, list):
+                content.append({"type": "text", "text": "Private reference analyses:\n" + private})
+            break
+        return messages
+
+    async def _goal_continuation(self, session: Session, final_response: str) -> str:
+        """Ask the auxiliary judge whether the persistent goal and criteria are complete."""
+        if not session.goal or session.goal_paused:
+            return ""
+        if session.goal_turns >= 20:
+            session.goal_paused = True
+            await self._send_message(
+                session.id,
+                "\n\n⚠️ Persistent goal paused after the 20-turn safety limit.\n",
+            )
+            return ""
+        session.goal_turns += 1
+        evidence = session.verification.fresh_pass
+        payload = {
+            "goal": session.goal,
+            "criteria": session.subgoals,
+            "assistant_response": final_response[-8000:],
+            "verification": vars(evidence) if evidence else None,
+            "changed_paths": session.verification.changed_paths[-50:],
+        }
+        try:
+            client = self._aux_client_for_session(session)
+            response = await client.complete_auxiliary(
+                "Judge whether a persistent coding goal is complete. Use only the supplied "
+                "response and verification evidence. Every criterion must be satisfied. Return "
+                'strict JSON: {"done": true|false, "blocked": true|false, "reason": "..."}. '
+                "A genuine blocker is terminal; unsupported success claims are not completion.",
+                wrap_untrusted_output(json.dumps(payload, ensure_ascii=False), "goal-evidence"),
+                max_tokens=200,
+            )
+            self._record_auxiliary_usage(session, response.usage)
+            match = re.search(r"\{.*\}", response.content, re.DOTALL)
+            verdict = json.loads(match.group(0)) if match else {}
+            if bool(verdict.get("done")) or bool(verdict.get("blocked")):
+                session.goal_paused = True
+                await self._send_message(
+                    session.id,
+                    f"\n\n🎯 Goal judge: {str(verdict.get('reason', 'complete'))[:500]}\n",
+                )
+                return ""
+            reason = str(verdict.get("reason", "The goal lacks completion evidence"))[:1000]
+        except Exception:
+            logger.warning("Goal judge failed; continuing within the bounded budget", exc_info=True)
+            reason = "The auxiliary judge was unavailable; re-check the goal and evidence."
+        criteria = "\n".join(f"- {item}" for item in session.subgoals) or "- (none)"
+        return (
+            "Persistent-goal continuation: do not finish yet.\n"
+            f"Goal: {session.goal}\nAcceptance criteria:\n{criteria}\nJudge reason: {reason}\n"
+            "Continue using tools and fresh verification evidence."
+        )
+
     async def _invalidate_session_client(self, session: Session) -> None:
         client = session.client
         aux_client = session.aux_client
@@ -646,6 +766,7 @@ class GlmAcpAgent(acp.Agent):
             return_exceptions=True,
         )
         await self._mcp.aclose()
+        await self._diagnostics.close()
 
     def on_connect(self, conn: Client) -> None:
         self._conn = conn
@@ -727,6 +848,7 @@ class GlmAcpAgent(acp.Agent):
             self._build_permission_option(session),
             self._build_generation_profile_option(session),
             self._build_auxiliary_model_option(session),
+            self._build_mixture_option(session),
         ]
 
         return NewSessionResponse(
@@ -794,6 +916,7 @@ class GlmAcpAgent(acp.Agent):
             self._build_permission_option(session),
             self._build_generation_profile_option(session),
             self._build_auxiliary_model_option(session),
+            self._build_mixture_option(session),
         ]
 
         return LoadSessionResponse(
@@ -873,6 +996,7 @@ class GlmAcpAgent(acp.Agent):
             self._build_permission_option(session),
             self._build_generation_profile_option(session),
             self._build_auxiliary_model_option(session),
+            self._build_mixture_option(session),
         ]
 
         return ResumeSessionResponse(
@@ -924,6 +1048,7 @@ class GlmAcpAgent(acp.Agent):
         new_session.api_endpoint = parent.api_endpoint
         new_session.generation_profile = parent.generation_profile
         new_session.auxiliary_model = parent.auxiliary_model
+        new_session.mixture_mode = parent.mixture_mode
         new_session.permission_mode = parent.permission_mode
         new_session.parent_session_id = parent.id
         new_session.branch_root_id = parent.branch_root_id or parent.id
@@ -939,6 +1064,12 @@ class GlmAcpAgent(acp.Agent):
         new_session.task_context = parent.task_context
         new_session.compaction_learning_proposals = list(parent.compaction_learning_proposals)
         new_session.compaction_quality_history = copy.deepcopy(parent.compaction_quality_history)
+        new_session.instruction_targets = list(parent.instruction_targets)
+        new_session.verification = VerificationLedger(parent.verification.to_dict())
+        new_session.goal = parent.goal
+        new_session.subgoals = list(parent.subgoals)
+        new_session.goal_paused = parent.goal_paused
+        new_session.goal_turns = parent.goal_turns
 
         self._sessions[new_session.id] = new_session
         await self._save_session(new_session)
@@ -950,6 +1081,7 @@ class GlmAcpAgent(acp.Agent):
             self._build_permission_option(new_session),
             self._build_generation_profile_option(new_session),
             self._build_auxiliary_model_option(new_session),
+            self._build_mixture_option(new_session),
         ]
 
         return ForkSessionResponse(
@@ -1037,6 +1169,12 @@ class GlmAcpAgent(acp.Agent):
                 requested in available and requested not in VISION_MODELS
             ):
                 session.auxiliary_model = requested
+        elif config_id == "mixture_mode":
+            requested = str(value)
+            if requested in {"off", "enabled"}:
+                session.mixture_mode = requested
+                session.moa_cache_key = ""
+                session.moa_cache_advice = []
 
         if (
             session.auxiliary_model != DEFAULT_AUXILIARY_MODEL
@@ -1065,6 +1203,7 @@ class GlmAcpAgent(acp.Agent):
                 self._build_permission_option(session),
                 self._build_generation_profile_option(session),
                 self._build_auxiliary_model_option(session),
+                self._build_mixture_option(session),
             ],
         )
 
@@ -1253,6 +1392,117 @@ class GlmAcpAgent(acp.Agent):
             )
         )
 
+    async def _postprocess_tool_result(
+        self,
+        session: Session,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_result: ToolResult,
+    ) -> tuple[str, str]:
+        """Update progressive context, verification state, diagnostics, and read dedup."""
+        original = tool_result.output
+        raw_path = tool_args.get("path")
+        if raw_path and tool_name in {
+            "read_file",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "list_directory",
+            "grep",
+        }:
+            try:
+                resolved = str(session.sandbox.resolve(str(raw_path)))
+            except ToolError:
+                resolved = ""
+            if resolved and resolved not in session.instruction_targets:
+                session.instruction_targets.append(resolved)
+                session.instruction_targets = session.instruction_targets[-100:]
+                session.refresh_system_prompt()
+        if tool_name in {"write_file", "edit_file", "apply_patch"} and tool_result.file_path:
+            session.verification.mark_edit(tool_result.file_path)
+            session.refresh_system_prompt()
+            try:
+                current_text = Path(tool_result.file_path).read_text(encoding="utf-8")
+                diagnostics = await self._diagnostics.check(
+                    tool_result.file_path,
+                    current_text,
+                    detect_project_facts(session.cwd).root,
+                )
+                syntax = diagnostics.get("syntax") or []
+                lsp = diagnostics.get("lsp") or []
+                if syntax or lsp:
+                    original += (
+                        "\n\nPost-write diagnostics:\n"
+                        + json.dumps({"syntax": syntax, "lsp": lsp}, ensure_ascii=False, indent=2)[
+                            :8000
+                        ]
+                    )
+                elif diagnostics.get("lsp_status") == "ok":
+                    original += (
+                        "\n\nPost-write diagnostics: syntax and LSP checks reported no errors."
+                    )
+                else:
+                    original += (
+                        "\n\nPost-write diagnostics: syntax check passed; LSP "
+                        f"{diagnostics.get('lsp_status', 'unavailable')}."
+                    )
+            except (OSError, UnicodeDecodeError):
+                original += (
+                    "\n\nPost-write diagnostics unavailable: the written file could not be "
+                    "read back."
+                )
+        displayed = original
+        if TOOL_KINDS.get(tool_name) in {"read", "search"}:
+            key = json.dumps([tool_name, tool_args], sort_keys=True, default=str)
+            digest = hashlib.sha256(original.encode(errors="replace")).hexdigest()
+            if session.read_cache.get(key) == digest:
+                displayed = (
+                    f"Unchanged result already provided earlier in this turn "
+                    f"(sha256:{digest[:12]}). Use the existing result or change the query."
+                )
+            else:
+                session.read_cache[key] = digest
+        return displayed, original
+
+    def _prepare_progressive_context(
+        self,
+        session: Session,
+        tool_name: str,
+        tool_args: Any,
+    ) -> list[str]:
+        """Load newly applicable scoped instructions before a path-based tool runs."""
+        if not isinstance(tool_args, dict):
+            return []
+        raw_path = tool_args.get("path")
+        if not raw_path or tool_name not in {
+            "read_file",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "list_directory",
+            "grep",
+        }:
+            return []
+        try:
+            resolved = str(session.sandbox.resolve(str(raw_path)))
+        except ToolError:
+            return []
+        if resolved in session.instruction_targets:
+            return []
+        before = set(instruction_files(session.cwd, session.instruction_targets))
+        session.instruction_targets.append(resolved)
+        session.instruction_targets = session.instruction_targets[-100:]
+        after = set(instruction_files(session.cwd, session.instruction_targets))
+        session.refresh_system_prompt()
+        root = Path(detect_project_facts(session.cwd).root)
+        labels: list[str] = []
+        for path in sorted(after - before):
+            try:
+                labels.append(str(path.relative_to(root)))
+            except ValueError:
+                labels.append(path.name)
+        return labels
+
     async def _run_turn(self, session: Session) -> str:
         """Execute the full model-turn loop: stream → tool calls → repeat."""
         client = self._client_for_session(session)
@@ -1294,10 +1544,11 @@ class GlmAcpAgent(acp.Agent):
         failed_command_guard_used = False
         unverified_change_pending = False
         unverified_change_guard_used = False
-        successful_verification_observed = False
+        successful_verification_observed = session.verification.fresh_pass is not None
         learning_review_pending = False
         learning_review_guard_used = False
         skills_used_this_turn: set[str] = set()
+        loop_guard = ToolLoopGuard()
         delegation_budget = {
             "workers": MAX_DELEGATIONS_PER_TURN,
             "tool_calls": MAX_DELEGATE_TOOL_CALLS_PER_TURN,
@@ -1317,8 +1568,9 @@ class GlmAcpAgent(acp.Agent):
             # --- Compaction check before each API call ---
             await self._maybe_compact(session, auxiliary_client)
 
+            call_messages = await self._messages_with_references(session)
             result = await client.stream_completion(
-                messages=session.messages,
+                messages=call_messages,
                 tools=tools,
                 on_reasoning=lambda chunk: self._send_thought(session.id, chunk),
                 on_content=lambda chunk: self._send_message(session.id, chunk),
@@ -1440,6 +1692,10 @@ class GlmAcpAgent(acp.Agent):
                     learning_review_pending = False
                     learning_review_guard_used = True
                     continue
+                goal_continuation = await self._goal_continuation(session, result.content or "")
+                if goal_continuation:
+                    session.messages.append({"role": "system", "content": goal_continuation})
+                    continue
                 notice = self._finish_reason_notice(result.finish_reason)
                 if notice:
                     await self._send_message(session.id, f"\n\n{notice}\n")
@@ -1481,6 +1737,11 @@ class GlmAcpAgent(acp.Agent):
             )
             if read_only_batch:
                 for tc in result.tool_calls:
+                    self._prepare_progressive_context(
+                        session,
+                        tc["function"]["name"],
+                        tc["function"]["arguments"],
+                    )
                     await self._start_tool_with_location(
                         session.id,
                         tc["id"],
@@ -1508,15 +1769,30 @@ class GlmAcpAgent(acp.Agent):
                     if isinstance(tool_result, BaseException):
                         error_msg = str(tool_result)
                         output = f"Error: {error_msg}"
+                        original_output = output
                         await self._fail_tool(session.id, tc["id"], error_msg)
                     else:
-                        output = tool_result.output
+                        output, original_output = await self._postprocess_tool_result(
+                            session,
+                            tc["function"]["name"],
+                            tc["function"]["arguments"],
+                            tool_result,
+                        )
                         await self._complete_tool(session.id, tc["id"], tool_result)
                         if tc["function"]["name"] in {"read_skill", "read_skill_bundle"}:
                             skills_used_this_turn.add(
                                 str(tc["function"]["arguments"].get("name", ""))
                             )
                             session.refresh_system_prompt()
+                    decision = loop_guard.observe(
+                        tc["function"]["name"],
+                        tc["function"]["arguments"],
+                        original_output,
+                        failed=isinstance(tool_result, BaseException),
+                        read_only=True,
+                    )
+                    if decision.message:
+                        output += "\n\n" + decision.message
                     session.messages.append(
                         {
                             "role": "tool",
@@ -1524,6 +1800,9 @@ class GlmAcpAgent(acp.Agent):
                             "content": self._guard_tool_output(tc["function"]["name"], output),
                         }
                     )
+                    if decision.action == "halt":
+                        await self._send_message(session.id, "\n\n⚠️ " + decision.message + "\n")
+                        return "end_turn"
                 continue
 
             for tc in result.tool_calls:
@@ -1618,6 +1897,26 @@ class GlmAcpAgent(acp.Agent):
 
                 await self._update_tool(session.id, tc_id, status="in_progress")
 
+                newly_loaded = self._prepare_progressive_context(
+                    session, tool_name, tool_args
+                )
+                if newly_loaded and TOOL_KINDS.get(tool_name) == "edit":
+                    output = (
+                        "Loaded newly applicable scoped instructions before mutation: "
+                        + ", ".join(newly_loaded)
+                        + ". Review the updated system context, then retry the edit in a new "
+                        "tool call. No file was changed by this call."
+                    )
+                    await self._fail_tool(session.id, tc_id, output)
+                    session.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": self._guard_tool_output(tool_name, output),
+                        }
+                    )
+                    continue
+
                 # --- Permission check ---
                 permitted, deny_reason = await self._check_permission(
                     session,
@@ -1637,6 +1936,7 @@ class GlmAcpAgent(acp.Agent):
                     )
                     continue
 
+                tool_failed = False
                 try:
                     if tool_name == "delegate_task":
                         delegated = await self._delegate_task(session, tool_args, delegation_budget)
@@ -1694,9 +1994,12 @@ class GlmAcpAgent(acp.Agent):
                                 "\n\nAuxiliary evaluator (advisory):\n" + evaluation
                             )
                     await self._complete_tool(session.id, tc_id, tool_result)
-                    output = tool_result.output
+                    output, original_output = await self._postprocess_tool_result(
+                        session, tool_name, tool_args, tool_result
+                    )
                     if tool_name in {"write_file", "edit_file", "apply_patch"}:
                         unverified_change_pending = True
+                        successful_verification_observed = False
                     elif tool_name in {"read_skill", "read_skill_bundle"}:
                         skills_used_this_turn.add(str(tool_args.get("name", "")))
                         session.refresh_system_prompt()
@@ -1715,7 +2018,15 @@ class GlmAcpAgent(acp.Agent):
                     elif tool_name == "run_command":
                         if tool_result.exit_code not in (None, 0):
                             failed_command_pending = True
-                        elif self._is_verification_command(str(tool_args.get("command", ""))):
+                            tool_failed = True
+                        event = session.verification.record(
+                            str(tool_args.get("command", "")),
+                            session.cwd,
+                            int(tool_result.exit_code or 0),
+                            tool_result.output,
+                            detect_project_facts(session.cwd),
+                        )
+                        if event is not None and event.status == "passed":
                             successful_verification_observed = True
                             unverified_change_pending = False
                             unverified_change_guard_used = False
@@ -1724,11 +2035,23 @@ class GlmAcpAgent(acp.Agent):
                                 failed_command_pending = False
                                 failed_command_guard_used = False
                 except (ToolError, McpError) as e:
+                    tool_failed = True
                     error_msg = str(e)
                     output = f"Error: {error_msg}"
+                    original_output = output
                     await self._fail_tool(session.id, tc_id, error_msg)
                     if tool_name == "run_command":
                         failed_command_pending = True
+
+                decision = loop_guard.observe(
+                    tool_name,
+                    tool_args,
+                    original_output,
+                    failed=tool_failed,
+                    read_only=TOOL_KINDS.get(tool_name) in {"read", "search"},
+                )
+                if decision.message:
+                    output += "\n\n" + decision.message
 
                 session.messages.append(
                     {
@@ -1737,6 +2060,9 @@ class GlmAcpAgent(acp.Agent):
                         "content": self._guard_tool_output(tool_name, output),
                     }
                 )
+                if decision.action == "halt":
+                    await self._send_message(session.id, "\n\n⚠️ " + decision.message + "\n")
+                    return "end_turn"
         else:
             # Loop exhausted without break — hit the configured iteration cap
             await self._send_message(
@@ -2205,6 +2531,14 @@ class GlmAcpAgent(acp.Agent):
                 name="lineage",
                 description="Show this session's parent, branch root, and direct child sessions",
             ),
+            AvailableCommand(
+                name="goal",
+                description="Set, show, pause, resume, or clear a persistent coding goal",
+            ),
+            AvailableCommand(
+                name="subgoal",
+                description="Add, list, remove, or clear persistent acceptance criteria",
+            ),
         ]
         update = update_available_commands(commands)
         await self._conn.session_update(session_id=session.id, update=update)
@@ -2239,6 +2573,74 @@ class GlmAcpAgent(acp.Agent):
             await self._send_plan(session)
             await self._save_session(session)
             return "📋 Task plan cleared."
+
+        elif command == "/goal" or command.startswith("/goal "):
+            argument = command.partition(" ")[2].strip()
+            if not argument:
+                if not session.goal:
+                    return "No persistent goal is active. Set one with `/goal <objective>`."
+                criteria = (
+                    "\n".join(
+                        f"{index}. {value}" for index, value in enumerate(session.subgoals, 1)
+                    )
+                    or "(none)"
+                )
+                state = "paused" if session.goal_paused else "active"
+                return f"🎯 **Goal ({state})**\n{session.goal}\n\n**Criteria**\n{criteria}"
+            lowered = argument.lower()
+            if lowered == "clear":
+                session.goal = ""
+                session.subgoals = []
+                session.goal_paused = False
+                session.goal_turns = 0
+                session.refresh_system_prompt()
+                await self._save_session(session)
+                return "🎯 Persistent goal cleared."
+            if lowered in {"pause", "resume"}:
+                if not session.goal:
+                    return "No persistent goal is active."
+                session.goal_paused = lowered == "pause"
+                if lowered == "resume":
+                    session.goal_turns = 0
+                session.refresh_system_prompt()
+                await self._save_session(session)
+                return f"🎯 Goal {lowered}d."
+            session.goal = argument[:4000]
+            session.subgoals = []
+            session.goal_paused = False
+            session.goal_turns = 0
+            session.refresh_system_prompt()
+            await self._save_session(session)
+            return "🎯 Persistent goal set. The auxiliary judge will evaluate each completed turn."
+
+        elif command == "/subgoal" or command.startswith("/subgoal "):
+            if not session.goal:
+                return "Set a persistent goal before adding acceptance criteria."
+            argument = command.partition(" ")[2].strip()
+            if not argument:
+                if not session.subgoals:
+                    return "No additional acceptance criteria are recorded."
+                return "\n".join(
+                    f"{index}. {value}" for index, value in enumerate(session.subgoals, 1)
+                )
+            if argument.lower() == "clear":
+                session.subgoals = []
+                response = "All additional acceptance criteria cleared."
+            elif argument.lower().startswith("remove "):
+                try:
+                    index = int(argument.split(maxsplit=1)[1]) - 1
+                    removed = session.subgoals.pop(index)
+                    response = f"Removed criterion: {removed}"
+                except (ValueError, IndexError):
+                    return "Use `/subgoal remove <number>` with a listed criterion number."
+            else:
+                if len(session.subgoals) >= 50:
+                    return "The persistent goal already has the maximum 50 criteria."
+                session.subgoals.append(argument[:1000])
+                response = f"Added criterion {len(session.subgoals)}."
+            session.refresh_system_prompt()
+            await self._save_session(session)
+            return response
 
         elif command == "/clear-history":
             system_msg = (
@@ -2356,6 +2758,20 @@ class GlmAcpAgent(acp.Agent):
         elif command == "/status":
             n_msgs = len(session.messages)
             curator = skill_curator_status(session.cwd)
+            facts = detect_project_facts(session.cwd)
+            evidence = session.verification.latest
+            evidence_text = (
+                f"{evidence.status} · {evidence.scope} · `{evidence.command}`"
+                if evidence is not None
+                else "none"
+            )
+            fresh_text = "yes" if session.verification.fresh_pass is not None else "no"
+            goal_text = (
+                f"{'paused' if session.goal_paused else 'active'} · "
+                f"{len(session.subgoals)} criteria"
+                if session.goal
+                else "none"
+            )
             latest_quality = (
                 session.compaction_quality_history[-1].get("score")
                 if session.compaction_quality_history
@@ -2373,7 +2789,14 @@ class GlmAcpAgent(acp.Agent):
                 f"- **Reasoning:** {session.thought_level}\n"
                 f"- **Generation style:** {session.generation_profile}\n"
                 f"- **Auxiliary model:** {session.auxiliary_model}\n"
+                f"- **Mixture of Agents:** {session.mixture_mode}\n"
                 f"- **Permissions:** {session.permission_mode}\n"
+                f"- **Project root:** {facts.root}\n"
+                f"- **Detected verification:** "
+                f"{'; '.join(facts.verify_commands) or 'none'}\n"
+                f"- **Persistent goal:** {goal_text}\n"
+                f"- **Latest verification evidence:** {evidence_text}\n"
+                f"- **Fresh passing evidence:** {fresh_text}\n"
                 f"- **Context:** {session.estimated_tokens:,} / {session.context_size:,} tokens "
                 f"({session.estimated_tokens * 100 // max(session.context_size, 1)}%)\n"
                 f"- **Context pressure tier:** {session.context_pressure_level} / 3\n"
@@ -2472,7 +2895,7 @@ class GlmAcpAgent(acp.Agent):
                 f"Unknown command: {command}\nAvailable commands: /compact, "
                 "/clear-plan, /clear-history, /diff, /export, /status, /memory, "
                 "/skills, /profile, /curator, /sessions"
-                ", /lineage"
+                ", /lineage, /goal, /subgoal"
             )
 
     # ------------------------------------------------------------------
@@ -3322,6 +3745,26 @@ class GlmAcpAgent(acp.Agent):
             type="select",
             current_value=session.auxiliary_model,
             options=options,
+        )
+
+    def _build_mixture_option(self, session: Session) -> SessionConfigOptionSelect:
+        return SessionConfigOptionSelect(
+            id="mixture_mode",
+            name="Mixture of Agents",
+            description="Optional independent GLM references before the acting model",
+            category="other",
+            type="select",
+            current_value=session.mixture_mode,
+            options=[
+                SessionConfigSelectOption(
+                    value="off", name="Off", description="Use the acting model directly"
+                ),
+                SessionConfigSelectOption(
+                    value="enabled",
+                    name="Reference review",
+                    description="Run up to two independent GLM references before each iteration",
+                ),
+            ],
         )
 
     def _build_api_endpoint_option(self, session: Session) -> SessionConfigOptionSelect:
