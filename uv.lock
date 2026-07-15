@@ -269,6 +269,7 @@ dependencies = [
     { name = "agent-client-protocol" },
     { name = "croniter" },
     { name = "httpx" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
 
@@ -293,6 +294,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<10" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1,<2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12,<1" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2,<3" },
     { name = "tzdata", marker = "sys_platform == 'win32'", specifier = "==2025.2" },
 ]
 provides-extras = ["dev"]
