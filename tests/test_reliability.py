@@ -35,7 +35,7 @@ def test_progressive_instruction_discovery_walks_root_to_target(tmp_path: Path):
     nested_rules.mkdir(parents=True)
     (nested_rules / "scoped.mdc").write_text("scoped cursor rules")
 
-    found = [str(path.relative_to(tmp_path)) for path in instruction_files(nested)]
+    found = [path.relative_to(tmp_path).as_posix() for path in instruction_files(nested)]
 
     assert found == [
         ".hermes.md",
@@ -85,6 +85,7 @@ def test_verification_ledger_rejects_spoof_and_invalidates_after_edit(tmp_path: 
     assert classify_verification("pytest | tee results.txt", facts) is None
     assert classify_verification("pytest || true", facts) is None
     assert classify_verification("uv run --frozen pytest -q", facts) == ("pytest", "full")
+    assert classify_verification('"python.exe" -m pytest -q', facts) == ("pytest", "full")
     event = ledger.record("pytest -q", str(tmp_path), 0, "2 passed", facts)
     assert event is not None
     assert ledger.fresh_pass is event

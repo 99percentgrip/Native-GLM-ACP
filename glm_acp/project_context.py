@@ -123,7 +123,7 @@ def progressive_instructions(cwd: str, targets: list[str] | None = None) -> str:
         if not text:
             continue
         try:
-            label = str(path.relative_to(root))
+            label = path.relative_to(root).as_posix()
         except ValueError:
             label = path.name
         sections.append(f"### {label}\n{safe_context_text(text, label)}")

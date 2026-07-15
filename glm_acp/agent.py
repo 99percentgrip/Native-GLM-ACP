@@ -1498,7 +1498,7 @@ class GlmAcpAgent(acp.Agent):
         labels: list[str] = []
         for path in sorted(after - before):
             try:
-                labels.append(str(path.relative_to(root)))
+                labels.append(path.relative_to(root).as_posix())
             except ValueError:
                 labels.append(path.name)
         return labels

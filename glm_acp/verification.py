@@ -12,6 +12,15 @@ from typing import Any
 from .project_context import ProjectFacts
 
 
+def _executable_name(value: str) -> str:
+    name = re.split(r"[\\/]", value)[-1]
+    lowered = name.lower()
+    for suffix in (".exe", ".cmd", ".bat"):
+        if lowered.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 @dataclass
 class VerificationEvent:
     command: str
@@ -38,7 +47,7 @@ def _segments(command: str) -> list[list[str]]:
         ):
             tokens = tokens[1:]
         if tokens:
-            executable = Path(tokens[0]).name
+            executable = _executable_name(tokens[0])
             if re.fullmatch(r"python3(?:\.\d+)*", executable):
                 executable = "python3"
             elif re.fullmatch(r"python(?:\.\d+)+", executable):
@@ -61,8 +70,9 @@ def _invocation_variants(tokens: list[str]) -> list[list[str]]:
     if tokens[:2] == ["uv", "run"]:
         executables = {"pytest", "ruff", "mypy", "python", "python3"}
         for index, token in enumerate(tokens[2:], 2):
-            if Path(token).name in executables:
-                variants.append([Path(token).name, *tokens[index + 1 :]])
+            executable = _executable_name(token)
+            if executable in executables:
+                variants.append([executable, *tokens[index + 1 :]])
                 break
     return variants
 
