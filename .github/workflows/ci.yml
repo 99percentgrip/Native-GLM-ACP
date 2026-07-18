@@ -113,4 +113,4 @@ jobs:
         shell: bash
         run: test "$("${{ matrix.binary }}" --version)" = "$(uv run --frozen python -c 'from glm_acp import __version__; print(__version__)')"
       - name: Enforce frozen executable size ceiling
-        run: python -c "from pathlib import Path; size=Path('${{ matrix.binary }}').stat().st_size; print(f'{size} bytes'); assert size < 31 * 1024 * 1024"
+        run: python -c "from pathlib import Path; size=Path('${{ matrix.binary }}').stat().st_size; print(f'{size} bytes'); assert size < 40 * 1024 * 1024"

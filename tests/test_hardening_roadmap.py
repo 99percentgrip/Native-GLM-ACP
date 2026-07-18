@@ -48,7 +48,8 @@ def test_platform_sandbox_capabilities_fail_closed(tmp_path, monkeypatch):
     assert prefix[:2] == ["/usr/bin/sandbox-exec", "-p"]
     assert "(deny default)" in prefix[2]
     assert "(deny network*)" in prefix[2]
-    assert str(tmp_path) in prefix[2]
+    escaped_root = str(tmp_path.resolve()).replace("\\", "\\\\")
+    assert escaped_root in prefix[2]
 
     monkeypatch.setattr("glm_acp.os_sandbox.sys.platform", "win32")
     with pytest.raises(RuntimeError, match="do not provide network isolation"):

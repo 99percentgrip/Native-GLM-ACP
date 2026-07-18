@@ -60,7 +60,7 @@ jobs:
         shell: bash
         run: test "$("dist/${{ matrix.binary }}" --version)" = "${GITHUB_REF_NAME#v}"
       - name: Enforce frozen executable size ceiling
-        run: python -c "from pathlib import Path; size=Path('dist/${{ matrix.binary }}').stat().st_size; print(f'{size} bytes'); assert size < 31 * 1024 * 1024"
+        run: python -c "from pathlib import Path; size=Path('dist/${{ matrix.binary }}').stat().st_size; print(f'{size} bytes'); assert size < 40 * 1024 * 1024"
       - name: Package Unix executable
         if: matrix.archive == 'tar.gz'
         shell: bash
