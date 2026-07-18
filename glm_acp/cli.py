@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import json
 import os
 from collections.abc import Callable, Sequence
 
@@ -12,6 +13,7 @@ from . import __version__
 from .agent import run
 from .config import get_api_key, store_api_key
 from .cron_cli import add_cron_parser, run_cron_command
+from .plugin_cli import add_plugin_parser, run_plugin_command
 from .uninstall import UninstallError, uninstall_release
 
 
@@ -63,6 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command")
     add_cron_parser(subparsers)
+    add_plugin_parser(subparsers)
+    observe = subparsers.add_parser("observe", help="show secret-safe local reliability metrics")
+    observe.add_argument("--json", action="store_true", dest="as_json")
+    harden = subparsers.add_parser("harden", help="run offline fuzz and fault-injection checks")
+    harden.add_argument("--iterations", type=int, default=250)
+    harden.add_argument("--seed", type=int, default=5202)
+    harden.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -73,6 +82,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--purge requires --uninstall")
     if args.command == "cron":
         return run_cron_command(args)
+    if args.command == "plugin":
+        return run_plugin_command(args)
+    if args.command == "observe":
+        from .observability import observability_snapshot, render_observability
+
+        snapshot = observability_snapshot()
+        print(
+            json.dumps(snapshot, ensure_ascii=False, indent=2)
+            if args.as_json
+            else render_observability(snapshot)
+        )
+        return 0
+    if args.command == "harden":
+        from .resilience import run_hardening_checks
+
+        result = run_hardening_checks(args.iterations, args.seed)
+        if args.as_json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            status = "passed" if result["passed"] else "failed"
+            print(
+                f"Offline hardening {status}: {result['iterations']} fuzz iterations; "
+                f"promotion rollback fault={result['checks']['promotion_rollback_fault']}."
+            )
+        return 0 if result["passed"] else 1
     if args.setup:
         return configure_credentials()
     if args.check_auth:

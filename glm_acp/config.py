@@ -270,6 +270,7 @@ DESTRUCTIVE_TOOLS = frozenset(
         "run_workflow",
         "plugin_package",
         "worktree_worker",
+        "failure_corpus",
         "rollback",
     }
 )

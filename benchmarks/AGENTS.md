@@ -6,7 +6,7 @@ Own opt-in, reproducible coding-agent quality evaluation without placing live AP
 
 ## Ownership
 
-- `eval.py` runs native or external agents against isolated task fixtures and emits JSON results.
+- `eval.py` runs native or external agents against built-in or reviewed project-local isolated task fixtures and emits JSON results.
 - `cases.json` defines prompts, fixture files, verification commands, and time limits.
 - `report.py` combines compatible JSON results into a Markdown leaderboard.
 - `run_live.py` performs credential-safe preflight and creates handoff-ready native JSON and Markdown artifacts.
@@ -20,6 +20,7 @@ Own opt-in, reproducible coding-agent quality evaluation without placing live AP
 - Reports record a schema version, candidate label, pass rate, end-to-end and first-delta latency, token totals, native prompt fingerprint, and non-identifying runtime details.
 - The live runner permits one process per checkout, recovers stale locks, prints per-attempt progress, and preserves atomic partial JSON and Markdown reports after cancellation.
 - Missing non-Python runtimes skip only their affected cases and remain visible in report totals.
+- `--cases-file` accepts the same validated outcome-based schema for explicitly promoted failure regressions; private failure drafts are never executable cases.
 
 ## Work Guidance
 

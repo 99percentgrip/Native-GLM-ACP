@@ -36,12 +36,15 @@ subprocess inside Zed's Agent Panel — no Zed recompilation required.
 - **Playwright UI testing** — permission-gated isolated browser automation returns accessibility, console, network, interaction, and screenshot evidence
 - **Lifecycle hooks** — user-owned hash-pinned hooks can block tools, observe results, or request bounded pre-verification follow-up
 - **Conflict-aware checkpoints** — automatic pre-mutation snapshots and `/rollback` restore only exact agent-produced hashes
-- **Explicit context references** — bounded `@file:`, `@folder:`, `@symbol:`, and `@diff` expansion is workspace-contained and secret-aware
+- **Language-aware context references** — bounded `@file:`, `@folder:`, `@symbol:`, and `@diff` expansion ranks definitions, references, task terms, tests, and changed files
 - **Declarative policy and workflows** — ordered allow/ask/deny rules and static DAGs add control without arbitrary orchestration code
-- **Optional OS sandboxing** — Bubblewrap isolates command filesystems on Linux; required mode fails closed when unavailable
-- **Worktree implementation workers** — opt-in editing workers operate in detached locked worktrees and return unmerged diffs
+- **Cross-platform command containment** — Bubblewrap isolates Linux, macOS Seatbelt is capability-detected, and Windows Job Objects contain process trees without overstating filesystem isolation
+- **Transactional worker promotion** — detached workers support inspect, isolated verification, exact-digest promotion, conflict detection, rollback, and reviewed discard
 - **Isolated profiles** — named profiles separate credentials, sessions, telemetry, hooks, cron jobs, plugins, and user memory
-- **Hash-pinned plugin packages** — permission-scoped data-only packages reject executable content and hash drift
+- **Signed plugin trust** — hash-pinned data-only packages support Ed25519 publisher identities, explicit trust, signature policy, and executable-content rejection
+- **Failure-driven evaluations** — secret-safe failure drafts can be explicitly promoted into runnable project-local regression cases
+- **Local observability dashboard** — `/observability` and `glm-acp observe` aggregate redacted reliability, latency, cache, tool, verification, and safety metrics
+- **Offline hardening harness** — deterministic parser fuzzing, malformed-telemetry tests, and real transactional rollback fault injection run without API credentials
 
 ### API Resilience
 
@@ -91,6 +94,7 @@ Type these in the chat input:
 | `/checkpoint [label\|list]` | Create or list a bounded secret-safe workspace checkpoint |
 | `/rollback [checkpoint-id]` | Restore recorded agent changes unless a later conflicting edit is detected |
 | `/plugins` | List installed declarative plugins and their integrity state |
+| `/observability [json]` | Show the local metadata-only quality, efficiency, and safety dashboard |
 
 ### Task Plans
 
@@ -110,7 +114,9 @@ change. Use `/checkpoint list` to inspect recent checkpoints.
 Prompts may explicitly include `@file:path`, `@folder:path`, `@symbol:name`, or
 `@diff`. Expansion stays inside workspace roots, has file/character limits,
 omits common secret files, and enters model context inside an untrusted-data
-boundary.
+boundary. Folder and symbol references rank language-specific definitions,
+references, task vocabulary, tests, manifests, and current Git changes before
+spending the fixed context budget.
 
 Repositories may define `.glm-acp/policy.json` with ordered rules:
 
@@ -133,11 +139,20 @@ generate steps or execute orchestration code.
 Command OS isolation is opt-in with `GLM_ACP_OS_SANDBOX=auto` or fail-closed
 with `GLM_ACP_OS_SANDBOX=required`. On Linux, Bubblewrap exposes system runtime
 files read-only, mounts only declared workspace roots writable, hides the user
-home, and can disable networking with `GLM_ACP_SANDBOX_NETWORK=0`. Unsupported
-platforms retain the existing workspace path sandbox in `auto` mode and reject
-commands in `required` mode. Worktree implementation workers always request
-required OS isolation with networking disabled for their command tools, preserve
-dirty worktrees, and never merge automatically.
+home, and can disable networking with `GLM_ACP_SANDBOX_NETWORK=0`. On macOS,
+the deprecated but still capability-detected `sandbox-exec` backend uses a
+deny-by-default Seatbelt profile with workspace-only writes and optional network
+denial. Windows Job Objects contain child-process trees and terminate them as a
+unit in `auto` mode; because they do not isolate the filesystem or network,
+`required` mode rejects them instead of claiming a stronger boundary.
+
+Worktree implementation workers always request required OS isolation with
+networking disabled for command tools. A completed worker remains detached and
+unmerged. Promotion requires a fresh verification command inside that isolated
+worktree plus the exact SHA-256 digest returned by inspection. Git checks the
+whole patch against the primary workspace before applying it; conflicts change
+nothing, injected post-apply faults reverse the complete patch, and the worker is
+preserved until an explicit digest-pinned discard.
 
 Set `GLM_ACP_PROFILE=client-a` before launch to isolate user state under a
 validated named profile. `default` preserves all legacy paths. Plugin packages
@@ -145,7 +160,38 @@ are installed from a workspace `plugin.json` through the permission-gated
 `plugin_package` tool. Manifests declare `schema: 1`, an id, permission scopes,
 and SHA-256 for every data file; only JSON, Markdown, TOML, and YAML are allowed.
 The installed manifest receives its own integrity pin. Executable plugin code is
-intentionally unsupported.
+intentionally unsupported. Unsigned local packages remain available by default
+and are labeled `local-hash-only`; set `GLM_ACP_REQUIRE_SIGNED_PLUGINS=1` to
+require an explicitly trusted Ed25519 publisher.
+
+Publisher signing is CLI-only so private keys never enter model tool arguments:
+
+```bash
+glm-acp plugin keygen --publisher example.org/team \
+  --private-key publisher.private.json --public-key publisher.public.json
+glm-acp plugin sign ./plugin.json --private-key publisher.private.json
+glm-acp plugin trust ./publisher.public.json
+glm-acp plugin publishers
+```
+
+The permission-gated `failure_corpus` tool records only normalized failure
+classes, hashed project identity, tool name, and file extensions. It never stores
+prompts, commands, outputs, paths, reasoning, or credentials. Drafts remain
+private and inert until a user approves a complete prompt, fixture, verifier, and
+timeout; promoted cases are written to
+`.glm-acp/evaluation/failure-cases.json` and can be run with:
+
+```bash
+.venv/bin/python3 benchmarks/eval.py \
+  --cases-file .glm-acp/evaluation/failure-cases.json --validate
+```
+
+`glm-acp observe` (or `/observability`) summarizes the bounded metadata-only
+trajectory locally. `glm-acp observe --json` provides machine-readable metrics.
+For offline resilience checks, `glm-acp harden --iterations 250 --seed 5202`
+fuzzes manifest/reference/policy inputs, corrupts telemetry framing, and injects
+a post-apply worker fault to prove transactional rollback. It makes no model or
+network request.
 
 ### Scheduled Automation
 
@@ -333,10 +379,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v1.2.0` before running the Unix
-installer, or pass `-Version v1.2.0` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v1.3.0` before running the Unix
+installer, or pass `-Version v1.3.0` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v1.2.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v1.2.0).
+[v1.3.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v1.3.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -469,7 +515,12 @@ glm_acp/
 ├── project_context.py # Progressive instructions and detected project facts
 ├── verification.py # Persistent, edit-fresh verification evidence ledger
 ├── diagnostics.py  # Syntax checks and optional LSP semantic diagnostics
+├── failure_corpus.py # Secret-safe failure drafts and reviewed benchmark promotion
 ├── guardrails.py    # Result-aware repeated-failure/no-progress detection
+├── observability.py # Metadata-only local quality and safety dashboard
+├── os_sandbox.py    # Linux/macOS isolation and Windows process-tree containment
+├── plugins.py       # Hash-pinned, Ed25519-verifiable data-only plugin packages
+├── resilience.py    # Offline fuzzing and transactional fault injection
 ├── security.py      # Promptware scanning and untrusted-context delimiters
 ├── session_store.py # Persistent JSON session storage (~/.glm-acp/sessions/)
 └── tools.py         # File/shell/search tools sandboxed to workspace roots
@@ -658,7 +709,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-1.2.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-1.3.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

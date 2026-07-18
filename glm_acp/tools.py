@@ -848,16 +848,28 @@ TOOL_DEFINITIONS.extend(
             "function": {
                 "name": "plugin_package",
                 "description": (
-                    "List, verify, or install a local hash-pinned data-only plugin package. "
-                    "Executable plugin files are rejected."
+                    "List, verify, install, or manage trusted publishers for hash-pinned "
+                    "data-only plugin packages. Executable plugin files are rejected."
                 ),
                 "parameters": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "action": {"type": "string", "enum": ["list", "verify", "install"]},
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "list",
+                                "verify",
+                                "install",
+                                "publishers",
+                                "trust",
+                                "untrust",
+                            ],
+                        },
                         "id": {"type": "string"},
                         "manifest_path": {"type": "string"},
+                        "publisher": {"type": "string"},
+                        "public_key_path": {"type": "string"},
                     },
                     "required": ["action"],
                 },
@@ -868,17 +880,55 @@ TOOL_DEFINITIONS.extend(
             "function": {
                 "name": "worktree_worker",
                 "description": (
-                    "Start one opt-in implementation worker in a detached Git worktree. "
-                    "The worker returns a diff and never merges into the primary workspace."
+                    "Run, inspect, verify, promote, or discard an implementation worker in a "
+                    "detached Git worktree. Promotion requires the exact reviewed diff hash."
                 ),
                 "parameters": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["run", "inspect", "verify", "promote", "discard"],
+                        },
                         "task": {"type": "string", "maxLength": 4000},
                         "base_ref": {"type": "string", "maxLength": 200},
+                        "worker_path": {"type": "string", "maxLength": 2000},
+                        "diff_sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                        },
+                        "verification_command": {"type": "string", "maxLength": 2000},
                     },
-                    "required": ["task"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "failure_corpus",
+                "description": (
+                    "List or discard secret-safe failure drafts, or promote a reviewed draft "
+                    "into a project-local outcome-based benchmark case."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "discard", "promote"]},
+                        "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{24}$"},
+                        "case": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "prompt": {"type": "string", "maxLength": 4000},
+                                "files": {"type": "object"},
+                                "verify": {"type": "array", "items": {"type": "string"}},
+                                "timeout": {"type": "integer"},
+                            },
+                        },
+                    },
+                    "required": ["action"],
                 },
             },
         },
@@ -900,6 +950,7 @@ TOOL_KINDS: dict[str, str] = {
     "run_workflow": "execute",
     "plugin_package": "edit",
     "worktree_worker": "execute",
+    "failure_corpus": "edit",
     "run_command": "execute",
     "update_plan": "other",
     "recall_memory": "read",
@@ -1025,6 +1076,8 @@ async def execute_tool(
             return await _run_workflow(arguments, sandbox, on_output=on_output)
         elif name == "plugin_package":
             return await _plugin_package(arguments, sandbox)
+        elif name == "failure_corpus":
+            return await _failure_corpus(arguments, sandbox)
         elif name == "run_command":
             return await _run_command(arguments, sandbox, on_output=on_output)
         elif name == "recall_memory":
@@ -1586,7 +1639,7 @@ async def _run_workflow(
 
 
 async def _plugin_package(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
-    from .plugins import PluginError, PluginRegistry
+    from .plugins import PluginError, PluginRegistry, read_public_key
 
     registry = PluginRegistry()
     action = str(args.get("action", ""))
@@ -1598,11 +1651,52 @@ async def _plugin_package(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
         elif action == "install":
             path = sandbox.resolve(str(args.get("manifest_path", "")))
             value = await asyncio.to_thread(registry.install, path)
+        elif action == "publishers":
+            value = registry.trusted_publishers()
+        elif action == "trust":
+            path = sandbox.resolve(str(args.get("public_key_path", "")))
+            publisher, public_key = read_public_key(path)
+            requested = str(args.get("publisher", ""))
+            if requested and requested != publisher:
+                raise ToolError("Publisher argument does not match the public key file")
+            value = registry.trust_publisher(publisher, public_key)
+        elif action == "untrust":
+            publisher = str(args.get("publisher", ""))
+            value = {"publisher": publisher, "removed": registry.untrust_publisher(publisher)}
         else:
-            raise ToolError("Plugin action must be list, verify, or install")
+            raise ToolError(
+                "Plugin action must be list, verify, install, publishers, trust, or untrust"
+            )
     except PluginError as error:
         raise ToolError(str(error)) from error
     return ToolResult(output=json.dumps(value, ensure_ascii=False, indent=2))
+
+
+async def _failure_corpus(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
+    from .failure_corpus import FailureCorpus, FailureCorpusError
+
+    corpus = FailureCorpus()
+    action = str(args.get("action", ""))
+    fingerprint = str(args.get("fingerprint", ""))
+    try:
+        if action == "list":
+            value: Any = corpus.list()
+            file_path = None
+        elif action == "discard":
+            value = {"fingerprint": fingerprint, "discarded": corpus.discard(fingerprint)}
+            file_path = None
+        elif action == "promote":
+            case = args.get("case")
+            if not isinstance(case, dict):
+                raise ToolError("Failure promotion requires a benchmark case object")
+            path = await asyncio.to_thread(corpus.promote, str(sandbox.roots[0]), fingerprint, case)
+            value = {"fingerprint": fingerprint, "promoted": True, "path": str(path)}
+            file_path = str(path)
+        else:
+            raise ToolError("Failure corpus action must be list, discard, or promote")
+    except FailureCorpusError as error:
+        raise ToolError(str(error)) from error
+    return ToolResult(output=json.dumps(value, ensure_ascii=False, indent=2), file_path=file_path)
 
 
 async def _list_directory(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
@@ -1722,7 +1816,7 @@ async def _run_command(args: dict[str, Any], sandbox: Sandbox, on_output: Any = 
         process_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         process_kwargs["start_new_session"] = True
-    from .os_sandbox import command_prefix
+    from .os_sandbox import WindowsJob, command_prefix
 
     try:
         prefix, backend = command_prefix(
@@ -1753,6 +1847,16 @@ async def _run_command(args: dict[str, Any], sandbox: Sandbox, on_output: Any = 
             stderr=asyncio.subprocess.PIPE,
             **process_kwargs,
         )
+    windows_job = None
+    if backend == "windows-job":
+        try:
+            windows_job = WindowsJob()
+            windows_job.assign(proc.pid)
+        except (OSError, RuntimeError):
+            backend = "workspace-only (Windows Job Object unavailable)"
+            if windows_job is not None:
+                windows_job.close()
+                windows_job = None
 
     async def collect(stream: asyncio.StreamReader | None, label: str) -> tuple[bytes, int]:
         if stream is None:
@@ -1795,6 +1899,9 @@ async def _run_command(args: dict[str, Any], sandbox: Sandbox, on_output: Any = 
         await proc.wait()
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         raise ToolError(f"Command timed out after {timeout}s")
+    finally:
+        if windows_job is not None:
+            windows_job.close()
     stdout, _ = stdout_info
     stderr, _ = stderr_info
     stdout_text = stdout.decode(errors="replace").strip()

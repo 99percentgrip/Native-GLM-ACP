@@ -86,7 +86,8 @@ When the user requests a durable behavior change, record it here or in the relev
 - Agent learning is inspectable, permission-gated, secret-safe, and reversible: facts/skills stay project-local, while explicitly approved user preferences use private cross-project storage.
 - Advanced learning remains evidence-gated: failed traces may produce drafts, but candidates require higher held-out pass rate with no per-case, median-latency, or token-cost regression and explicit promotion; delegation is read-only, depth-one, shared-budgeted, and permission-gated.
 - Coding reliability prioritizes progressively scoped repository instructions, edit-fresh verification evidence, persistent judged goals and acceptance criteria, post-write syntax/semantic diagnostics, unchanged-read deduplication, opt-in reference-model aggregation, and result-aware loop stops.
-- Advanced execution remains declarative and fail-closed: checkpoints are conflict-aware and secret-safe; context references are bounded; policy rules inspect nested workflow steps; implementation workers stay in unmerged worktrees with required OS command isolation; profiles isolate user state; plugin packages are permission-scoped, data-only, and hash-pinned.
+- Advanced execution remains declarative and fail-closed: checkpoints are conflict-aware and secret-safe; context references are bounded and language-ranked; policy rules inspect nested workflow steps; worker promotion is verification- and digest-gated with transactional rollback; profiles isolate user state; plugin packages are permission-scoped, data-only, hash-pinned, and optionally require trusted Ed25519 publishers.
+- Quality evidence remains private and reproducible: failure drafts contain metadata only until explicitly promoted into outcome-based cases; local observability never stores bodies or raw identities; fuzzing and fault injection run offline and deterministically.
 
 ## Project Purpose
 
@@ -100,8 +101,8 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 
 ## Current Project Status
 
-- Package and ACP implementation version is `1.2.0` from `glm_acp.__version__`.
-- GitHub release `v1.2.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
+- Package and ACP implementation version is `1.3.0` from `glm_acp.__version__`.
+- GitHub release `v1.3.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
 - ACP Registry publication is tracked in `agentclientprotocol/registry#439` and remains pending until Registry maintainers merge it.
 - Source installs, the `glm-acp` console script, module execution, and frozen binaries share `cli.main()`.
 - Public frozen binaries support one-command removal of installer-owned commands, PATH markers, and matching custom Zed configuration with an automatic settings backup.
@@ -125,6 +126,11 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 - Bounded secret-safe checkpoints precede workspace mutations; exact post-agent hashes make `/rollback` stop on later conflicts instead of overwriting them.
 - Explicit `@file:`, `@folder:`, `@symbol:`, and `@diff` references stay workspace-contained, bounded, secret-aware, and delimited as untrusted context.
 - Ordered repository policy rules, static dependency workflows, optional Bubblewrap isolation, detached worktree implementation workers, named user profiles, and permission-scoped hash-pinned data-only plugin packages provide safe extensibility without arbitrary orchestration code or automatic merges.
+- Cross-platform containment capability-detects Linux Bubblewrap and macOS Seatbelt, adds Windows process-tree Job Objects without treating them as filesystem isolation, and keeps required mode fail-closed.
+- Detached workers support exact-digest inspection, required isolated verification, conflict-aware transactional promotion, rollback-on-fault, and reviewed discard while preserving the worker after promotion.
+- Explicit folder/symbol references spend their fixed budget on language-aware definitions, references, task terms, tests, manifests, and current changes.
+- Metadata-only failure drafts can be permission-gated into runnable project-local regression cases; a local observability dashboard and deterministic offline hardening command expose reliability evidence without prompts, outputs, commands, paths, reasoning, credentials, or raw session IDs.
+- Data-only plugin packages support explicit Ed25519 publisher trust, CLI-only private-key signing, signature enforcement policy, and exact manifest verification in addition to content hashes.
 - Expired MCP HTTP sessions and restarted stdio servers reinitialize automatically with per-server initialization locking.
 - The opt-in quality harness provides 11 outcome-based Python, TypeScript, Go, and Rust cases plus a credential-safe one-command runner with single-run locking, visible progress, and incremental JSON/Markdown handoff reports; live runs remain outside ordinary CI.
 - Persistent scheduled automation supports relative one-shots, intervals, timezone-aware five-field cron, and aware ISO timestamps; permission-gated management, fresh non-persisted runs, skills/bundles, script prechecks, script-only mode, `[SILENT]`, renewable cross-process claims, and bounded redacted artifacts are available through ACP and `glm-acp cron`.
@@ -150,7 +156,7 @@ Verify the install:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: editable glm_acp metadata and glm_acp-1.2.0.dist-info
+# expect: editable glm_acp metadata and glm_acp-1.3.0.dist-info
 ```
 
 ## Verification

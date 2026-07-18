@@ -45,6 +45,15 @@ def _safe_value(value: Any) -> Any:
     return type(value).__name__
 
 
+def _safe_field(key: str, value: Any) -> Any:
+    if key.lower() in {"path", "paths", "workspace", "cwd", "file", "files"}:
+        values = value if isinstance(value, list) else [value]
+        return [
+            "sha256:" + hashlib.sha256(str(item).encode()).hexdigest()[:16] for item in values[:30]
+        ]
+    return _safe_value(value)
+
+
 class TrajectoryRecorder:
     """Append bounded metadata-only events; never persist prompts or tool bodies."""
 
@@ -60,7 +69,7 @@ class TrajectoryRecorder:
             "event": str(event)[:100],
             "session": hashlib.sha256(session_id.encode()).hexdigest()[:16],
             **{
-                str(key)[:100]: _safe_value(value)
+                str(key)[:100]: _safe_field(str(key), value)
                 for key, value in fields.items()
                 if str(key).lower() not in _BODY_FIELDS
             },

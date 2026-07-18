@@ -22,13 +22,15 @@ streaming, 1M context, and auto-continuation for long generations.
 - **Verification evidence**: `verification.py` — persistent edit generations and bounded canonical command outcomes
 - **Post-write diagnostics**: `diagnostics.py` — deterministic syntax checks and lazy optional LSP clients
 - **Lifecycle extensions**: `hooks.py` — user-owned, hash-pinned, workspace-scoped lifecycle commands
-- **Trajectory evidence**: `telemetry.py` — bounded metadata-only JSONL events with session hashing and secret/body exclusion
+- **Trajectory evidence**: `telemetry.py` and `observability.py` — bounded metadata-only events plus local aggregate quality, latency, cache, tool, and safety reporting
+- **Failure-driven evaluation**: `failure_corpus.py` — metadata-only drafts and permission-gated runnable project regression cases
 - **Workspace checkpoints**: `checkpoints.py` — bounded secret-excluding baselines, exact agent hashes, and conflict-aware rollback
-- **Explicit references**: `references.py` — bounded workspace-contained `@file`, `@folder`, `@symbol`, and `@diff` expansion
+- **Explicit references**: `references.py` — bounded workspace-contained references with language/task/change-aware ranking
 - **Declarative controls**: `policy.py` and `workflows.py` — ordered allow/ask/deny rules and static dependency graphs
-- **OS command isolation**: `os_sandbox.py` — optional Bubblewrap argv construction with required-mode fail closure
-- **Isolated extension state**: `profiles.py` and `plugins.py` — validated profile paths and hash-pinned data-only packages
-- **Implementation workers**: `worktrees.py` — detached locked worktree creation, diff handoff, and clean-only removal
+- **OS command isolation**: `os_sandbox.py` — Linux Bubblewrap, capability-detected macOS Seatbelt, Windows Job Object containment, and required-mode fail closure
+- **Isolated extension state**: `profiles.py` and `plugins.py` — validated profile paths plus hash-pinned, Ed25519-verifiable data-only packages
+- **Implementation workers**: `worktrees.py` — detached creation, digest inspection, conflict-aware transactional promotion/rollback, and reviewed cleanup
+- **Offline hardening**: `resilience.py` — deterministic parser fuzzing, malformed telemetry, and real promotion rollback fault injection
 - **Loop guardrails**: `guardrails.py` — repeated failure and unchanged read-only result detection
 - **Untrusted-context defense**: `security.py` — promptware findings, stored-context blocking, and tool/MCP/recall delimiters
 - **Tools**: `tools.py` — file/shell operations sandboxed to workspace roots
@@ -280,8 +282,10 @@ provider cache-hit ratio; cache layout changes must preserve scoped instructions
 and compaction/session compatibility.
 
 Trajectory telemetry stores no prompts, content, tool arguments, commands,
-outputs, reasoning, credentials, or raw session IDs and is disabled by
-`GLM_ACP_TELEMETRY=0`. Lifecycle hooks require an exact executable SHA-256,
+outputs, raw paths, reasoning, credentials, or raw session IDs and is disabled
+by `GLM_ACP_TELEMETRY=0`. `/observability` and `glm-acp observe` read at most
+50,000 events/20 MiB, ignore corrupt records, and report aggregates only.
+Lifecycle hooks require an exact executable SHA-256,
 optional exact workspace scope, argv execution without a shell,
 credential-scrubbed environments, a 10-second maximum timeout, fail-open
 isolation, and a three-nudge pre-verification cap.
@@ -301,7 +305,9 @@ aborts the entire rollback before writes.
 Explicit `@file:`, `@folder:`, `@symbol:`, and `@diff` prompt references are
 limited to 12 references and 48,000 aggregate characters. Paths remain inside
 workspace roots, common secret files are rejected/omitted, folder expansion is
-file-bounded, and all expanded content is untrusted model data.
+file-bounded, and all expanded content is untrusted model data. Folder/symbol
+budgets rank language-specific definitions and references, task terms, tests,
+manifests, and current Git changes before deterministic path tie-breaking.
 
 `.glm-acp/policy.json` version 1 supplies at most 100 ordered allow/ask/deny
 rules over tool globs, path globs, and bounded safe command regular expressions.
@@ -312,12 +318,20 @@ most 12 existing allowlisted tools, executes in dependency order, and stops on
 the first command failure; it cannot generate steps or run orchestration code.
 
 Main-session OS command isolation is opt-in through `GLM_ACP_OS_SANDBOX`.
-Bubblewrap mounts system runtime paths read-only, declared workspace roots
-writable, a private temporary home, and optionally an unshared network; required
-mode rejects execution without a backend. Worktree implementation workers
-always require OS isolation for commands, use detached locked worktrees, return
-bounded untrusted diffs, run without network access, never merge, and never
-force-remove dirty state.
+Bubblewrap mounts Linux runtime paths read-only, declared workspace roots
+writable, a private temporary home, and optionally an unshared network. macOS
+uses `sandbox-exec` only when present with a deny-default Seatbelt profile and
+labels the deprecated backend explicitly. Windows `auto` mode uses a Job Object
+to contain/terminate the child tree; because that is not filesystem or network
+isolation, required mode rejects it. Worktree command tools always require real
+filesystem/network isolation and fail closed otherwise.
+
+Worker inspection hashes the complete bounded binary patch and reports affected
+paths. Promotion requires that exact digest plus a fresh verifier run inside the
+network-disabled worker sandbox. `git apply --check` rejects primary conflicts
+before writes; ordinary apply never uses partial-reject mode, post-apply faults
+reverse the whole patch, and the worker remains preserved until an explicit
+digest-pinned discard.
 
 `GLM_ACP_PROFILE` accepts a validated 1-32 character identifier. `default`
 preserves legacy paths; named profiles isolate credentials, sessions, telemetry,
@@ -325,7 +339,17 @@ hooks, MCP configuration, cron state, plugins, checkpoints, worktrees, and
 private user memory. Plugin packages require schema 1, explicit permission
 scopes, exact SHA-256 for every file plus an installed manifest pin, a 2 MiB/32-file
 bound, and data-only file types; executable package content is rejected and prompt
-fragments are scanned.
+fragments are scanned. Optional Ed25519 signatures cover canonical manifests,
+must match an explicitly trusted publisher key, and may be made mandatory with
+`GLM_ACP_REQUIRE_SIGNED_PLUGINS=1`. Private-key creation/signing is CLI-only.
+
+Failed tool traces create deduplicated private drafts containing only hashed
+project identity, tool name, normalized failure class, and file extensions.
+They never enter model context automatically. The permission-gated
+`failure_corpus` tool requires a reviewed prompt, bounded non-secret fixtures,
+argv verifier, and timeout before writing a runnable project-local case.
+`glm-acp harden` is credential-free and bounded to 10-5,000 deterministic fuzz
+iterations plus a real Git post-apply rollback fault.
 
 Persistent `/goal` state and `/subgoal` acceptance criteria survive session
 reloads and forks. A strict-JSON auxiliary judge evaluates the response, changed

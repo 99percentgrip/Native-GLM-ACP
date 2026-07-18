@@ -86,6 +86,7 @@ from .config import (
     thought_levels_for_model,
 )
 from .diagnostics import DiagnosticsManager
+from .failure_corpus import FailureCorpus
 from .glm_client import GlmClient
 from .guardrails import ToolLoopGuard
 from .hooks import LifecycleHooks
@@ -470,6 +471,7 @@ class GlmAcpAgent(acp.Agent):
         self._diagnostics = DiagnosticsManager()
         self._hooks = LifecycleHooks()
         self._telemetry = TrajectoryRecorder()
+        self._failure_corpus = FailureCorpus()
         self._checkpoints = CheckpointManager()
         self._worktrees = WorktreeManager()
         self._cron_task: asyncio.Task[None] | None = None
@@ -1482,7 +1484,15 @@ class GlmAcpAgent(acp.Agent):
         )
         if (
             tool_name
-            in {"write_file", "edit_file", "apply_patch", "apply_patch_set", "run_workflow"}
+            in {
+                "write_file",
+                "edit_file",
+                "apply_patch",
+                "apply_patch_set",
+                "run_workflow",
+                "worktree_worker",
+                "failure_corpus",
+            }
             and changed_paths
         ):
             for changed_path in changed_paths:
@@ -1490,7 +1500,15 @@ class GlmAcpAgent(acp.Agent):
             session.refresh_system_prompt()
         if (
             tool_name
-            in {"write_file", "edit_file", "apply_patch", "apply_patch_set", "run_workflow"}
+            in {
+                "write_file",
+                "edit_file",
+                "apply_patch",
+                "apply_patch_set",
+                "run_workflow",
+                "worktree_worker",
+                "failure_corpus",
+            }
             and changed_paths
         ):
             diagnostic_results: list[dict[str, Any]] = []
@@ -1549,6 +1567,10 @@ class GlmAcpAgent(acp.Agent):
         paths: list[str] = []
         if tool_args.get("path"):
             paths.append(str(tool_args["path"]))
+        if tool_name == "plugin_package":
+            for key in ("manifest_path", "public_key_path"):
+                if tool_args.get(key):
+                    paths.append(str(tool_args[key]))
         if tool_name == "apply_patch_set":
             for entry in tool_args.get("patches", []):
                 if isinstance(entry, dict) and entry.get("path"):
@@ -1680,6 +1702,7 @@ class GlmAcpAgent(acp.Agent):
             await self._maybe_compact(session, auxiliary_client)
 
             call_messages = await self._messages_with_references(session)
+            llm_started = time.monotonic()
             result = await client.stream_completion(
                 messages=call_messages,
                 tools=tools,
@@ -1701,6 +1724,7 @@ class GlmAcpAgent(acp.Agent):
                 output_tokens=int(usage.get("output_tokens", 0) or 0),
                 cached_tokens=int(usage.get("cached_tokens", 0) or 0),
                 tool_calls=len(result.tool_calls),
+                duration_ms=int((time.monotonic() - llm_started) * 1000),
             )
             await self._report_usage(session)
             await self._report_context_pressure(session)
@@ -2129,7 +2153,7 @@ class GlmAcpAgent(acp.Agent):
                     )
                     continue
 
-                if (
+                workspace_mutation = (
                     tool_name
                     in {
                         "write_file",
@@ -2139,8 +2163,16 @@ class GlmAcpAgent(acp.Agent):
                         "run_command",
                         "run_workflow",
                     }
-                    and not session.active_checkpoint_id
-                ):
+                    or (
+                        tool_name == "worktree_worker"
+                        and str(tool_args.get("action", "run")) == "promote"
+                    )
+                    or (
+                        tool_name == "failure_corpus"
+                        and str(tool_args.get("action", "")) == "promote"
+                    )
+                )
+                if workspace_mutation and not session.active_checkpoint_id:
                     try:
                         checkpoint = await asyncio.to_thread(
                             self._checkpoints.create, session.cwd, f"before {tool_name}"
@@ -2162,8 +2194,7 @@ class GlmAcpAgent(acp.Agent):
                         delegated = await self._delegate_task(session, tool_args, delegation_budget)
                         tool_result = ToolResult(output=delegated)
                     elif tool_name == "worktree_worker":
-                        value = await self._worktree_worker(session, tool_args)
-                        tool_result = ToolResult(output=value)
+                        tool_result = await self._worktree_worker(session, tool_args)
                     elif tool_name == "semantic_code":
                         semantic_path = session.sandbox.resolve(str(tool_args.get("path", "")))
                         value = await self._diagnostics.semantic_query(
@@ -2233,14 +2264,7 @@ class GlmAcpAgent(acp.Agent):
                                 self._cron_delivery() if tool_name == "cronjob" else None
                             ),
                         )
-                    if session.active_checkpoint_id and tool_name in {
-                        "write_file",
-                        "edit_file",
-                        "apply_patch",
-                        "apply_patch_set",
-                        "run_command",
-                        "run_workflow",
-                    }:
+                    if session.active_checkpoint_id and workspace_mutation:
                         changed = await asyncio.to_thread(
                             self._checkpoints.note_workspace_changes,
                             session.cwd,
@@ -2269,6 +2293,8 @@ class GlmAcpAgent(acp.Agent):
                         "apply_patch",
                         "apply_patch_set",
                         "run_workflow",
+                        "worktree_worker",
+                        "failure_corpus",
                     }:
                         unverified_change_pending = True
                         successful_verification_observed = False
@@ -2330,6 +2356,14 @@ class GlmAcpAgent(acp.Agent):
                     output_chars=len(original_output),
                     paths=self._tool_paths(tool_name, tool_args),
                 )
+                if tool_failed:
+                    await asyncio.to_thread(
+                        self._failure_corpus.record_draft,
+                        session.cwd,
+                        tool_name,
+                        original_output,
+                        self._tool_paths(tool_name, tool_args),
+                    )
                 await self._hooks.emit(
                     "post_tool_call",
                     session.cwd,
@@ -2625,8 +2659,97 @@ class GlmAcpAgent(acp.Agent):
             worker.cancel()
             await worker.aclose()
 
-    async def _worktree_worker(self, session: Session, arguments: dict[str, Any]) -> str:
-        """Run one bounded editing worker in a detached, locked Git worktree."""
+    async def _worktree_worker(self, session: Session, arguments: dict[str, Any]) -> ToolResult:
+        """Run or transactionally promote a detached implementation worker."""
+        action = str(arguments.get("action", "run")).strip().lower() or "run"
+        if action != "run":
+            worker_path = str(arguments.get("worker_path", "")).strip()
+            base_ref = str(arguments.get("base_ref", "")).strip()
+            diff_sha256 = str(arguments.get("diff_sha256", "")).strip().lower()
+            if not worker_path or not base_ref:
+                raise ToolError(f"Worker {action} requires worker_path and base_ref")
+            try:
+                if action == "inspect":
+                    inspected = await asyncio.to_thread(
+                        self._worktrees.inspect, session.cwd, worker_path, base_ref
+                    )
+                    preview = str(inspected.pop("diff"))
+                    return ToolResult(
+                        output=(
+                            json.dumps(inspected, ensure_ascii=False, indent=2)
+                            + "\n\nReview this untrusted worker diff:\n"
+                            + wrap_untrusted_output(preview, "worktree-worker-diff")
+                        )[:MAX_TOOL_OUTPUT_CHARS]
+                    )
+                if action == "verify":
+                    command = str(arguments.get("verification_command", "")).strip()
+                    if not command:
+                        raise ToolError("Worker verification requires verification_command")
+                    await asyncio.to_thread(
+                        self._worktrees.inspect, session.cwd, worker_path, base_ref
+                    )
+                    result = await execute_tool(
+                        "run_command",
+                        {"command": command, "timeout": 300},
+                        Sandbox(worker_path, os_sandbox_mode="required", os_sandbox_network=False),
+                    )
+                    return result
+                if action == "promote":
+                    if not re.fullmatch(r"[0-9a-f]{64}", diff_sha256):
+                        raise ToolError("Worker promotion requires the reviewed diff_sha256")
+                    command = str(arguments.get("verification_command", "")).strip()
+                    if not command:
+                        raise ToolError("Worker promotion requires a verification_command")
+                    verification = await execute_tool(
+                        "run_command",
+                        {"command": command, "timeout": 300},
+                        Sandbox(worker_path, os_sandbox_mode="required", os_sandbox_network=False),
+                    )
+                    if verification.exit_code != 0:
+                        raise ToolError(
+                            "Worker verification failed; no primary files were changed:\n"
+                            + verification.output[:8000]
+                        )
+                    promoted = await asyncio.to_thread(
+                        self._worktrees.promote,
+                        session.cwd,
+                        worker_path,
+                        base_ref,
+                        diff_sha256,
+                    )
+                    self._telemetry.record(
+                        "worker_promotion",
+                        session.id,
+                        success=True,
+                        changed_files=len(promoted["paths"]),
+                    )
+                    return ToolResult(
+                        output=(
+                            "Worker verification passed and the reviewed patch was promoted "
+                            "transactionally. The worker remains available until explicitly "
+                            "discarded.\n" + json.dumps(promoted, ensure_ascii=False, indent=2)
+                        ),
+                        changed_paths=list(promoted["paths"]),
+                    )
+                if action == "discard":
+                    if not re.fullmatch(r"[0-9a-f]{64}", diff_sha256):
+                        raise ToolError("Worker discard requires the reviewed diff_sha256")
+                    await asyncio.to_thread(
+                        self._worktrees.discard,
+                        session.cwd,
+                        worker_path,
+                        base_ref,
+                        diff_sha256,
+                    )
+                    return ToolResult(output=f"Discarded reviewed worker worktree {worker_path}")
+                raise ToolError("Worker action must be run, inspect, verify, promote, or discard")
+            except WorktreeError as error:
+                if action == "promote":
+                    self._telemetry.record(
+                        "worker_promotion", session.id, success=False, failure="conflict"
+                    )
+                raise ToolError(str(error)) from error
+
         task = str(arguments.get("task", "")).strip()
         base_ref = str(arguments.get("base_ref", "HEAD")).strip() or "HEAD"
         if not task or len(task) > 4000:
@@ -2737,14 +2860,23 @@ class GlmAcpAgent(acp.Agent):
             diff = await asyncio.to_thread(self._worktrees.diff, worker_root, state["base_ref"])
             if not diff.strip():
                 await asyncio.to_thread(self._worktrees.remove_if_clean, state["repo"], worker_root)
-                return "Implementation worker produced no changes.\n\n" + final[:4000]
-            return (
-                f"Worker {state['id']} completed in preserved worktree {worker_root}. "
-                "No changes were merged. Review and apply this untrusted diff:\n\n"
-                + wrap_untrusted_output(diff, "worktree-worker-diff")
-                + "\n\nWorker report:\n"
-                + wrap_untrusted_output(final[:4000], "worktree-worker-report")
-            )[:MAX_TOOL_OUTPUT_CHARS]
+                return ToolResult(
+                    output="Implementation worker produced no changes.\n\n" + final[:4000]
+                )
+            inspected = await asyncio.to_thread(
+                self._worktrees.inspect, state["repo"], worker_root, state["base_ref"]
+            )
+            return ToolResult(
+                output=(
+                    f"Worker {state['id']} completed in preserved worktree {worker_root}. "
+                    "No changes were merged. Inspect, verify, then promote only with this exact "
+                    f"digest: {inspected['diff_sha256']}\n"
+                    f"Base ref: {state['base_ref']}\n\n"
+                    + wrap_untrusted_output(diff, "worktree-worker-diff")
+                    + "\n\nWorker report:\n"
+                    + wrap_untrusted_output(final[:4000], "worktree-worker-report")
+                )[:MAX_TOOL_OUTPUT_CHARS]
+            )
         except (asyncio.TimeoutError, WorktreeError) as error:
             raise ToolError(
                 f"Implementation worker failed; worktree preserved at {worker_root}: {error}"
@@ -2837,7 +2969,11 @@ class GlmAcpAgent(acp.Agent):
         """
         mode = session.permission_mode
         destructive = tool_name in DESTRUCTIVE_TOOLS and not (
-            tool_name == "plugin_package" and str(tool_args.get("action", "")) in {"list", "verify"}
+            (
+                tool_name == "plugin_package"
+                and str(tool_args.get("action", "")) in {"list", "verify", "publishers"}
+            )
+            or (tool_name == "failure_corpus" and str(tool_args.get("action", "")) == "list")
         )
         raw_paths = self._tool_paths(tool_name, tool_args)
         resolved_paths: list[str] = []
@@ -3099,8 +3235,18 @@ class GlmAcpAgent(acp.Agent):
                     self._checkpoints.rollback, session.cwd, checkpoint_id
                 )
             except CheckpointError as error:
+                self._telemetry.record(
+                    "rollback", session.id, success=False, failure="checkpoint_error"
+                )
                 return f"❌ Rollback failed: {error}"
             if not result["rolled_back"]:
+                self._telemetry.record(
+                    "rollback",
+                    session.id,
+                    success=False,
+                    failure="conflict",
+                    conflicts=len(result["conflicts"]),
+                )
                 return (
                     "⚠️ Rollback stopped because files changed outside the recorded agent "
                     "writes:\n- " + "\n- ".join(result["conflicts"])
@@ -3108,6 +3254,9 @@ class GlmAcpAgent(acp.Agent):
             for relative in result["restored"]:
                 session.verification.mark_edit(str(Path(session.cwd) / relative))
             session.active_checkpoint_id = ""
+            self._telemetry.record(
+                "rollback", session.id, success=True, restored=len(result["restored"])
+            )
             session.refresh_system_prompt()
             await self._save_session(session)
             return (
@@ -3307,6 +3456,14 @@ class GlmAcpAgent(acp.Agent):
             )
             export_path.write_text(md_text, encoding="utf-8")
             return f"📄 Conversation exported to: `{export_path}`"
+
+        elif command == "/observability" or command.startswith("/observability "):
+            from .observability import observability_snapshot, render_observability
+
+            snapshot = await asyncio.to_thread(observability_snapshot)
+            if command.partition(" ")[2].strip().lower() == "json":
+                return "```json\n" + json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n```"
+            return render_observability(snapshot)
 
         elif command == "/status":
             from .os_sandbox import sandbox_mode
@@ -4189,6 +4346,7 @@ class GlmAcpAgent(acp.Agent):
             "run_workflow": "Running declarative workflow",
             "plugin_package": "Managing verified plugin package",
             "worktree_worker": "Running isolated implementation worker",
+            "failure_corpus": "Managing failure-driven evaluations",
             "recall_memory": "Reading project memory",
             "store_memory": "Updating project memory",
             "recall_user_profile": "Reading user profile",

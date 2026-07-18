@@ -25,8 +25,9 @@ sys.path.insert(0, str(ROOT))
 REQUIRED_CASE_FIELDS = {"id", "prompt", "files", "verify", "timeout"}
 
 
-def load_cases() -> list[dict[str, Any]]:
-    cases = json.loads((Path(__file__).with_name("cases.json")).read_text(encoding="utf-8"))
+def load_cases(path: Path | None = None) -> list[dict[str, Any]]:
+    source = path or Path(__file__).with_name("cases.json")
+    cases = json.loads(source.read_text(encoding="utf-8"))
     if not isinstance(cases, list) or not cases:
         raise ValueError("cases.json must contain a non-empty list")
     seen: set[str] = set()
@@ -257,13 +258,18 @@ async def main() -> int:
     parser.add_argument("--runner", choices=("native", "external"), default="native")
     parser.add_argument("--external-command", nargs=argparse.REMAINDER)
     parser.add_argument("--case", action="append", dest="selected")
+    parser.add_argument(
+        "--cases-file",
+        type=Path,
+        help="run a reviewed project-local failure-cases.json corpus",
+    )
     parser.add_argument("--label", default="native-glm-acp")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--markdown-output", type=Path)
     parser.add_argument("--validate", action="store_true")
     args = parser.parse_args()
-    cases = load_cases()
+    cases = load_cases(args.cases_file)
     if args.validate:
         print(f"Validated {len(cases)} benchmark cases")
         return 0
