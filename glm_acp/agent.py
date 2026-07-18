@@ -53,6 +53,7 @@ from acp.schema import (
 )
 
 from . import __version__
+from .checkpoints import CheckpointError, CheckpointManager
 from .config import (
     API_ENDPOINTS,
     AUTH_METHOD_ID,
@@ -97,8 +98,11 @@ from .memory import (
     skill_curator_status,
     user_knowledge,
 )
+from .policy import PolicyEngine
+from .profiles import active_profile
 from .project_context import detect_project_facts, instruction_files
-from .security import wrap_untrusted_output
+from .references import expand_references
+from .security import safe_context_text, wrap_untrusted_output
 from .session_store import SessionStore, session_persistence_enabled
 from .telemetry import TrajectoryRecorder
 from .tools import (
@@ -111,6 +115,7 @@ from .tools import (
     execute_tool,
 )
 from .verification import VerificationLedger
+from .worktrees import WorktreeError, WorktreeManager
 
 logger = logging.getLogger("glm_acp")
 
@@ -188,6 +193,17 @@ def build_system_prompt(
     knowledge = project_knowledge(cwd, task, instruction_targets) or (
         "(none loaded; inspect nested instructions before edits)"
     )
+    try:
+        from .plugins import PluginRegistry
+
+        fragments = PluginRegistry().prompt_fragments()
+    except Exception:
+        logger.warning("Could not load verified plugin prompt fragments", exc_info=True)
+        fragments = ""
+    if fragments:
+        knowledge += "\n\nVerified declarative plugin context:\n" + safe_context_text(
+            fragments, "hash-pinned plugin packages"
+        )
     rendered = SYSTEM_PROMPT_TEMPLATE.format(
         project_context=project_context,
         project_knowledge=knowledge,
@@ -290,6 +306,8 @@ class Session:
         self.goal_turns = 0
         self.mixture_mode = "off"
         self.scheduled_run = False
+        self.last_checkpoint_id = ""
+        self.active_checkpoint_id = ""
         # Cumulative cost tracking per session
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
@@ -377,6 +395,7 @@ class Session:
             "goal_paused": self.goal_paused,
             "goal_turns": self.goal_turns,
             "mixture_mode": self.mixture_mode,
+            "last_checkpoint_id": self.last_checkpoint_id,
         }
 
     @classmethod
@@ -430,6 +449,7 @@ class Session:
         session.goal_paused = bool(data.get("goal_paused", False))
         session.goal_turns = int(data.get("goal_turns", 0))
         session.mixture_mode = str(data.get("mixture_mode", "off"))
+        session.last_checkpoint_id = str(data.get("last_checkpoint_id", ""))
         messages = data.get("messages")
         if messages:
             session.messages = messages
@@ -450,6 +470,8 @@ class GlmAcpAgent(acp.Agent):
         self._diagnostics = DiagnosticsManager()
         self._hooks = LifecycleHooks()
         self._telemetry = TrajectoryRecorder()
+        self._checkpoints = CheckpointManager()
+        self._worktrees = WorktreeManager()
         self._cron_task: asyncio.Task[None] | None = None
         self._cron_stop: asyncio.Event | None = None
 
@@ -1296,6 +1318,20 @@ class GlmAcpAgent(acp.Agent):
         if not content.strip() and not images:
             return PromptResponse(stop_reason="end_turn", user_message_id=message_id)
 
+        # Explicit context references are bounded and appended as untrusted data.
+        if content and not images:
+            try:
+                content, reference_targets = await asyncio.to_thread(
+                    expand_references, content, session.sandbox
+                )
+            except ToolError as error:
+                await self._send_message(session.id, f"\n\n⚠️ Context reference error: {error}\n")
+                return PromptResponse(stop_reason="end_turn", user_message_id=message_id)
+            for target in reference_targets:
+                if target not in session.instruction_targets:
+                    session.instruction_targets.append(target)
+        session.active_checkpoint_id = ""
+
         # Text-only models can't process images. Vision models can.
         is_vision_model = session.model in VISION_MODELS
 
@@ -1444,11 +1480,19 @@ class GlmAcpAgent(acp.Agent):
         changed_paths = tool_result.changed_paths or (
             [tool_result.file_path] if tool_result.file_path else []
         )
-        if tool_name in {"write_file", "edit_file", "apply_patch", "apply_patch_set"}:
+        if (
+            tool_name
+            in {"write_file", "edit_file", "apply_patch", "apply_patch_set", "run_workflow"}
+            and changed_paths
+        ):
             for changed_path in changed_paths:
                 session.verification.mark_edit(changed_path)
             session.refresh_system_prompt()
-        if tool_name in {"write_file", "edit_file", "apply_patch", "apply_patch_set"}:
+        if (
+            tool_name
+            in {"write_file", "edit_file", "apply_patch", "apply_patch_set", "run_workflow"}
+            and changed_paths
+        ):
             diagnostic_results: list[dict[str, Any]] = []
             for changed_path in changed_paths[:20]:
                 try:
@@ -1467,9 +1511,10 @@ class GlmAcpAgent(acp.Agent):
                 if item.get("syntax") or item.get("lsp") or item.get("lsp_status") == "unreadable"
             ]
             if findings:
-                original += "\n\nPost-write diagnostics:\n" + json.dumps(
-                    findings, ensure_ascii=False, indent=2
-                )[:8000]
+                original += (
+                    "\n\nPost-write diagnostics:\n"
+                    + json.dumps(findings, ensure_ascii=False, indent=2)[:8000]
+                )
             elif diagnostic_results and all(
                 item.get("lsp_status") == "ok" for item in diagnostic_results
             ):
@@ -1511,6 +1556,11 @@ class GlmAcpAgent(acp.Agent):
         if tool_name == "batch_read":
             for operation in tool_args.get("operations", []):
                 arguments = operation.get("arguments", {}) if isinstance(operation, dict) else {}
+                if isinstance(arguments, dict) and arguments.get("path"):
+                    paths.append(str(arguments["path"]))
+        if tool_name == "run_workflow":
+            for step in tool_args.get("steps", []):
+                arguments = step.get("arguments", {}) if isinstance(step, dict) else {}
                 if isinstance(arguments, dict) and arguments.get("path"):
                     paths.append(str(arguments["path"]))
         return list(dict.fromkeys(paths))[:100]
@@ -2018,9 +2068,7 @@ class GlmAcpAgent(acp.Agent):
 
                 await self._update_tool(session.id, tc_id, status="in_progress")
 
-                newly_loaded = self._prepare_progressive_context(
-                    session, tool_name, tool_args
-                )
+                newly_loaded = self._prepare_progressive_context(session, tool_name, tool_args)
                 if newly_loaded and TOOL_KINDS.get(tool_name) == "edit":
                     output = (
                         "Loaded newly applicable scoped instructions before mutation: "
@@ -2081,12 +2129,41 @@ class GlmAcpAgent(acp.Agent):
                     )
                     continue
 
+                if (
+                    tool_name
+                    in {
+                        "write_file",
+                        "edit_file",
+                        "apply_patch",
+                        "apply_patch_set",
+                        "run_command",
+                        "run_workflow",
+                    }
+                    and not session.active_checkpoint_id
+                ):
+                    try:
+                        checkpoint = await asyncio.to_thread(
+                            self._checkpoints.create, session.cwd, f"before {tool_name}"
+                        )
+                        session.active_checkpoint_id = str(checkpoint["id"])
+                        session.last_checkpoint_id = session.active_checkpoint_id
+                    except CheckpointError as error:
+                        output = f"Safety checkpoint failed; tool was not run: {error}"
+                        await self._fail_tool(session.id, tc_id, output)
+                        session.messages.append(
+                            {"role": "tool", "tool_call_id": tc_id, "content": output}
+                        )
+                        continue
+
                 tool_failed = False
                 tool_started = time.monotonic()
                 try:
                     if tool_name == "delegate_task":
                         delegated = await self._delegate_task(session, tool_args, delegation_budget)
                         tool_result = ToolResult(output=delegated)
+                    elif tool_name == "worktree_worker":
+                        value = await self._worktree_worker(session, tool_args)
+                        tool_result = ToolResult(output=value)
                     elif tool_name == "semantic_code":
                         semantic_path = session.sandbox.resolve(str(tool_args.get("path", "")))
                         value = await self._diagnostics.semantic_query(
@@ -2096,9 +2173,7 @@ class GlmAcpAgent(acp.Agent):
                             line=int(tool_args.get("line", 1)),
                             column=int(tool_args.get("column", 1)),
                             query=str(tool_args.get("query", ""))[:500],
-                            include_declaration=bool(
-                                tool_args.get("include_declaration", True)
-                            ),
+                            include_declaration=bool(tool_args.get("include_declaration", True)),
                             item=(
                                 tool_args.get("item")
                                 if isinstance(tool_args.get("item"), dict)
@@ -2158,6 +2233,23 @@ class GlmAcpAgent(acp.Agent):
                                 self._cron_delivery() if tool_name == "cronjob" else None
                             ),
                         )
+                    if session.active_checkpoint_id and tool_name in {
+                        "write_file",
+                        "edit_file",
+                        "apply_patch",
+                        "apply_patch_set",
+                        "run_command",
+                        "run_workflow",
+                    }:
+                        changed = await asyncio.to_thread(
+                            self._checkpoints.note_workspace_changes,
+                            session.cwd,
+                            session.active_checkpoint_id,
+                        )
+                        if changed:
+                            tool_result.changed_paths = [
+                                str(Path(session.cwd) / path) for path in changed
+                            ]
                     if tool_name == "evolve_skill" and str(tool_args.get("action", "")) in {
                         "draft",
                         "propose",
@@ -2176,6 +2268,7 @@ class GlmAcpAgent(acp.Agent):
                         "edit_file",
                         "apply_patch",
                         "apply_patch_set",
+                        "run_workflow",
                     }:
                         unverified_change_pending = True
                         successful_verification_observed = False
@@ -2532,6 +2625,134 @@ class GlmAcpAgent(acp.Agent):
             worker.cancel()
             await worker.aclose()
 
+    async def _worktree_worker(self, session: Session, arguments: dict[str, Any]) -> str:
+        """Run one bounded editing worker in a detached, locked Git worktree."""
+        task = str(arguments.get("task", "")).strip()
+        base_ref = str(arguments.get("base_ref", "HEAD")).strip() or "HEAD"
+        if not task or len(task) > 4000:
+            raise ToolError("Implementation worker task must be between 1 and 4,000 characters")
+        try:
+            state = await asyncio.to_thread(self._worktrees.create, session.cwd, base_ref)
+        except WorktreeError as error:
+            raise ToolError(str(error)) from error
+        worker_root = state["path"]
+        worker_sandbox = Sandbox(worker_root, os_sandbox_mode="required", os_sandbox_network=False)
+        model = (
+            session.model
+            if session.auxiliary_model == DEFAULT_AUXILIARY_MODEL
+            else session.auxiliary_model
+        )
+        base_url = API_ENDPOINTS.get(session.api_endpoint, {}).get(
+            "base_url", API_ENDPOINTS[DEFAULT_API_ENDPOINT]["base_url"]
+        )
+        client = GlmClient(model, thought_level="disabled", base_url=base_url)
+        allowed = {
+            "read_file",
+            "list_directory",
+            "search_files",
+            "grep",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "apply_patch_set",
+            "run_command",
+        }
+        worker_tools = [
+            definition
+            for definition in TOOL_DEFINITIONS
+            if definition["function"]["name"] in allowed
+        ]
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": build_system_prompt(worker_root, model, task)
+                + "\n\nYou are an opt-in implementation worker in an isolated detached "
+                "Git worktree. "
+                "Implement only the assigned task, obey scoped repository instructions, and "
+                "run narrow verification. Do not commit, merge, push, access other worktrees, "
+                "delegate, or use external tools. The primary agent will review your diff.",
+            },
+            {"role": "user", "content": task},
+        ]
+        client.begin_turn()
+        final = ""
+        try:
+            for _ in range(8):
+                result = await asyncio.wait_for(
+                    client.stream_completion(
+                        messages=messages,
+                        tools=worker_tools,
+                        on_reasoning=None,
+                        on_content=None,
+                        on_tool_call_started=None,
+                        max_output_tokens=8_000,
+                    ),
+                    timeout=180,
+                )
+                self._record_auxiliary_usage(session, result.usage)
+                assistant: dict[str, Any] = {"role": "assistant", "content": result.content or None}
+                if not result.tool_calls:
+                    final = result.content or "Worker completed without a report."
+                    break
+                assistant["tool_calls"] = [
+                    {
+                        "id": call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": call["function"]["name"],
+                            "arguments": json.dumps(call["function"]["arguments"]),
+                        },
+                    }
+                    for call in result.tool_calls
+                ]
+                messages.append(assistant)
+                for call in result.tool_calls[:8]:
+                    name = str(call["function"].get("name", ""))
+                    args = call["function"].get("arguments", {})
+                    try:
+                        if name not in allowed or not isinstance(args, dict):
+                            raise ToolError("Worker tool is outside the implementation allowlist")
+                        worker_paths = []
+                        for raw in self._tool_paths(name, args):
+                            try:
+                                worker_paths.append(str(worker_sandbox.resolve(raw)))
+                            except ToolError:
+                                worker_paths.append(raw)
+                        effect, reason = PolicyEngine(worker_root).evaluate(
+                            name, args, worker_paths
+                        )
+                        if effect == "deny":
+                            raise ToolError(f"Worker policy denied {name}: {reason}")
+                        value = await execute_tool(name, args, worker_sandbox)
+                        output = value.output
+                    except ToolError as error:
+                        output = f"Error: {error}"
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": self._guard_tool_output(name, output),
+                        }
+                    )
+            diff = await asyncio.to_thread(self._worktrees.diff, worker_root, state["base_ref"])
+            if not diff.strip():
+                await asyncio.to_thread(self._worktrees.remove_if_clean, state["repo"], worker_root)
+                return "Implementation worker produced no changes.\n\n" + final[:4000]
+            return (
+                f"Worker {state['id']} completed in preserved worktree {worker_root}. "
+                "No changes were merged. Review and apply this untrusted diff:\n\n"
+                + wrap_untrusted_output(diff, "worktree-worker-diff")
+                + "\n\nWorker report:\n"
+                + wrap_untrusted_output(final[:4000], "worktree-worker-report")
+            )[:MAX_TOOL_OUTPUT_CHARS]
+        except (asyncio.TimeoutError, WorktreeError) as error:
+            raise ToolError(
+                f"Implementation worker failed; worktree preserved at {worker_root}: {error}"
+            ) from error
+        finally:
+            client.cancel()
+            await client.aclose()
+
     # ------------------------------------------------------------------
     # Task plan / todo list
     # ------------------------------------------------------------------
@@ -2615,6 +2836,55 @@ class GlmAcpAgent(acp.Agent):
         The reason is sent back to the model as the tool result.
         """
         mode = session.permission_mode
+        destructive = tool_name in DESTRUCTIVE_TOOLS and not (
+            tool_name == "plugin_package" and str(tool_args.get("action", "")) in {"list", "verify"}
+        )
+        raw_paths = self._tool_paths(tool_name, tool_args)
+        resolved_paths: list[str] = []
+        for raw in raw_paths:
+            try:
+                resolved_paths.append(str(session.sandbox.resolve(raw)))
+            except ToolError:
+                resolved_paths.append(str(raw))
+        effect, policy_reason = PolicyEngine(session.cwd).evaluate(
+            tool_name, tool_args, resolved_paths
+        )
+        if tool_name == "run_workflow":
+            for step in tool_args.get("steps", [])[:12]:
+                if not isinstance(step, dict) or not isinstance(step.get("arguments"), dict):
+                    continue
+                nested_name = str(step.get("tool", ""))
+                nested_args = step["arguments"]
+                nested_paths = []
+                for raw in self._tool_paths(nested_name, nested_args):
+                    try:
+                        nested_paths.append(str(session.sandbox.resolve(raw)))
+                    except ToolError:
+                        nested_paths.append(raw)
+                nested_effect, nested_reason = PolicyEngine(session.cwd).evaluate(
+                    nested_name,
+                    nested_args,
+                    nested_paths,
+                )
+                if nested_effect == "deny":
+                    effect = "deny"
+                    policy_reason = (
+                        f"Workflow step {step.get('id', '?')} ({nested_name}): {nested_reason}"
+                    )
+                    break
+                if nested_effect == "ask" and effect != "deny":
+                    effect = "ask"
+                    policy_reason = (
+                        f"Workflow step {step.get('id', '?')} ({nested_name}) requires approval: "
+                        f"{nested_reason}"
+                    )
+        if effect == "deny":
+            msg = f"Policy denied '{tool_name}': {policy_reason}"
+            await self._send_message(session.id, f"\n\n🚫 {msg}\n")
+            return False, msg
+        force_ask = effect == "ask"
+        if effect == "ask" and mode != "read":
+            mode = "ask"
 
         # "bypass" — auto-approve everything
         if mode == "bypass":
@@ -2622,7 +2892,7 @@ class GlmAcpAgent(acp.Agent):
 
         # "read" — only read-only tools
         if mode == "read":
-            if tool_name in DESTRUCTIVE_TOOLS:
+            if destructive:
                 msg = (
                     f"Permission denied: '{tool_name}' is blocked because the "
                     f"session is in read-only mode. Ask the user to switch to "
@@ -2633,7 +2903,7 @@ class GlmAcpAgent(acp.Agent):
             return True, ""
 
         # "ask" — read-only tools auto-approved, destructive tools need approval
-        if tool_name not in DESTRUCTIVE_TOOLS:
+        if not destructive and not force_ask:
             return True, ""
 
         # Request permission via ACP request_permission
@@ -2744,6 +3014,18 @@ class GlmAcpAgent(acp.Agent):
                 name="subgoal",
                 description="Add, list, remove, or clear persistent acceptance criteria",
             ),
+            AvailableCommand(
+                name="checkpoint",
+                description="Create or list bounded workspace safety checkpoints",
+            ),
+            AvailableCommand(
+                name="rollback",
+                description="Conflict-aware rollback to the latest or selected checkpoint",
+            ),
+            AvailableCommand(
+                name="plugins",
+                description="List and verify installed hash-pinned declarative plugins",
+            ),
         ]
         update = update_available_commands(commands)
         await self._conn.session_update(session_id=session.id, update=update)
@@ -2778,6 +3060,70 @@ class GlmAcpAgent(acp.Agent):
             await self._send_plan(session)
             await self._save_session(session)
             return "📋 Task plan cleared."
+
+        elif command == "/checkpoint" or command.startswith("/checkpoint "):
+            argument = command.partition(" ")[2].strip()
+            if argument.lower() == "list":
+                checkpoints = await asyncio.to_thread(self._checkpoints.list, session.cwd)
+                return (
+                    "🛟 **Workspace Checkpoints**\n```json\n"
+                    + json.dumps(checkpoints, ensure_ascii=False, indent=2)[:8000]
+                    + "\n```"
+                )
+            try:
+                checkpoint = await asyncio.to_thread(
+                    self._checkpoints.create, session.cwd, argument or "manual"
+                )
+            except CheckpointError as error:
+                return f"❌ Checkpoint failed: {error}"
+            session.active_checkpoint_id = str(checkpoint["id"])
+            session.last_checkpoint_id = session.active_checkpoint_id
+            await self._save_session(session)
+            return (
+                f"🛟 Checkpoint `{checkpoint['id']}` captured "
+                f"{checkpoint['files']} files ({checkpoint['bytes']} bytes); "
+                f"excluded {checkpoint['excluded_sensitive_paths']} sensitive paths."
+            )
+
+        elif command == "/rollback" or command.startswith("/rollback "):
+            checkpoint_id = command.partition(" ")[2].strip() or session.last_checkpoint_id
+            if not checkpoint_id:
+                return "No checkpoint is available. Create one with `/checkpoint`."
+            permitted, reason = await self._check_permission(
+                session, f"rollback-{uuid4().hex[:12]}", "rollback", {"checkpoint": checkpoint_id}
+            )
+            if not permitted:
+                return reason
+            try:
+                result = await asyncio.to_thread(
+                    self._checkpoints.rollback, session.cwd, checkpoint_id
+                )
+            except CheckpointError as error:
+                return f"❌ Rollback failed: {error}"
+            if not result["rolled_back"]:
+                return (
+                    "⚠️ Rollback stopped because files changed outside the recorded agent "
+                    "writes:\n- " + "\n- ".join(result["conflicts"])
+                )
+            for relative in result["restored"]:
+                session.verification.mark_edit(str(Path(session.cwd) / relative))
+            session.active_checkpoint_id = ""
+            session.refresh_system_prompt()
+            await self._save_session(session)
+            return (
+                f"↩️ Rolled back checkpoint `{checkpoint_id}`; restored "
+                f"{len(result['restored'])} paths. Verification evidence is now stale."
+            )
+
+        elif command == "/plugins":
+            from .plugins import PluginRegistry
+
+            plugins = await asyncio.to_thread(PluginRegistry().list)
+            return (
+                "🧩 **Declarative Plugins**\n```json\n"
+                + json.dumps(plugins, ensure_ascii=False, indent=2)[:8000]
+                + "\n```"
+            )
 
         elif command == "/goal" or command.startswith("/goal "):
             argument = command.partition(" ")[2].strip()
@@ -2963,6 +3309,9 @@ class GlmAcpAgent(acp.Agent):
             return f"📄 Conversation exported to: `{export_path}`"
 
         elif command == "/status":
+            from .os_sandbox import sandbox_mode
+            from .plugins import PluginRegistry
+
             n_msgs = len(session.messages)
             curator = skill_curator_status(session.cwd)
             facts = detect_project_facts(session.cwd)
@@ -2998,6 +3347,11 @@ class GlmAcpAgent(acp.Agent):
                 f"- **Auxiliary model:** {session.auxiliary_model}\n"
                 f"- **Mixture of Agents:** {session.mixture_mode}\n"
                 f"- **Permissions:** {session.permission_mode}\n"
+                f"- **Isolated profile:** {active_profile()}\n"
+                f"- **OS sandbox mode:** {sandbox_mode()}\n"
+                f"- **Latest checkpoint:** {session.last_checkpoint_id or 'none'}\n"
+                f"- **Verified plugins:** "
+                f"{sum(bool(item.get('verified')) for item in PluginRegistry().list())}\n"
                 f"- **Project root:** {facts.root}\n"
                 f"- **Detected verification:** "
                 f"{'; '.join(facts.verify_commands) or 'none'}\n"
@@ -3048,7 +3402,10 @@ class GlmAcpAgent(acp.Agent):
             return "\n".join(lines)
 
         elif command == "/profile":
-            return f"\n👤 **Private User Profile**\n\n{read_user_profile()}"
+            return (
+                f"\n👤 **Isolated Profile:** `{active_profile()}`\n\n"
+                f"**Private preferences**\n\n{read_user_profile()}"
+            )
 
         elif command == "/curator":
             status = skill_curator_status(session.cwd)
@@ -3106,6 +3463,7 @@ class GlmAcpAgent(acp.Agent):
                 "/clear-plan, /clear-history, /diff, /export, /status, /memory, "
                 "/skills, /profile, /curator, /sessions"
                 ", /lineage, /goal, /subgoal"
+                ", /checkpoint, /rollback, /plugins"
             )
 
     # ------------------------------------------------------------------
@@ -3828,6 +4186,9 @@ class GlmAcpAgent(acp.Agent):
             "batch_read": "Reading repository context in batch",
             "semantic_code": "Navigating code semantically",
             "run_command": "Running command",
+            "run_workflow": "Running declarative workflow",
+            "plugin_package": "Managing verified plugin package",
+            "worktree_worker": "Running isolated implementation worker",
             "recall_memory": "Reading project memory",
             "store_memory": "Updating project memory",
             "recall_user_profile": "Reading user profile",

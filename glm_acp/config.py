@@ -267,6 +267,10 @@ DESTRUCTIVE_TOOLS = frozenset(
         "mcp_list_tools",
         "vision_analyze",
         "browser_ui",
+        "run_workflow",
+        "plugin_package",
+        "worktree_worker",
+        "rollback",
     }
 )
 
@@ -288,15 +292,17 @@ def persist_reasoning() -> bool:
 
 def config_dir() -> Path:
     """Return the per-user configuration directory without creating it."""
+    from .profiles import profile_path
+
     override = os.environ.get(CONFIG_DIR_ENV)
     if override:
-        return Path(override).expanduser()
+        return profile_path(Path(override).expanduser())
     if os.name == "nt" and os.environ.get("APPDATA"):
-        return Path(os.environ["APPDATA"]) / "glm-acp"
+        return profile_path(Path(os.environ["APPDATA"]) / "glm-acp")
     if sys_platform() == "darwin":
-        return Path.home() / "Library" / "Application Support" / "glm-acp"
+        return profile_path(Path.home() / "Library" / "Application Support" / "glm-acp")
     xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
-    return (
+    return profile_path(
         Path(xdg_config_home) / "glm-acp"
         if xdg_config_home
         else Path.home() / ".config" / "glm-acp"

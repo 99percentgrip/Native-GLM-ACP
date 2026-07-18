@@ -23,6 +23,12 @@ streaming, 1M context, and auto-continuation for long generations.
 - **Post-write diagnostics**: `diagnostics.py` — deterministic syntax checks and lazy optional LSP clients
 - **Lifecycle extensions**: `hooks.py` — user-owned, hash-pinned, workspace-scoped lifecycle commands
 - **Trajectory evidence**: `telemetry.py` — bounded metadata-only JSONL events with session hashing and secret/body exclusion
+- **Workspace checkpoints**: `checkpoints.py` — bounded secret-excluding baselines, exact agent hashes, and conflict-aware rollback
+- **Explicit references**: `references.py` — bounded workspace-contained `@file`, `@folder`, `@symbol`, and `@diff` expansion
+- **Declarative controls**: `policy.py` and `workflows.py` — ordered allow/ask/deny rules and static dependency graphs
+- **OS command isolation**: `os_sandbox.py` — optional Bubblewrap argv construction with required-mode fail closure
+- **Isolated extension state**: `profiles.py` and `plugins.py` — validated profile paths and hash-pinned data-only packages
+- **Implementation workers**: `worktrees.py` — detached locked worktree creation, diff handoff, and clean-only removal
 - **Loop guardrails**: `guardrails.py` — repeated failure and unchanged read-only result detection
 - **Untrusted-context defense**: `security.py` — promptware findings, stored-context blocking, and tool/MCP/recall delimiters
 - **Tools**: `tools.py` — file/shell operations sandboxed to workspace roots
@@ -285,6 +291,42 @@ Playwright MCP. It allowlists navigation, accessibility snapshots, console/netwo
 evidence, screenshots, ordinary interaction, waits, and close; arbitrary browser
 JavaScript evaluation is absent and the MCP child receives no inherited credentials.
 
+Automatic workspace checkpoints are created once per mutating user turn before
+the first edit or command. They are bounded to 20,000 files/250 MiB, exclude
+common credential, SSH, private-key, and `.env` paths, and record current hashes
+after each successful mutation. `/rollback` restores only recorded paths whose
+current hash still equals the exact agent-produced hash; any later conflict
+aborts the entire rollback before writes.
+
+Explicit `@file:`, `@folder:`, `@symbol:`, and `@diff` prompt references are
+limited to 12 references and 48,000 aggregate characters. Paths remain inside
+workspace roots, common secret files are rejected/omitted, folder expansion is
+file-bounded, and all expanded content is untrusted model data.
+
+`.glm-acp/policy.json` version 1 supplies at most 100 ordered allow/ask/deny
+rules over tool globs, path globs, and bounded safe command regular expressions.
+Invalid policy fails closed, policy `allow` never bypasses the session permission
+mode, Read Only cannot be overridden, and every nested workflow step is evaluated.
+`run_workflow` accepts a static acyclic graph of at
+most 12 existing allowlisted tools, executes in dependency order, and stops on
+the first command failure; it cannot generate steps or run orchestration code.
+
+Main-session OS command isolation is opt-in through `GLM_ACP_OS_SANDBOX`.
+Bubblewrap mounts system runtime paths read-only, declared workspace roots
+writable, a private temporary home, and optionally an unshared network; required
+mode rejects execution without a backend. Worktree implementation workers
+always require OS isolation for commands, use detached locked worktrees, return
+bounded untrusted diffs, run without network access, never merge, and never
+force-remove dirty state.
+
+`GLM_ACP_PROFILE` accepts a validated 1-32 character identifier. `default`
+preserves legacy paths; named profiles isolate credentials, sessions, telemetry,
+hooks, MCP configuration, cron state, plugins, checkpoints, worktrees, and
+private user memory. Plugin packages require schema 1, explicit permission
+scopes, exact SHA-256 for every file plus an installed manifest pin, a 2 MiB/32-file
+bound, and data-only file types; executable package content is rejected and prompt
+fragments are scanned.
+
 Persistent `/goal` state and `/subgoal` acceptance criteria survive session
 reloads and forks. A strict-JSON auxiliary judge evaluates the response, changed
 paths, and fresh verification evidence after each candidate completion. It may
@@ -347,7 +389,8 @@ removes index rows when a session is deleted.
 ### Session persistence & history replay
 
 Conversation state (messages, model, mode, title) is persisted to disk
-(`~/.glm-acp/sessions/<id>.json`) after every prompt turn and config change.
+(`~/.glm-acp/sessions/<id>.json` for the default profile, or its named profile
+subdirectory) after every prompt turn and config change.
 On `session/load` and `session/resume`, the agent rebuilds the `Session` from
 disk via `Session.from_dict`.
 
@@ -363,7 +406,7 @@ Forks persist `parent_session_id` plus `branch_root_id`; `/lineage` exposes dire
 children and identifies the parent session as the rollback path.
 Instruction targets, verification ledger, persistent goal/subgoals, judge
 budget, and Mixture-of-Agents selection are serialized with the session; read
-fingerprints and reference-response caches remain runtime-only.
+fingerprints, active checkpoint state, and reference-response caches remain runtime-only.
 
 **Critical:** The ACP `LoadSessionResponse` and `ResumeSessionResponse` only
 carry `modes`, `config_options`, and `models` — they do **not** include message

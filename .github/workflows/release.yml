@@ -117,7 +117,7 @@ jobs:
             id: "native-glm-acp",
             name: "Native GLM ACP",
             version: $version,
-            description: "Native GLM ACP with 1M context, semantic LSP navigation, transactional multi-file patches, cache-aware prompts, redacted telemetry, and no Python runtime.",
+            description: "Native GLM ACP with 1M context, safe checkpoints, bounded references, policy and sandbox controls, isolated workers, and no Python runtime.",
             repository: $repository,
             website: $repository,
             authors: ["Aleksejs Kozlitins"],

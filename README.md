@@ -35,6 +35,13 @@ subprocess inside Zed's Agent Panel — no Zed recompilation required.
 - **Redacted trajectory telemetry** — metadata-only events support tuning without prompts, outputs, commands, reasoning, credentials, or raw session IDs
 - **Playwright UI testing** — permission-gated isolated browser automation returns accessibility, console, network, interaction, and screenshot evidence
 - **Lifecycle hooks** — user-owned hash-pinned hooks can block tools, observe results, or request bounded pre-verification follow-up
+- **Conflict-aware checkpoints** — automatic pre-mutation snapshots and `/rollback` restore only exact agent-produced hashes
+- **Explicit context references** — bounded `@file:`, `@folder:`, `@symbol:`, and `@diff` expansion is workspace-contained and secret-aware
+- **Declarative policy and workflows** — ordered allow/ask/deny rules and static DAGs add control without arbitrary orchestration code
+- **Optional OS sandboxing** — Bubblewrap isolates command filesystems on Linux; required mode fails closed when unavailable
+- **Worktree implementation workers** — opt-in editing workers operate in detached locked worktrees and return unmerged diffs
+- **Isolated profiles** — named profiles separate credentials, sessions, telemetry, hooks, cron jobs, plugins, and user memory
+- **Hash-pinned plugin packages** — permission-scoped data-only packages reject executable content and hash drift
 
 ### API Resilience
 
@@ -75,18 +82,70 @@ Type these in the chat input:
 | `/status` | Show model, project facts, goal, fresh verification evidence, context usage, and cost |
 | `/memory` | Show approved durable project facts |
 | `/skills` | List skills learned from verified project work |
-| `/profile` | Show approved private preferences shared across projects |
+| `/profile` | Show the active isolated profile and its approved private preferences |
 | `/curator` | Show skill usage, stale/archive candidates, and lifecycle state |
 | `/sessions [words]` | Browse or search persisted conversations |
 | `/lineage` | Show the current session's parent, branch root, and direct children |
 | `/goal [objective\|pause\|resume\|clear]` | Set, inspect, pause, resume, or clear a persistent coding goal |
 | `/subgoal [criterion\|remove N\|clear]` | Manage persistent acceptance criteria for the active goal |
+| `/checkpoint [label\|list]` | Create or list a bounded secret-safe workspace checkpoint |
+| `/rollback [checkpoint-id]` | Restore recorded agent changes unless a later conflicting edit is detected |
+| `/plugins` | List installed declarative plugins and their integrity state |
 
 ### Task Plans
 
 For any task with 3+ steps, the model automatically creates a live todo list
 visible as a checklist in the panel. Each task shows pending / in-progress /
 completed status with priority indicators.
+
+### Safe orchestration, rollback, and isolation
+
+Before the first workspace-mutating tool in each user turn, Native GLM ACP
+captures a bounded checkpoint outside the repository. Common credential,
+private-key, SSH, and `.env` files are never copied. After each mutation, the
+checkpoint records the exact resulting hashes. `/rollback` restores only those
+paths; if any current hash differs, rollback stops without overwriting the later
+change. Use `/checkpoint list` to inspect recent checkpoints.
+
+Prompts may explicitly include `@file:path`, `@folder:path`, `@symbol:name`, or
+`@diff`. Expansion stays inside workspace roots, has file/character limits,
+omits common secret files, and enters model context inside an untrusted-data
+boundary.
+
+Repositories may define `.glm-acp/policy.json` with ordered rules:
+
+```json
+{
+  "version": 1,
+  "rules": [
+    {"effect": "deny", "tools": ["run_command"], "command_regex": "rm\\s", "reason": "No shell removal"},
+    {"effect": "ask", "tools": ["run_workflow", "worktree_worker"]}
+  ]
+}
+```
+
+Invalid policies fail closed. Policy `allow` never bypasses the session's
+permission mode, Read Only remains absolute, and workflow rules are also
+evaluated against every nested step. `run_workflow` accepts at most 12
+static dependency-ordered steps from the existing tool allowlist; it cannot
+generate steps or execute orchestration code.
+
+Command OS isolation is opt-in with `GLM_ACP_OS_SANDBOX=auto` or fail-closed
+with `GLM_ACP_OS_SANDBOX=required`. On Linux, Bubblewrap exposes system runtime
+files read-only, mounts only declared workspace roots writable, hides the user
+home, and can disable networking with `GLM_ACP_SANDBOX_NETWORK=0`. Unsupported
+platforms retain the existing workspace path sandbox in `auto` mode and reject
+commands in `required` mode. Worktree implementation workers always request
+required OS isolation with networking disabled for their command tools, preserve
+dirty worktrees, and never merge automatically.
+
+Set `GLM_ACP_PROFILE=client-a` before launch to isolate user state under a
+validated named profile. `default` preserves all legacy paths. Plugin packages
+are installed from a workspace `plugin.json` through the permission-gated
+`plugin_package` tool. Manifests declare `schema: 1`, an id, permission scopes,
+and SHA-256 for every data file; only JSON, Markdown, TOML, and YAML are allowed.
+The installed manifest receives its own integrity pin. Executable plugin code is
+intentionally unsupported.
 
 ### Scheduled Automation
 
@@ -274,10 +333,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v1.1.0` before running the Unix
-installer, or pass `-Version v1.1.0` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v1.2.0` before running the Unix
+installer, or pass `-Version v1.2.0` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v1.1.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v1.1.0).
+[v1.2.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v1.2.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -599,7 +658,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-1.1.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-1.2.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

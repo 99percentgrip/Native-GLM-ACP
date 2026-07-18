@@ -56,7 +56,16 @@ def _now_iso() -> str:
 class SessionStore:
     """Save / load serialized session state to individual JSON files."""
 
-    def __init__(self, base_dir: Path = SESSION_DIR) -> None:
+    def __init__(self, base_dir: Path | None = None) -> None:
+        if base_dir is None:
+            from .profiles import active_profile
+
+            profile = active_profile()
+            base_dir = (
+                SESSION_DIR
+                if profile == "default"
+                else SESSION_DIR.parent / "profiles" / profile / "sessions"
+            )
         self._base_dir = base_dir
 
     def _path(self, session_id: str) -> Path:

@@ -808,6 +808,83 @@ TOOL_DEFINITIONS.extend(
     ]
 )
 
+TOOL_DEFINITIONS.extend(
+    [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_workflow",
+                "description": (
+                    "Run a bounded declarative dependency graph of ordinary tools. "
+                    "Stops on the first failed step; no dynamic code or generated steps."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "steps": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 12,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "tool": {"type": "string"},
+                                    "arguments": {"type": "object"},
+                                    "needs": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "required": ["id", "tool", "arguments"],
+                            },
+                        }
+                    },
+                    "required": ["steps"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "plugin_package",
+                "description": (
+                    "List, verify, or install a local hash-pinned data-only plugin package. "
+                    "Executable plugin files are rejected."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "verify", "install"]},
+                        "id": {"type": "string"},
+                        "manifest_path": {"type": "string"},
+                    },
+                    "required": ["action"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "worktree_worker",
+                "description": (
+                    "Start one opt-in implementation worker in a detached Git worktree. "
+                    "The worker returns a diff and never merges into the primary workspace."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "task": {"type": "string", "maxLength": 4000},
+                        "base_ref": {"type": "string", "maxLength": 200},
+                    },
+                    "required": ["task"],
+                },
+            },
+        },
+    ]
+)
+
 TOOL_KINDS: dict[str, str] = {
     "cronjob": "edit",
     "read_file": "read",
@@ -820,6 +897,9 @@ TOOL_KINDS: dict[str, str] = {
     "grep": "search",
     "batch_read": "search",
     "semantic_code": "search",
+    "run_workflow": "execute",
+    "plugin_package": "edit",
+    "worktree_worker": "execute",
     "run_command": "execute",
     "update_plan": "other",
     "recall_memory": "read",
@@ -885,8 +965,16 @@ class ToolResult:
 class Sandbox:
     """Validates that paths stay within allowed workspace roots."""
 
-    def __init__(self, cwd: str, additional_dirs: list[str] | None = None):
+    def __init__(
+        self,
+        cwd: str,
+        additional_dirs: list[str] | None = None,
+        os_sandbox_mode: str | None = None,
+        os_sandbox_network: bool | None = None,
+    ):
         self.roots = [Path(cwd).resolve()]
+        self.os_sandbox_mode = os_sandbox_mode
+        self.os_sandbox_network = os_sandbox_network
         if additional_dirs:
             self.roots += [Path(d).resolve() for d in additional_dirs]
 
@@ -933,6 +1021,10 @@ async def execute_tool(
             return await _grep(arguments, sandbox)
         elif name == "batch_read":
             return await _batch_read(arguments, sandbox)
+        elif name == "run_workflow":
+            return await _run_workflow(arguments, sandbox, on_output=on_output)
+        elif name == "plugin_package":
+            return await _plugin_package(arguments, sandbox)
         elif name == "run_command":
             return await _run_command(arguments, sandbox, on_output=on_output)
         elif name == "recall_memory":
@@ -1456,6 +1548,63 @@ async def _batch_read(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     return ToolResult(output=_bounded_output(json.dumps({"results": results}, ensure_ascii=False)))
 
 
+async def _run_workflow(
+    args: dict[str, Any], sandbox: Sandbox, on_output: Any = None
+) -> ToolResult:
+    """Execute a static, validated DAG sequentially and stop on failure."""
+    from .workflows import ordered_steps
+
+    try:
+        steps = ordered_steps(args.get("steps"))
+    except ValueError as error:
+        raise ToolError(str(error)) from error
+    results: list[dict[str, Any]] = []
+    changed_paths: list[str] = []
+    for step in steps:
+        result = await execute_tool(step["tool"], step["arguments"], sandbox, on_output=on_output)
+        results.append(
+            {
+                "id": step["id"],
+                "tool": step["tool"],
+                "exit_code": result.exit_code,
+                "output": result.output[:8000],
+            }
+        )
+        changed_paths.extend(
+            result.changed_paths or ([result.file_path] if result.file_path else [])
+        )
+        if result.exit_code not in (None, 0):
+            break
+    return ToolResult(
+        output=_bounded_output(json.dumps({"steps": results}, ensure_ascii=False)),
+        changed_paths=list(dict.fromkeys(changed_paths)),
+        exit_code=next(
+            (int(item["exit_code"]) for item in results if item["exit_code"] not in (None, 0)),
+            0,
+        ),
+    )
+
+
+async def _plugin_package(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
+    from .plugins import PluginError, PluginRegistry
+
+    registry = PluginRegistry()
+    action = str(args.get("action", ""))
+    try:
+        if action == "list":
+            value = registry.list()
+        elif action == "verify":
+            value = registry.verify(str(args.get("id", "")))
+        elif action == "install":
+            path = sandbox.resolve(str(args.get("manifest_path", "")))
+            value = await asyncio.to_thread(registry.install, path)
+        else:
+            raise ToolError("Plugin action must be list, verify, or install")
+    except PluginError as error:
+        raise ToolError(str(error)) from error
+    return ToolResult(output=json.dumps(value, ensure_ascii=False, indent=2))
+
+
 async def _list_directory(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     return await asyncio.to_thread(_list_directory_sync, args, sandbox)
 
@@ -1573,14 +1722,37 @@ async def _run_command(args: dict[str, Any], sandbox: Sandbox, on_output: Any = 
         process_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         process_kwargs["start_new_session"] = True
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        cwd=str(sandbox.roots[0]),
-        env=_command_environment(),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        **process_kwargs,
-    )
+    from .os_sandbox import command_prefix
+
+    try:
+        prefix, backend = command_prefix(
+            sandbox.roots,
+            sandbox.os_sandbox_mode,
+            sandbox.os_sandbox_network,
+        )
+    except RuntimeError as error:
+        raise ToolError(str(error)) from error
+    if prefix and os.name != "nt":
+        proc = await asyncio.create_subprocess_exec(
+            *prefix,
+            "/bin/sh",
+            "-lc",
+            command,
+            cwd=str(sandbox.roots[0]),
+            env=_command_environment(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **process_kwargs,
+        )
+    else:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=str(sandbox.roots[0]),
+            env=_command_environment(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **process_kwargs,
+        )
 
     async def collect(stream: asyncio.StreamReader | None, label: str) -> tuple[bytes, int]:
         if stream is None:
@@ -1627,7 +1799,7 @@ async def _run_command(args: dict[str, Any], sandbox: Sandbox, on_output: Any = 
     stderr, _ = stderr_info
     stdout_text = stdout.decode(errors="replace").strip()
     stderr_text = stderr.decode(errors="replace").strip()
-    sections = [f"Exit code: {proc.returncode}"]
+    sections = [f"Exit code: {proc.returncode}", f"Sandbox: {backend}"]
     if stdout_text:
         sections.append(f"Stdout:\n{stdout_text}")
     if stderr_text:
