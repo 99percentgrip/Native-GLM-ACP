@@ -1,6 +1,6 @@
 # glm_acp
 
-ACP agent server for Z.ai GLM models.
+Open-source ACP-native coding agent runtime for Z.ai GLM models.
 
 ## Purpose
 
@@ -20,6 +20,7 @@ streaming, 1M context, and auto-continuation for long generations.
 - **Project knowledge and learning**: `memory.py` — scoped memory, relevant skills/bundles, telemetry, curation, and evaluated candidates
 - **Project discovery**: `project_context.py` — repository roots, progressive instruction files, manifests, package managers, git state, and canonical verification commands
 - **Verification evidence**: `verification.py` — persistent edit generations and bounded canonical command outcomes
+- **Awareness and completion evidence**: `awareness.py` — bounded typed epistemic records, harness-issued evidence references, scope-aware invalidation, and completion certificates
 - **Post-write diagnostics**: `diagnostics.py` — deterministic syntax checks and lazy optional LSP clients
 - **Lifecycle extensions**: `hooks.py` — user-owned, hash-pinned, workspace-scoped lifecycle commands
 - **Trajectory evidence**: `telemetry.py` and `observability.py` — bounded metadata-only events plus local aggregate quality, latency, cache, tool, and safety reporting
@@ -125,6 +126,15 @@ previous compaction produces a warning.
 - Findings are defense in depth and never replace sandboxing, secret removal,
   destructive-tool permissions, or operator review.
 - Learning rejects credential-shaped and prompt-injection content before writing.
+
+### Epistemic awareness and completion
+
+- `EpistemicLedger` persists at most 100 typed records and 200 metadata-only evidence events; it never stores tool bodies, prompts, reasoning, commands, credentials, or raw external content.
+- Model records may cite only harness-issued evidence IDs and valid current goal/criterion IDs. Secret-shaped or promptware-shaped summaries are rejected.
+- Reads, searches, edits, diagnostics, verification, and the current user request create concise evidence events. Relevant later edits make scope-overlapping support stale; user-request evidence is edit-independent.
+- `/awareness` renders active observations, assumptions, hypotheses, contradictions, unknowns, capability limits, stale state, fresh evidence IDs, completion coverage, and the next evidence need.
+- Persistent goals reach the bounded auxiliary judge only when every goal/criterion has a fresh evidence-backed observation, no contradiction remains active, and changed files have fresh verification.
+- Ordinary turns emit informational completion-certificate metrics without adding a new hard completion loop.
 
 ### Auxiliary routing and delegation
 

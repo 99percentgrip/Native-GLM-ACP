@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repository="99percentgrip/Native-GLM-5.2-Provider"
+repository="99percentgrip/Native-GLM-ACP"
 release_base="${GLM_ACP_RELEASE_BASE_URL:-https://github.com/$repository/releases}"
 version="${GLM_ACP_VERSION:-latest}"
 install_dir="${GLM_ACP_INSTALL_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"

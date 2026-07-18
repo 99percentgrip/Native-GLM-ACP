@@ -1,11 +1,10 @@
 # Native GLM ACP
 
-[![CI](https://github.com/99percentgrip/Native-GLM-5.2-Provider/actions/workflows/ci.yml/badge.svg)](https://github.com/99percentgrip/Native-GLM-5.2-Provider/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/99percentgrip/Native-GLM-5.2-Provider)](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases)
+[![CI](https://github.com/99percentgrip/Native-GLM-ACP/actions/workflows/ci.yml/badge.svg)](https://github.com/99percentgrip/Native-GLM-ACP/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/99percentgrip/Native-GLM-ACP)](https://github.com/99percentgrip/Native-GLM-ACP/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A native Agent Client Protocol (ACP) server for Z.ai GLM models. Runs as a
-subprocess inside Zed's Agent Panel — no Zed recompilation required.
+Native GLM ACP — an open-source ACP-native coding agent runtime for Z.ai GLM models.
 
 ## Features
 
@@ -19,6 +18,7 @@ subprocess inside Zed's Agent Panel — no Zed recompilation required.
 - **Context-pressure diagnostics** — one-time 60%/75%/85% warnings explain when compaction approaches
 - **Persistent session lineage** — conversations survive restarts; forks retain parent/root rollback paths
 - **Persistent goals and criteria** — `/goal` plus `/subgoal` continue across restarts and use a bounded auxiliary completion judge
+- **Inspectable awareness** — typed evidence-backed observations, assumptions, hypotheses, contradictions, unknowns, and capability limits with edit-aware freshness and completion certificates
 - **Multi-root workspaces** — full support for additional workspace directories
 - **Progressive repository rules** — scoped AGENTS, Claude, Hermes, and Cursor instructions load before affected edits
 - **Evidence-led verification** — canonical project checks are recorded with scope and invalidated by later edits
@@ -94,6 +94,7 @@ Type these in the chat input:
 | `/checkpoint [label\|list]` | Create or list a bounded secret-safe workspace checkpoint |
 | `/rollback [checkpoint-id]` | Restore recorded agent changes unless a later conflicting edit is detected |
 | `/plugins` | List installed declarative plugins and their integrity state |
+| `/awareness` | Show knowledge, uncertainty, stale evidence, capability limits, next evidence, and completion coverage |
 | `/observability [json]` | Show the local metadata-only quality, efficiency, and safety dashboard |
 
 ### Task Plans
@@ -188,10 +189,20 @@ timeout; promoted cases are written to
 
 `glm-acp observe` (or `/observability`) summarizes the bounded metadata-only
 trajectory locally. `glm-acp observe --json` provides machine-readable metrics.
+It includes completion-certificate coverage and unsupported completions prevented.
 For offline resilience checks, `glm-acp harden --iterations 250 --seed 5202`
 fuzzes manifest/reference/policy inputs, corrupts telemetry framing, and injects
 a post-apply worker fault to prove transactional rollback. It makes no model or
 network request.
+
+The awareness ledger stores bounded summaries and harness-issued evidence IDs,
+not prompts, tool bodies, external page contents, or private reasoning. Reads,
+searches, edits, diagnostics, verification, and the current request issue metadata
+evidence; later overlapping edits invalidate edit-sensitive support. `/awareness`
+makes observations, uncertainty, contradictions, capability limits, freshness, and
+the next useful evidence visible. For persistent goals, every goal and `/subgoal`
+criterion needs a fresh evidence-backed observation, active contradictions must be
+resolved, and edited files need fresh verification before the completion judge runs.
 
 ### Scheduled Automation
 
@@ -360,7 +371,7 @@ servers reuse the existing API key without printing or persisting it.
 Linux and macOS:
 
 ```bash
-curl -fsSL https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/99percentgrip/Native-GLM-ACP/releases/latest/download/install.sh | sh
 glm-acp --setup
 ```
 
@@ -368,7 +379,7 @@ Windows PowerShell:
 
 ```powershell
 $installer = Join-Path $env:TEMP "install-glm-acp.ps1"
-Invoke-WebRequest https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/latest/download/install.ps1 -OutFile $installer
+Invoke-WebRequest https://github.com/99percentgrip/Native-GLM-ACP/releases/latest/download/install.ps1 -OutFile $installer
 & $installer
 Remove-Item $installer
 glm-acp --setup
@@ -379,10 +390,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v1.3.0` before running the Unix
-installer, or pass `-Version v1.3.0` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v1.4.0` before running the Unix
+installer, or pass `-Version v1.4.0` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v1.3.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v1.3.0).
+[v1.4.0](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v1.4.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -508,6 +519,7 @@ glm_acp/
 ├── cron_scheduler.py # Isolated execution, delivery, ticking, and daemon
 ├── launcher.py      # Frozen-executable entry point
 ├── agent.py         # ACP agent: session lifecycle, prompt loop, slash commands
+├── awareness.py     # Typed epistemic ledger and completion certificates
 ├── config.py        # Model registry, API endpoints, constants
 ├── glm_client.py    # Streaming Z.ai API client (SSE, retry, reasoning, tools)
 ├── mcp.py           # Z.ai and user-configured MCP transports
@@ -709,7 +721,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-1.3.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-1.4.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

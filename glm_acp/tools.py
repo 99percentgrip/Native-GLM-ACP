@@ -400,6 +400,62 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "update_awareness",
+            "description": (
+                "Maintain bounded decision-relevant epistemic state. Upsert observations, "
+                "assumptions, hypotheses, contradictions, unknowns, or capability limits using "
+                "only fresh evidence IDs exposed in the managed awareness context. Observations "
+                "may support completion IDs (`task`, `goal`, or `criterion:N`). Resolve or "
+                "invalidate records when evidence changes; never store reasoning or bodies."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["upsert", "resolve", "invalidate"],
+                    },
+                    "record_id": {"type": "string", "maxLength": 40},
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "observation",
+                            "assumption",
+                            "hypothesis",
+                            "contradiction",
+                            "unknown",
+                            "capability",
+                        ],
+                    },
+                    "summary": {"type": "string", "maxLength": 500},
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                    },
+                    "evidence_ids": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string", "maxLength": 40},
+                    },
+                    "supports": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string", "maxLength": 80},
+                    },
+                    "scopes": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string", "maxLength": 1000},
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "recall_memory",
             "description": "Read opt-in durable knowledge recorded for this project.",
             "parameters": {"type": "object", "properties": {}},
@@ -953,6 +1009,7 @@ TOOL_KINDS: dict[str, str] = {
     "failure_corpus": "edit",
     "run_command": "execute",
     "update_plan": "other",
+    "update_awareness": "other",
     "recall_memory": "read",
     "store_memory": "edit",
     "recall_user_profile": "read",

@@ -117,7 +117,7 @@ jobs:
             id: "native-glm-acp",
             name: "Native GLM ACP",
             version: $version,
-            description: "Native GLM ACP with 1M context, safe checkpoints, bounded references, policy and sandbox controls, isolated workers, and no Python runtime.",
+            description: "Native GLM ACP — an open-source ACP-native coding agent runtime for Z.ai GLM models.",
             repository: $repository,
             website: $repository,
             authors: ["Aleksejs Kozlitins"],

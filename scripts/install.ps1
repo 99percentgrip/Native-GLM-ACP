@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$repository = "99percentgrip/Native-GLM-5.2-Provider"
+$repository = "99percentgrip/Native-GLM-ACP"
 $releaseBase = if ($env:GLM_ACP_RELEASE_BASE_URL) { $env:GLM_ACP_RELEASE_BASE_URL.TrimEnd("/") } else { "https://github.com/$repository/releases" }
 
 $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()

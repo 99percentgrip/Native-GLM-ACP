@@ -55,6 +55,7 @@ def observability_snapshot(
     tools = [event for event in events if event.get("event") == "tool_call"]
     llm = [event for event in events if event.get("event") == "llm_call"]
     turns = [event for event in events if event.get("event") == "turn_complete"]
+    certificates = [event for event in events if event.get("event") == "completion_certificate"]
     durations = [int(event.get("duration_ms", 0) or 0) for event in tools]
     llm_durations = [int(event.get("duration_ms", 0) or 0) for event in llm]
     tool_counts = Counter(str(event.get("tool", "unknown")) for event in tools)
@@ -77,6 +78,24 @@ def observability_snapshot(
             "completed": len(turns),
             "freshly_verified": sum(bool(event.get("fresh_verification")) for event in turns),
             "changed_files": sum(int(event.get("changed_files", 0) or 0) for event in turns),
+        },
+        "awareness": {
+            "certificates": len(certificates),
+            "complete": sum(bool(event.get("complete")) for event in certificates),
+            "prevented_false_completion": sum(
+                bool(event.get("prevented")) for event in certificates
+            ),
+            "mean_evidence_coverage": round(
+                sum(float(event.get("coverage", 0.0) or 0.0) for event in certificates)
+                / max(len(certificates), 1),
+                4,
+            ),
+            "active_contradictions": sum(
+                int(event.get("contradictions", 0) or 0) for event in certificates
+            ),
+            "stale_evidence": sum(
+                int(event.get("stale_evidence", 0) or 0) for event in certificates
+            ),
         },
         "llm": {
             "calls": len(llm),
@@ -119,6 +138,7 @@ def render_observability(snapshot: dict[str, Any]) -> str:
     llm = snapshot["llm"]
     turns = snapshot["turns"]
     safety = snapshot["safety"]
+    awareness = snapshot["awareness"]
     by_tool = (
         "\n".join(
             f"- `{item['tool']}`: {item['calls']} calls, {item['failures']} failures"
@@ -139,5 +159,8 @@ def render_observability(snapshot: dict[str, Any]) -> str:
         f"p95 {tools['latency_ms_p95']} ms\n"
         f"- Safety: {safety['rollbacks']} rollbacks ({safety['rollback_conflicts']} conflicts) · "
         f"{safety['worker_promotions']} worker promotions\n\n"
+        f"- Awareness: {awareness['complete']}/{awareness['certificates']} certificates complete · "
+        f"{awareness['mean_evidence_coverage']:.1%} mean evidence coverage · "
+        f"{awareness['prevented_false_completion']} unsupported completions prevented\n\n"
         "**Most-used tools**\n" + by_tool
     )

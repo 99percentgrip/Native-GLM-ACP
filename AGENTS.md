@@ -86,12 +86,13 @@ When the user requests a durable behavior change, record it here or in the relev
 - Agent learning is inspectable, permission-gated, secret-safe, and reversible: facts/skills stay project-local, while explicitly approved user preferences use private cross-project storage.
 - Advanced learning remains evidence-gated: failed traces may produce drafts, but candidates require higher held-out pass rate with no per-case, median-latency, or token-cost regression and explicit promotion; delegation is read-only, depth-one, shared-budgeted, and permission-gated.
 - Coding reliability prioritizes progressively scoped repository instructions, edit-fresh verification evidence, persistent judged goals and acceptance criteria, post-write syntax/semantic diagnostics, unchanged-read deduplication, opt-in reference-model aggregation, and result-aware loop stops.
+- Awareness remains bounded and inspectable: typed epistemic records cite only harness-issued metadata evidence; relevant edits invalidate support; active contradictions and unsupported criteria block persistent-goal completion before the auxiliary judge; no chain-of-thought is stored.
 - Advanced execution remains declarative and fail-closed: checkpoints are conflict-aware and secret-safe; context references are bounded and language-ranked; policy rules inspect nested workflow steps; worker promotion is verification- and digest-gated with transactional rollback; profiles isolate user state; plugin packages are permission-scoped, data-only, hash-pinned, and optionally require trusted Ed25519 publishers.
 - Quality evidence remains private and reproducible: failure drafts contain metadata only until explicitly promoted into outcome-based cases; local observability never stores bodies or raw identities; fuzzing and fault injection run offline and deterministically.
 
 ## Project Purpose
 
-This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM models. It is a standalone Python package that Zed (or any ACP-compatible editor) launches as a subprocess over stdio. It wraps the Z.ai GLM Coding Plan API directly — not the generic openai_compatible wrapper — to unlock GLM's 1M context window, live reasoning traces, and long-running generation without stalls.
+Native GLM ACP is an open-source ACP-native coding agent runtime for Z.ai GLM models. It is a standalone Python package that Zed (or any ACP-compatible editor) launches as a subprocess over stdio. It wraps the Z.ai GLM Coding Plan API directly — not the generic openai_compatible wrapper — to unlock GLM's 1M context window, live reasoning traces, and long-running generation without stalls.
 
 - Language: Python 3.10+
 - Transport: ACP over stdio (JSON-RPC 2.0)
@@ -101,8 +102,8 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 
 ## Current Project Status
 
-- Package and ACP implementation version is `1.3.0` from `glm_acp.__version__`.
-- GitHub release `v1.3.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
+- Package and ACP implementation version is `1.4.0` from `glm_acp.__version__`.
+- GitHub release `v1.4.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
 - ACP Registry publication is tracked in `agentclientprotocol/registry#439` and remains pending until Registry maintainers merge it.
 - Source installs, the `glm-acp` console script, module execution, and frozen binaries share `cli.main()`.
 - Public frozen binaries support one-command removal of installer-owned commands, PATH markers, and matching custom Zed configuration with an automatic settings backup.
@@ -119,6 +120,7 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 - ACP forks persist parent/root lineage, while relevant skill metadata, bundles, and benchmark-gated candidate promotion extend learning without automatic replacement.
 - Project facts and canonical checks are auto-detected; edit-fresh verification evidence persists, and post-write Python/JSON/TOML syntax plus optional Python/TypeScript/Go/Rust LSP diagnostics feed the acting model.
 - Persistent goals and subgoal acceptance criteria use a bounded auxiliary completion judge. Opt-in Mixture-of-Agents runs cached parallel reference reviews while the primary GLM remains the aggregator and sole actor.
+- A typed epistemic ledger tracks observations, assumptions, hypotheses, contradictions, unknowns, and capability limits with provenance and scope-aware freshness. `/awareness` shows the state and completion certificate; metadata-only observability reports evidence coverage and prevented unsupported completions.
 - Repeated identical tool batches, repeated failures, and unchanged read-only results are interrupted before the 50-iteration ceiling; unchanged reads are deduplicated, malformed JSON arguments receive corrective feedback, and shell tools do not inherit common credential environment variables.
 - Installed language servers provide read-only semantic navigation, transactional hash-pinned multi-file patches commit all-or-nothing, and bounded batch reads reduce tool round trips without arbitrary code execution.
 - Stable managed-prompt prefixes expose cache-hit ratios; metadata-only redacted trajectories and hash-pinned lifecycle hooks add evidence and policy without storing prompts, outputs, commands, reasoning, credentials, or raw session IDs.
@@ -156,7 +158,7 @@ Verify the install:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: editable glm_acp metadata and glm_acp-1.3.0.dist-info
+# expect: editable glm_acp metadata and glm_acp-1.4.0.dist-info
 ```
 
 ## Verification

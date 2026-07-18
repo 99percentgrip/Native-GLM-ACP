@@ -184,7 +184,10 @@ async def test_goal_and_subgoals_persist_and_judge_continue(tmp_path: Path):
     continuation = await agent._goal_continuation(session, "Implemented")
     restored = Session.from_dict(session.to_dict(), "restored")
 
-    assert "tests missing" in continuation
+    assert "completion certificate is incomplete" in continuation
+    client.complete_auxiliary.assert_not_awaited()
+    assert session.awareness.last_certificate is not None
+    assert session.awareness.last_certificate.complete is False
     assert restored.goal == "Fix cleanup"
     assert restored.subgoals == ["Tests pass"]
     await agent.aclose()

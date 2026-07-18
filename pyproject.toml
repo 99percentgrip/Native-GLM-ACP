@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "glm-acp"
 dynamic = ["version"]
-description = "Native ACP agent server for Z.ai GLM models, optimized for Zed"
+description = "Native GLM ACP — an open-source ACP-native coding agent runtime for Z.ai GLM models."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -41,9 +41,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/99percentgrip/Native-GLM-5.2-Provider"
-Repository = "https://github.com/99percentgrip/Native-GLM-5.2-Provider"
-Issues = "https://github.com/99percentgrip/Native-GLM-5.2-Provider/issues"
+Homepage = "https://github.com/99percentgrip/Native-GLM-ACP"
+Repository = "https://github.com/99percentgrip/Native-GLM-ACP"
+Issues = "https://github.com/99percentgrip/Native-GLM-ACP/issues"
 
 [project.scripts]
 glm-acp = "glm_acp.cli:main"
