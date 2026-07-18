@@ -19,6 +19,7 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
 - `test_quality.py` covers tool-loop, failed-verification and unverified-edit recovery, benchmark locking/incremental reports, million-token estimation, and real stdio/SDK ACP process lifecycles.
 - `test_cron.py` covers schedule forms, secure persistence, cross-process claims, mutation safety, script-only runs, CLI/tool management, and daemon lifecycle.
 - `test_reliability.py` covers progressive repository rules, project facts, fresh verification evidence, syntax/LSP fallback, unchanged-read deduplication, result-aware loop guards, persistent goals/subgoals, and Mixture-of-Agents aggregation.
+- `test_extensions.py` covers LSP semantic requests, stable cache prefixes, redacted trajectories, hash-pinned hooks, and the allowlisted Playwright adapter.
 
 ## Local Contracts
 
@@ -42,6 +43,7 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
 - Process-level ACP tests must use test credentials, isolated HOME state, and the official SDK lifecycle helpers where available.
 - Cron tests must isolate the configuration directory, avoid live model calls, and prove claim ownership, secret scrubbing, workspace containment, and clean daemon shutdown.
 - Reliability tests must prove direct writes defer for newly discovered scoped instructions, shell/output spoofing cannot create verification evidence, later edits invalidate passes, optional diagnostics fail safely, goal state round-trips, and MoA references are reused once per user turn.
+- Extension tests must prove LSP position conversion, patch-set atomicity and syntax rejection, bounded batch reduction, telemetry exclusion, hook hash drift disablement, and Playwright allowlisting.
 
 ## Work Guidance
 

@@ -250,6 +250,7 @@ DESTRUCTIVE_TOOLS = frozenset(
         "write_file",
         "edit_file",
         "apply_patch",
+        "apply_patch_set",
         "run_command",
         "store_memory",
         "store_user_profile",
@@ -265,6 +266,7 @@ DESTRUCTIVE_TOOLS = frozenset(
         "mcp_call",
         "mcp_list_tools",
         "vision_analyze",
+        "browser_ui",
     }
 )
 

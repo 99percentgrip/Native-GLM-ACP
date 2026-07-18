@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .diagnostics import syntax_diagnostics
 from .memory import (
     append_memory,
     append_user_profile,
@@ -686,15 +688,138 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
 ]
 
+TOOL_DEFINITIONS.extend(
+    [
+        {
+            "type": "function",
+            "function": {
+                "name": "semantic_code",
+                "description": (
+                    "Use an installed language server for precise symbol navigation. "
+                    "Lines and columns are 1-based; this tool never edits files."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "document_symbols",
+                                "workspace_symbols",
+                                "definition",
+                                "references",
+                                "hover",
+                                "implementation",
+                                "prepare_rename",
+                                "prepare_call_hierarchy",
+                                "incoming_calls",
+                                "outgoing_calls",
+                            ],
+                        },
+                        "path": {"type": "string"},
+                        "line": {"type": "integer", "minimum": 1},
+                        "column": {"type": "integer", "minimum": 1},
+                        "query": {"type": "string"},
+                        "include_declaration": {"type": "boolean"},
+                        "item": {"type": "object"},
+                    },
+                    "required": ["action", "path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_patch_set",
+                "description": (
+                    "Transactionally apply validated unified-diff hunks to multiple files. "
+                    "Every expected_sha256 must match; all files change or none do."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "patches": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 20,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "expected_sha256": {"type": "string"},
+                                    "patch": {"type": "string"},
+                                },
+                                "required": ["path", "expected_sha256", "patch"],
+                            },
+                        }
+                    },
+                    "required": ["patches"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "batch_read",
+                "description": (
+                    "Run up to 20 independent read/list/search operations concurrently and "
+                    "return one bounded JSON result, reducing model round trips."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "operations": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 20,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "tool": {
+                                        "type": "string",
+                                        "enum": [
+                                            "read_file",
+                                            "list_directory",
+                                            "search_files",
+                                            "grep",
+                                        ],
+                                    },
+                                    "arguments": {"type": "object"},
+                                },
+                                "required": ["id", "tool", "arguments"],
+                            },
+                        },
+                        "max_chars_per_result": {
+                            "type": "integer",
+                            "minimum": 200,
+                            "maximum": 16000,
+                        },
+                    },
+                    "required": ["operations"],
+                },
+            },
+        },
+    ]
+)
+
 TOOL_KINDS: dict[str, str] = {
     "cronjob": "edit",
     "read_file": "read",
     "write_file": "edit",
     "edit_file": "edit",
     "apply_patch": "edit",
+    "apply_patch_set": "edit",
     "list_directory": "read",
     "search_files": "search",
     "grep": "search",
+    "batch_read": "search",
+    "semantic_code": "search",
     "run_command": "execute",
     "update_plan": "other",
     "recall_memory": "read",
@@ -753,6 +878,8 @@ class ToolResult:
     new_text: str | None = None
     # For commands: the process exit code, otherwise None
     exit_code: int | None = None
+    # For transactional edits that affect more than one file.
+    changed_paths: list[str] | None = None
 
 
 class Sandbox:
@@ -796,12 +923,16 @@ async def execute_tool(
             return await _edit_file(arguments, sandbox)
         elif name == "apply_patch":
             return await _apply_patch(arguments, sandbox)
+        elif name == "apply_patch_set":
+            return await _apply_patch_set(arguments, sandbox)
         elif name == "list_directory":
             return await _list_directory(arguments, sandbox)
         elif name == "search_files":
             return await _search_files(arguments, sandbox)
         elif name == "grep":
             return await _grep(arguments, sandbox)
+        elif name == "batch_read":
+            return await _batch_read(arguments, sandbox)
         elif name == "run_command":
             return await _run_command(arguments, sandbox, on_output=on_output)
         elif name == "recall_memory":
@@ -1144,8 +1275,21 @@ def _apply_patch_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     if not path.is_file():
         raise ToolError(f"File not found: {path}")
     old_text = _read_utf8_text(path, "patch")
+    new_text, hunks = _patched_text(old_text, str(args.get("patch", "")))
+    path.write_text(new_text, encoding="utf-8")
+    return ToolResult(
+        output=f"Applied {hunks} patch hunk{'s' if hunks != 1 else ''} to {path}",
+        file_path=str(path),
+        old_text=old_text,
+        new_text=new_text,
+        changed_paths=[str(path)],
+    )
+
+
+def _patched_text(old_text: str, patch: str) -> tuple[str, int]:
+    """Validate unified diff hunks against text and return the candidate text."""
     source = old_text.splitlines(keepends=True)
-    patch_lines = str(args.get("patch", "")).splitlines(keepends=True)
+    patch_lines = patch.splitlines(keepends=True)
     header = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
     output: list[str] = []
     source_index = 0
@@ -1196,14 +1340,113 @@ def _apply_patch_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     if not hunks:
         raise ToolError("Patch contains no unified diff hunks")
     output.extend(source[source_index:])
-    new_text = "".join(output)
-    path.write_text(new_text, encoding="utf-8")
+    return "".join(output), hunks
+
+
+async def _apply_patch_set(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
+    return await asyncio.to_thread(_apply_patch_set_sync, args, sandbox)
+
+
+def _apply_patch_set_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
+    """Validate every candidate before committing an all-or-nothing patch set."""
+    raw_patches = args.get("patches")
+    if not isinstance(raw_patches, list) or not 1 <= len(raw_patches) <= 20:
+        raise ToolError("patches must contain between 1 and 20 entries")
+    candidates: list[tuple[Path, str, str, int]] = []
+    seen: set[Path] = set()
+    for entry in raw_patches:
+        if not isinstance(entry, dict):
+            raise ToolError("Each patch entry must be an object")
+        path = sandbox.resolve(str(entry.get("path", "")))
+        if path in seen:
+            raise ToolError(f"Duplicate patch target: {path}")
+        seen.add(path)
+        if not path.is_file():
+            raise ToolError(f"File not found: {path}")
+        old_text = _read_utf8_text(path, "patch")
+        actual_hash = hashlib.sha256(old_text.encode()).hexdigest()
+        expected_hash = str(entry.get("expected_sha256", "")).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise ToolError(f"Invalid expected_sha256 for {path}")
+        if actual_hash != expected_hash:
+            raise ToolError(
+                f"Content hash mismatch for {path}: expected {expected_hash[:12]}, "
+                f"found {actual_hash[:12]}"
+            )
+        new_text, hunks = _patched_text(old_text, str(entry.get("patch", "")))
+        syntax = syntax_diagnostics(path, new_text)
+        if syntax:
+            first = syntax[0]
+            raise ToolError(
+                f"Candidate syntax error in {path}:{first.get('line', 1)}: "
+                f"{first.get('message', 'invalid syntax')}"
+            )
+        candidates.append((path, old_text, new_text, hunks))
+
+    committed: list[tuple[Path, str]] = []
+    try:
+        for path, old_text, new_text, _ in candidates:
+            path.write_text(new_text, encoding="utf-8")
+            committed.append((path, old_text))
+    except OSError as error:
+        rollback_errors: list[str] = []
+        for path, old_text in reversed(committed):
+            try:
+                path.write_text(old_text, encoding="utf-8")
+            except OSError:
+                rollback_errors.append(str(path))
+        detail = f"; rollback failed for {', '.join(rollback_errors)}" if rollback_errors else ""
+        raise ToolError(f"Patch-set commit failed and was rolled back{detail}: {error}") from error
+
+    paths = [str(path) for path, _, _, _ in candidates]
+    hunk_count = sum(hunks for _, _, _, hunks in candidates)
     return ToolResult(
-        output=f"Applied {hunks} patch hunk{'s' if hunks != 1 else ''} to {path}",
-        file_path=str(path),
-        old_text=old_text,
-        new_text=new_text,
+        output=(
+            f"Transactionally applied {hunk_count} hunks across {len(paths)} files:\n"
+            + "\n".join(f"- {path}" for path in paths)
+        ),
+        changed_paths=paths,
     )
+
+
+async def _batch_read(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
+    """Execute a bounded read-only operation graph and return reduced JSON."""
+    operations = args.get("operations")
+    if not isinstance(operations, list) or not 1 <= len(operations) <= 20:
+        raise ToolError("operations must contain between 1 and 20 entries")
+    per_result = min(16000, max(200, int(args.get("max_chars_per_result", 4000))))
+    allowed = {"read_file", "list_directory", "search_files", "grep"}
+    normalized: list[tuple[str, str, dict[str, Any]]] = []
+    ids: set[str] = set()
+    for index, operation in enumerate(operations):
+        if not isinstance(operation, dict):
+            raise ToolError("Each batch operation must be an object")
+        operation_id = str(operation.get("id", index + 1))[:100]
+        if operation_id in ids:
+            raise ToolError(f"Duplicate batch operation id: {operation_id}")
+        ids.add(operation_id)
+        tool = str(operation.get("tool", ""))
+        arguments = operation.get("arguments")
+        if tool not in allowed or not isinstance(arguments, dict):
+            raise ToolError(f"Unsupported batch operation: {tool or '(missing)'}")
+        normalized.append((operation_id, tool, arguments))
+
+    async def run_one(operation_id: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            result = await execute_tool(tool, arguments, sandbox)
+            output = result.output
+            return {
+                "id": operation_id,
+                "tool": tool,
+                "ok": True,
+                "output": output[:per_result],
+                "truncated": len(output) > per_result,
+            }
+        except ToolError as error:
+            return {"id": operation_id, "tool": tool, "ok": False, "error": str(error)[:1000]}
+
+    results = await asyncio.gather(*(run_one(*operation) for operation in normalized))
+    return ToolResult(output=_bounded_output(json.dumps({"results": results}, ensure_ascii=False)))
 
 
 async def _list_directory(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:

@@ -1,5 +1,6 @@
 """Tests for glm_acp.tools — sandbox, gitignore, tool execution, ToolResult."""
 
+import hashlib
 import sys
 
 import pytest
@@ -218,6 +219,86 @@ class TestToolExecution:
             )
 
     @pytest.mark.asyncio
+    async def test_apply_patch_set_commits_all_files_transactionally(self, tmp_path):
+        first = tmp_path / "first.py"
+        second = tmp_path / "second.py"
+        first.write_text("value = 1\n")
+        second.write_text("other = 2\n")
+
+        result = await execute_tool(
+            "apply_patch_set",
+            {
+                "patches": [
+                    {
+                        "path": "first.py",
+                        "expected_sha256": hashlib.sha256(first.read_bytes()).hexdigest(),
+                        "patch": "@@ -1 +1 @@\n-value = 1\n+value = 10\n",
+                    },
+                    {
+                        "path": "second.py",
+                        "expected_sha256": hashlib.sha256(second.read_bytes()).hexdigest(),
+                        "patch": "@@ -1 +1 @@\n-other = 2\n+other = 20\n",
+                    },
+                ]
+            },
+            Sandbox(str(tmp_path)),
+        )
+
+        assert first.read_text() == "value = 10\n"
+        assert second.read_text() == "other = 20\n"
+        assert result.changed_paths == [str(first), str(second)]
+
+    @pytest.mark.asyncio
+    async def test_apply_patch_set_hash_failure_changes_nothing(self, tmp_path):
+        first = tmp_path / "first.py"
+        second = tmp_path / "second.py"
+        first.write_text("value = 1\n")
+        second.write_text("other = 2\n")
+
+        with pytest.raises(ToolError, match="Content hash mismatch"):
+            await execute_tool(
+                "apply_patch_set",
+                {
+                    "patches": [
+                        {
+                            "path": "first.py",
+                            "expected_sha256": hashlib.sha256(first.read_bytes()).hexdigest(),
+                            "patch": "@@ -1 +1 @@\n-value = 1\n+value = 10\n",
+                        },
+                        {
+                            "path": "second.py",
+                            "expected_sha256": "0" * 64,
+                            "patch": "@@ -1 +1 @@\n-other = 2\n+other = 20\n",
+                        },
+                    ]
+                },
+                Sandbox(str(tmp_path)),
+            )
+
+        assert first.read_text() == "value = 1\n"
+        assert second.read_text() == "other = 2\n"
+
+    @pytest.mark.asyncio
+    async def test_apply_patch_set_rejects_candidate_syntax_error(self, tmp_path):
+        path = tmp_path / "code.py"
+        path.write_text("value = 1\n")
+        with pytest.raises(ToolError, match="Candidate syntax error"):
+            await execute_tool(
+                "apply_patch_set",
+                {
+                    "patches": [
+                        {
+                            "path": "code.py",
+                            "expected_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                            "patch": "@@ -1 +1 @@\n-value = 1\n+value = (\n",
+                        }
+                    ]
+                },
+                Sandbox(str(tmp_path)),
+            )
+        assert path.read_text() == "value = 1\n"
+
+    @pytest.mark.asyncio
     async def test_list_directory(self, tmp_path):
         (tmp_path / "file.py").write_text("x")
         (tmp_path / "subdir").mkdir()
@@ -244,6 +325,26 @@ class TestToolExecution:
         result = await execute_tool("search_files", {"pattern": "*.py"}, sandbox)
         assert "a.py" in result.output
         assert "b.txt" not in result.output
+
+    @pytest.mark.asyncio
+    async def test_batch_read_reduces_multiple_results_to_bounded_json(self, tmp_path):
+        (tmp_path / "a.py").write_text("needle = 1\n")
+        (tmp_path / "b.py").write_text("needle = 2\n")
+        result = await execute_tool(
+            "batch_read",
+            {
+                "operations": [
+                    {"id": "files", "tool": "search_files", "arguments": {"pattern": "*.py"}},
+                    {"id": "matches", "tool": "grep", "arguments": {"pattern": "needle"}},
+                    {"id": "source", "tool": "read_file", "arguments": {"path": "a.py"}},
+                ],
+                "max_chars_per_result": 500,
+            },
+            Sandbox(str(tmp_path)),
+        )
+        payload = __import__("json").loads(result.output)
+        assert [item["id"] for item in payload["results"]] == ["files", "matches", "source"]
+        assert all(item["ok"] for item in payload["results"])
 
     @pytest.mark.asyncio
     async def test_unknown_tool(self, tmp_path):

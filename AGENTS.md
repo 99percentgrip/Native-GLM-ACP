@@ -99,8 +99,8 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 
 ## Current Project Status
 
-- Package and ACP implementation version is `1.0.0` from `glm_acp.__version__`.
-- GitHub release `v1.0.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
+- Package and ACP implementation version is `1.1.0` from `glm_acp.__version__`.
+- GitHub release `v1.1.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
 - ACP Registry publication is tracked in `agentclientprotocol/registry#439` and remains pending until Registry maintainers merge it.
 - Source installs, the `glm-acp` console script, module execution, and frozen binaries share `cli.main()`.
 - Public frozen binaries support one-command removal of installer-owned commands, PATH markers, and matching custom Zed configuration with an automatic settings backup.
@@ -118,6 +118,9 @@ This project implements a native ACP (Agent Client Protocol) server for Z.ai GLM
 - Project facts and canonical checks are auto-detected; edit-fresh verification evidence persists, and post-write Python/JSON/TOML syntax plus optional Python/TypeScript/Go/Rust LSP diagnostics feed the acting model.
 - Persistent goals and subgoal acceptance criteria use a bounded auxiliary completion judge. Opt-in Mixture-of-Agents runs cached parallel reference reviews while the primary GLM remains the aggregator and sole actor.
 - Repeated identical tool batches, repeated failures, and unchanged read-only results are interrupted before the 50-iteration ceiling; unchanged reads are deduplicated, malformed JSON arguments receive corrective feedback, and shell tools do not inherit common credential environment variables.
+- Installed language servers provide read-only semantic navigation, transactional hash-pinned multi-file patches commit all-or-nothing, and bounded batch reads reduce tool round trips without arbitrary code execution.
+- Stable managed-prompt prefixes expose cache-hit ratios; metadata-only redacted trajectories and hash-pinned lifecycle hooks add evidence and policy without storing prompts, outputs, commands, reasoning, credentials, or raw session IDs.
+- Permission-gated isolated Playwright MCP supplies accessibility, console, network, screenshot, and interaction evidence without arbitrary browser JavaScript evaluation or inherited credentials.
 - Expired MCP HTTP sessions and restarted stdio servers reinitialize automatically with per-server initialization locking.
 - The opt-in quality harness provides 11 outcome-based Python, TypeScript, Go, and Rust cases plus a credential-safe one-command runner with single-run locking, visible progress, and incremental JSON/Markdown handoff reports; live runs remain outside ordinary CI.
 - Persistent scheduled automation supports relative one-shots, intervals, timezone-aware five-field cron, and aware ISO timestamps; permission-gated management, fresh non-persisted runs, skills/bundles, script prechecks, script-only mode, `[SILENT]`, renewable cross-process claims, and bounded redacted artifacts are available through ACP and `glm-acp cron`.
@@ -143,7 +146,7 @@ Verify the install:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: editable glm_acp metadata and glm_acp-1.0.0.dist-info
+# expect: editable glm_acp metadata and glm_acp-1.1.0.dist-info
 ```
 
 ## Verification

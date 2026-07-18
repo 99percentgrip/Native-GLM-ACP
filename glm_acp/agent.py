@@ -87,6 +87,7 @@ from .config import (
 from .diagnostics import DiagnosticsManager
 from .glm_client import GlmClient
 from .guardrails import ToolLoopGuard
+from .hooks import LifecycleHooks
 from .mcp import MCP_TOOL_DEFINITIONS, McpError, McpManager
 from .memory import (
     list_learned_skills,
@@ -98,7 +99,8 @@ from .memory import (
 )
 from .project_context import detect_project_facts, instruction_files
 from .security import wrap_untrusted_output
-from .session_store import SessionStore
+from .session_store import SessionStore, session_persistence_enabled
+from .telemetry import TrajectoryRecorder
 from .tools import (
     MAX_TOOL_OUTPUT_CHARS,
     TOOL_DEFINITIONS,
@@ -186,12 +188,18 @@ def build_system_prompt(
     knowledge = project_knowledge(cwd, task, instruction_targets) or (
         "(none loaded; inspect nested instructions before edits)"
     )
-    return SYSTEM_PROMPT_TEMPLATE.format(
+    rendered = SYSTEM_PROMPT_TEMPLATE.format(
         project_context=project_context,
         project_knowledge=knowledge,
         model_name=model_name,
         user_knowledge=user_knowledge() or "(none recorded)",
     )
+    stable, separator, dynamic = rendered.partition("Project context:\n")
+    if not separator:
+        return rendered
+    # Keep all volatile repository/session material after one byte-stable prefix so
+    # Z.ai's automatic prefix cache can reuse the behavior contract across turns.
+    return stable + "<dynamic_context>\nProject context:\n" + dynamic + "\n</dynamic_context>"
 
 
 MODE_LIST = [
@@ -286,6 +294,7 @@ class Session:
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
         self.total_cached_tokens: int = 0
+        self.system_prefix_hash = self._system_prefix_hash(self.messages[0]["content"])
         # Runtime-only state. These fields are intentionally not persisted.
         self.prompt_lock = asyncio.Lock()
         self.client: GlmClient | None = None
@@ -319,6 +328,12 @@ class Session:
             self.messages[0] = prompt
         else:
             self.messages.insert(0, prompt)
+        self.system_prefix_hash = self._system_prefix_hash(content)
+
+    @staticmethod
+    def _system_prefix_hash(content: str) -> str:
+        prefix = content.partition("<dynamic_context>")[0]
+        return hashlib.sha256(prefix.encode()).hexdigest()[:16]
 
     # ------------------------------------------------------------------
     # Serialization for persistence across process restarts
@@ -433,16 +448,20 @@ class GlmAcpAgent(acp.Agent):
         self._tool_io_semaphore = asyncio.Semaphore(4)
         self._mcp = McpManager()
         self._diagnostics = DiagnosticsManager()
+        self._hooks = LifecycleHooks()
+        self._telemetry = TrajectoryRecorder()
         self._cron_task: asyncio.Task[None] | None = None
         self._cron_stop: asyncio.Event | None = None
 
     async def _save_session(self, session: Session) -> None:
-        if session.scheduled_run:
+        if session.scheduled_run or not session_persistence_enabled():
             return
         data = copy.deepcopy(session.to_dict())
         await asyncio.to_thread(self._store.save, session.id, data)
 
     async def _load_stored_session(self, session_id: str) -> dict[str, Any] | None:
+        if not session_persistence_enabled():
+            return None
         return await asyncio.to_thread(self._store.load, session_id)
 
     def _client_for_session(self, session: Session) -> GlmClient:
@@ -1401,55 +1420,68 @@ class GlmAcpAgent(acp.Agent):
     ) -> tuple[str, str]:
         """Update progressive context, verification state, diagnostics, and read dedup."""
         original = tool_result.output
-        raw_path = tool_args.get("path")
-        if raw_path and tool_name in {
+        raw_paths = self._tool_paths(tool_name, tool_args)
+        if raw_paths and tool_name in {
             "read_file",
             "write_file",
             "edit_file",
             "apply_patch",
             "list_directory",
             "grep",
+            "semantic_code",
+            "batch_read",
+            "apply_patch_set",
         }:
-            try:
-                resolved = str(session.sandbox.resolve(str(raw_path)))
-            except ToolError:
-                resolved = ""
-            if resolved and resolved not in session.instruction_targets:
-                session.instruction_targets.append(resolved)
-                session.instruction_targets = session.instruction_targets[-100:]
-                session.refresh_system_prompt()
-        if tool_name in {"write_file", "edit_file", "apply_patch"} and tool_result.file_path:
-            session.verification.mark_edit(tool_result.file_path)
+            for raw_path in raw_paths:
+                try:
+                    resolved = str(session.sandbox.resolve(str(raw_path)))
+                except ToolError:
+                    resolved = ""
+                if resolved and resolved not in session.instruction_targets:
+                    session.instruction_targets.append(resolved)
+                    session.instruction_targets = session.instruction_targets[-100:]
+                    session.refresh_system_prompt()
+        changed_paths = tool_result.changed_paths or (
+            [tool_result.file_path] if tool_result.file_path else []
+        )
+        if tool_name in {"write_file", "edit_file", "apply_patch", "apply_patch_set"}:
+            for changed_path in changed_paths:
+                session.verification.mark_edit(changed_path)
             session.refresh_system_prompt()
-            try:
-                current_text = Path(tool_result.file_path).read_text(encoding="utf-8")
-                diagnostics = await self._diagnostics.check(
-                    tool_result.file_path,
-                    current_text,
-                    detect_project_facts(session.cwd).root,
+        if tool_name in {"write_file", "edit_file", "apply_patch", "apply_patch_set"}:
+            diagnostic_results: list[dict[str, Any]] = []
+            for changed_path in changed_paths[:20]:
+                try:
+                    current_text = Path(changed_path).read_text(encoding="utf-8")
+                    diagnostics = await self._diagnostics.check(
+                        changed_path,
+                        current_text,
+                        detect_project_facts(session.cwd).root,
+                    )
+                    diagnostic_results.append({"path": changed_path, **diagnostics})
+                except (OSError, UnicodeDecodeError):
+                    diagnostic_results.append({"path": changed_path, "lsp_status": "unreadable"})
+            findings = [
+                item
+                for item in diagnostic_results
+                if item.get("syntax") or item.get("lsp") or item.get("lsp_status") == "unreadable"
+            ]
+            if findings:
+                original += "\n\nPost-write diagnostics:\n" + json.dumps(
+                    findings, ensure_ascii=False, indent=2
+                )[:8000]
+            elif diagnostic_results and all(
+                item.get("lsp_status") == "ok" for item in diagnostic_results
+            ):
+                original += "\n\nPost-write diagnostics: syntax and LSP checks reported no errors."
+            elif diagnostic_results:
+                statuses = sorted(
+                    {str(item.get("lsp_status", "unavailable")) for item in diagnostic_results}
                 )
-                syntax = diagnostics.get("syntax") or []
-                lsp = diagnostics.get("lsp") or []
-                if syntax or lsp:
-                    original += (
-                        "\n\nPost-write diagnostics:\n"
-                        + json.dumps({"syntax": syntax, "lsp": lsp}, ensure_ascii=False, indent=2)[
-                            :8000
-                        ]
-                    )
-                elif diagnostics.get("lsp_status") == "ok":
-                    original += (
-                        "\n\nPost-write diagnostics: syntax and LSP checks reported no errors."
-                    )
-                else:
-                    original += (
-                        "\n\nPost-write diagnostics: syntax check passed; LSP "
-                        f"{diagnostics.get('lsp_status', 'unavailable')}."
-                    )
-            except (OSError, UnicodeDecodeError):
                 original += (
-                    "\n\nPost-write diagnostics unavailable: the written file could not be "
-                    "read back."
+                    "\n\nPost-write diagnostics: syntax checks passed; LSP "
+                    + ", ".join(statuses)
+                    + "."
                 )
         displayed = original
         if TOOL_KINDS.get(tool_name) in {"read", "search"}:
@@ -1464,6 +1496,25 @@ class GlmAcpAgent(acp.Agent):
                 session.read_cache[key] = digest
         return displayed, original
 
+    @staticmethod
+    def _tool_paths(tool_name: str, tool_args: dict[str, Any]) -> list[str]:
+        """Return every workspace path addressed by a direct or compound tool call."""
+        if not isinstance(tool_args, dict):
+            return []
+        paths: list[str] = []
+        if tool_args.get("path"):
+            paths.append(str(tool_args["path"]))
+        if tool_name == "apply_patch_set":
+            for entry in tool_args.get("patches", []):
+                if isinstance(entry, dict) and entry.get("path"):
+                    paths.append(str(entry["path"]))
+        if tool_name == "batch_read":
+            for operation in tool_args.get("operations", []):
+                arguments = operation.get("arguments", {}) if isinstance(operation, dict) else {}
+                if isinstance(arguments, dict) and arguments.get("path"):
+                    paths.append(str(arguments["path"]))
+        return list(dict.fromkeys(paths))[:100]
+
     def _prepare_progressive_context(
         self,
         session: Session,
@@ -1473,24 +1524,31 @@ class GlmAcpAgent(acp.Agent):
         """Load newly applicable scoped instructions before a path-based tool runs."""
         if not isinstance(tool_args, dict):
             return []
-        raw_path = tool_args.get("path")
-        if not raw_path or tool_name not in {
+        raw_paths = self._tool_paths(tool_name, tool_args)
+        if not raw_paths or tool_name not in {
             "read_file",
             "write_file",
             "edit_file",
             "apply_patch",
             "list_directory",
             "grep",
+            "semantic_code",
+            "batch_read",
+            "apply_patch_set",
         }:
             return []
-        try:
-            resolved = str(session.sandbox.resolve(str(raw_path)))
-        except ToolError:
-            return []
-        if resolved in session.instruction_targets:
-            return []
         before = set(instruction_files(session.cwd, session.instruction_targets))
-        session.instruction_targets.append(resolved)
+        added = False
+        for raw_path in raw_paths:
+            try:
+                resolved = str(session.sandbox.resolve(str(raw_path)))
+            except ToolError:
+                continue
+            if resolved not in session.instruction_targets:
+                session.instruction_targets.append(resolved)
+                added = True
+        if not added:
+            return []
         session.instruction_targets = session.instruction_targets[-100:]
         after = set(instruction_files(session.cwd, session.instruction_targets))
         session.refresh_system_prompt()
@@ -1548,6 +1606,9 @@ class GlmAcpAgent(acp.Agent):
         learning_review_pending = False
         learning_review_guard_used = False
         skills_used_this_turn: set[str] = set()
+        edited_paths_this_turn: set[str] = set()
+        pre_verify_checked = False
+        hook_verify_nudges = 0
         loop_guard = ToolLoopGuard()
         delegation_budget = {
             "workers": MAX_DELEGATIONS_PER_TURN,
@@ -1579,6 +1640,18 @@ class GlmAcpAgent(acp.Agent):
 
             # --- Update token estimates and notify Zed ---
             self._update_usage(session, result.usage)
+            usage = result.usage or {}
+            self._telemetry.record(
+                "llm_call",
+                session.id,
+                model=session.model,
+                iteration=turn_iter,
+                finish_reason=result.finish_reason,
+                input_tokens=int(usage.get("input_tokens", 0) or 0),
+                output_tokens=int(usage.get("output_tokens", 0) or 0),
+                cached_tokens=int(usage.get("cached_tokens", 0) or 0),
+                tool_calls=len(result.tool_calls),
+            )
             await self._report_usage(session)
             await self._report_context_pressure(session)
 
@@ -1692,6 +1765,32 @@ class GlmAcpAgent(acp.Agent):
                     learning_review_pending = False
                     learning_review_guard_used = True
                     continue
+                if edited_paths_this_turn and not pre_verify_checked:
+                    directives = await self._hooks.emit(
+                        "pre_verify",
+                        session.cwd,
+                        {
+                            "model": session.model,
+                            "changed_paths": sorted(edited_paths_this_turn),
+                            "fresh_verification": session.verification.fresh_pass is not None,
+                            "attempt": hook_verify_nudges,
+                        },
+                    )
+                    message = next(
+                        (
+                            str(item.get("message", ""))[:1000]
+                            for item in directives
+                            if item.get("action") == "continue" and item.get("message")
+                        ),
+                        "",
+                    )
+                    if message and hook_verify_nudges < 3:
+                        hook_verify_nudges += 1
+                        session.messages.append(
+                            {"role": "system", "content": "Lifecycle pre_verify: " + message}
+                        )
+                        continue
+                    pre_verify_checked = True
                 goal_continuation = await self._goal_continuation(session, result.content or "")
                 if goal_continuation:
                     session.messages.append({"role": "system", "content": goal_continuation})
@@ -1701,6 +1800,23 @@ class GlmAcpAgent(acp.Agent):
                     await self._send_message(session.id, f"\n\n{notice}\n")
                 if result.finish_reason == "cancelled":
                     return "cancelled"
+                await self._hooks.emit(
+                    "post_llm_call",
+                    session.cwd,
+                    {
+                        "model": session.model,
+                        "changed_paths": sorted(edited_paths_this_turn),
+                        "finish_reason": result.finish_reason,
+                    },
+                )
+                self._telemetry.record(
+                    "turn_complete",
+                    session.id,
+                    model=session.model,
+                    changed_files=len(edited_paths_this_turn),
+                    fresh_verification=session.verification.fresh_pass is not None,
+                    iterations=turn_iter + 1,
+                )
                 return "end_turn"
 
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": result.content or None}
@@ -1727,7 +1843,12 @@ class GlmAcpAgent(acp.Agent):
                 len(result.tool_calls) > 1
                 and all(
                     tc["function"]["name"]
-                    not in {"session_search", "read_skill", "read_skill_bundle"}
+                    not in {
+                        "session_search",
+                        "read_skill",
+                        "read_skill_bundle",
+                        "semantic_code",
+                    }
                     for tc in result.tool_calls
                 )
                 and all(
@@ -1917,6 +2038,30 @@ class GlmAcpAgent(acp.Agent):
                     )
                     continue
 
+                hook_directives = await self._hooks.emit(
+                    "pre_tool_call",
+                    session.cwd,
+                    {
+                        "tool_name": tool_name,
+                        "paths": self._tool_paths(tool_name, tool_args),
+                        "action": str(tool_args.get("action", ""))[:100],
+                    },
+                )
+                blocked = next(
+                    (
+                        str(item.get("message", "Hook policy blocked this tool call"))[:1000]
+                        for item in hook_directives
+                        if item.get("action") == "block"
+                    ),
+                    "",
+                )
+                if blocked:
+                    await self._fail_tool(session.id, tc_id, blocked)
+                    session.messages.append(
+                        {"role": "tool", "tool_call_id": tc_id, "content": blocked}
+                    )
+                    continue
+
                 # --- Permission check ---
                 permitted, deny_reason = await self._check_permission(
                     session,
@@ -1937,11 +2082,40 @@ class GlmAcpAgent(acp.Agent):
                     continue
 
                 tool_failed = False
+                tool_started = time.monotonic()
                 try:
                     if tool_name == "delegate_task":
                         delegated = await self._delegate_task(session, tool_args, delegation_budget)
                         tool_result = ToolResult(output=delegated)
-                    elif tool_name in {"web_search", "web_reader", "vision_analyze"}:
+                    elif tool_name == "semantic_code":
+                        semantic_path = session.sandbox.resolve(str(tool_args.get("path", "")))
+                        value = await self._diagnostics.semantic_query(
+                            str(tool_args.get("action", "")),
+                            detect_project_facts(session.cwd).root,
+                            path=str(semantic_path),
+                            line=int(tool_args.get("line", 1)),
+                            column=int(tool_args.get("column", 1)),
+                            query=str(tool_args.get("query", ""))[:500],
+                            include_declaration=bool(
+                                tool_args.get("include_declaration", True)
+                            ),
+                            item=(
+                                tool_args.get("item")
+                                if isinstance(tool_args.get("item"), dict)
+                                else None
+                            ),
+                        )
+                        tool_result = ToolResult(
+                            output=json.dumps(value, ensure_ascii=False)[:MAX_TOOL_OUTPUT_CHARS],
+                            file_path=str(semantic_path),
+                            line=int(tool_args.get("line", 1)),
+                        )
+                    elif tool_name in {
+                        "web_search",
+                        "web_reader",
+                        "vision_analyze",
+                        "browser_ui",
+                    }:
                         if tool_name == "vision_analyze":
                             tool_args = {
                                 **tool_args,
@@ -1997,9 +2171,19 @@ class GlmAcpAgent(acp.Agent):
                     output, original_output = await self._postprocess_tool_result(
                         session, tool_name, tool_args, tool_result
                     )
-                    if tool_name in {"write_file", "edit_file", "apply_patch"}:
+                    if tool_name in {
+                        "write_file",
+                        "edit_file",
+                        "apply_patch",
+                        "apply_patch_set",
+                    }:
                         unverified_change_pending = True
                         successful_verification_observed = False
+                        edited_paths_this_turn.update(
+                            tool_result.changed_paths
+                            or ([tool_result.file_path] if tool_result.file_path else [])
+                        )
+                        pre_verify_checked = False
                     elif tool_name in {"read_skill", "read_skill_bundle"}:
                         skills_used_this_turn.add(str(tool_args.get("name", "")))
                         session.refresh_system_prompt()
@@ -2042,6 +2226,27 @@ class GlmAcpAgent(acp.Agent):
                     await self._fail_tool(session.id, tc_id, error_msg)
                     if tool_name == "run_command":
                         failed_command_pending = True
+
+                duration_ms = int((time.monotonic() - tool_started) * 1000)
+                self._telemetry.record(
+                    "tool_call",
+                    session.id,
+                    tool=tool_name,
+                    success=not tool_failed,
+                    duration_ms=duration_ms,
+                    output_chars=len(original_output),
+                    paths=self._tool_paths(tool_name, tool_args),
+                )
+                await self._hooks.emit(
+                    "post_tool_call",
+                    session.cwd,
+                    {
+                        "tool_name": tool_name,
+                        "success": not tool_failed,
+                        "duration_ms": duration_ms,
+                        "paths": self._tool_paths(tool_name, tool_args),
+                    },
+                )
 
                 decision = loop_guard.observe(
                     tool_name,
@@ -2711,6 +2916,8 @@ class GlmAcpAgent(acp.Agent):
                 f"- **Total usage:** {session.total_input_tokens:,} input + "
                 f"{session.total_output_tokens:,} output tokens",
                 f"- **Cached input:** {session.total_cached_tokens:,} tokens",
+                f"- **Cache hit ratio:** "
+                f"{session.total_cached_tokens / max(session.total_input_tokens, 1):.1%}",
                 "",
                 "---",
                 "",
@@ -2808,6 +3015,9 @@ class GlmAcpAgent(acp.Agent):
                 f"- **Total usage:** {session.total_input_tokens:,} input + "
                 f"{session.total_output_tokens:,} output tokens\n"
                 f"- **Cached input:** {session.total_cached_tokens:,} tokens\n"
+                f"- **Cache hit ratio:** "
+                f"{session.total_cached_tokens / max(session.total_input_tokens, 1):.1%}\n"
+                f"- **Stable prompt prefix:** {session.system_prefix_hash}\n"
                 f"- **Learned skills:** {curator['active']} active, "
                 f"{curator['stale']} stale, {curator['archived']} archived\n"
                 f"- **Lineage:** parent={session.parent_session_id or 'none'}, "
@@ -2928,6 +3138,12 @@ class GlmAcpAgent(acp.Agent):
                     continue
                 if name in {"write_file", "edit_file", "apply_patch"} and arguments.get("path"):
                     files.add(str(arguments["path"])[:500])
+                if name == "apply_patch_set":
+                    files.update(
+                        str(entry.get("path", ""))[:500]
+                        for entry in arguments.get("patches", [])
+                        if isinstance(entry, dict) and entry.get("path")
+                    )
                 if name == "apply_patch" and arguments.get("patch"):
                     files.update(
                         match[:500]
@@ -3605,9 +3821,12 @@ class GlmAcpAgent(acp.Agent):
             "write_file": "Writing file",
             "edit_file": "Editing file",
             "apply_patch": "Applying patch",
+            "apply_patch_set": "Applying transactional patch set",
             "list_directory": "Listing directory",
             "search_files": "Searching files",
             "grep": "Searching code",
+            "batch_read": "Reading repository context in batch",
+            "semantic_code": "Navigating code semantically",
             "run_command": "Running command",
             "recall_memory": "Reading project memory",
             "store_memory": "Updating project memory",
@@ -3630,6 +3849,7 @@ class GlmAcpAgent(acp.Agent):
             "web_search": "Searching the web",
             "web_reader": "Reading web page",
             "vision_analyze": "Analyzing image",
+            "browser_ui": "Testing browser UI",
             "mcp_list_tools": "Listing MCP tools",
             "mcp_call": "Calling MCP tool",
             "update_plan": "Updating plan",

@@ -28,6 +28,16 @@ _SERVERS: dict[str, tuple[list[str], str]] = {
     ".rs": (["rust-analyzer"], "rust"),
 }
 
+_SEMANTIC_METHODS = {
+    "document_symbols": "textDocument/documentSymbol",
+    "definition": "textDocument/definition",
+    "references": "textDocument/references",
+    "hover": "textDocument/hover",
+    "implementation": "textDocument/implementation",
+    "prepare_rename": "textDocument/prepareRename",
+    "prepare_call_hierarchy": "textDocument/prepareCallHierarchy",
+}
+
 
 def syntax_diagnostics(path: Path, text: str) -> list[dict[str, Any]]:
     """Return deterministic syntax errors for formats supported by the stdlib."""
@@ -62,6 +72,7 @@ class _LspProcess:
     diagnostics: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     versions: dict[str, int] = field(default_factory=dict)
     events: dict[str, asyncio.Event] = field(default_factory=dict)
+    opened_text: dict[str, str] = field(default_factory=dict)
 
     async def start(self) -> None:
         if self.process is not None:
@@ -80,7 +91,17 @@ class _LspProcess:
                 "processId": None,
                 "rootUri": self.root.as_uri(),
                 "capabilities": {
-                    "textDocument": {"publishDiagnostics": {"relatedInformation": True}}
+                    "textDocument": {
+                        "publishDiagnostics": {"relatedInformation": True},
+                        "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
+                        "definition": {"linkSupport": True},
+                        "references": {},
+                        "hover": {"contentFormat": ["markdown", "plaintext"]},
+                        "implementation": {"linkSupport": True},
+                        "rename": {"prepareSupport": True},
+                        "callHierarchy": {},
+                    },
+                    "workspace": {"symbol": {"resolveSupport": {"properties": []}}},
                 },
                 "clientInfo": {"name": "native-glm-acp"},
             },
@@ -147,11 +168,15 @@ class _LspProcess:
         except Exception:
             logger.debug("LSP reader stopped", exc_info=True)
 
-    async def diagnose(self, path: Path, text: str, language_id: str) -> list[dict[str, Any]]:
+    async def open_document(self, path: Path, text: str, language_id: str) -> str:
+        """Synchronize one document and return its file URI."""
         await self.start()
         uri = path.resolve().as_uri()
+        if self.opened_text.get(uri) == text:
+            return uri
         version = self.versions.get(uri, 0) + 1
         self.versions[uri] = version
+        self.opened_text[uri] = text
         event = self.events.setdefault(uri, asyncio.Event())
         event.clear()
         if version == 1:
@@ -174,11 +199,55 @@ class _LspProcess:
                     "contentChanges": [{"text": text}],
                 },
             )
+        return uri
+
+    async def diagnose(self, path: Path, text: str, language_id: str) -> list[dict[str, Any]]:
+        uri = await self.open_document(path, text, language_id)
+        event = self.events.setdefault(uri, asyncio.Event())
         try:
             await asyncio.wait_for(event.wait(), timeout=3)
         except asyncio.TimeoutError:
             return []
         return self.diagnostics.get(uri, [])
+
+    async def semantic(
+        self,
+        action: str,
+        path: Path | None,
+        text: str | None,
+        language_id: str,
+        *,
+        line: int = 1,
+        column: int = 1,
+        query: str = "",
+        include_declaration: bool = True,
+        item: dict[str, Any] | None = None,
+    ) -> Any:
+        """Run one bounded LSP 3.17 semantic navigation request."""
+        await self.start()
+        if action == "workspace_symbols":
+            return await self.request("workspace/symbol", {"query": query})
+        if action in {"incoming_calls", "outgoing_calls"}:
+            if not isinstance(item, dict):
+                raise ValueError(f"{action} requires a call hierarchy item")
+            suffix = "incomingCalls" if action == "incoming_calls" else "outgoingCalls"
+            method = f"callHierarchy/{suffix}"
+            return await self.request(method, {"item": item})
+        method = _SEMANTIC_METHODS.get(action)
+        if method is None:
+            raise ValueError(f"Unsupported semantic action: {action}")
+        if path is None or text is None:
+            raise ValueError(f"{action} requires a document path")
+        uri = await self.open_document(path, text, language_id)
+        params: dict[str, Any] = {"textDocument": {"uri": uri}}
+        if action != "document_symbols":
+            params["position"] = {
+                "line": max(0, int(line) - 1),
+                "character": max(0, int(column) - 1),
+            }
+        if action == "references":
+            params["context"] = {"includeDeclaration": bool(include_declaration)}
+        return await self.request(method, params)
 
     async def close(self) -> None:
         try:
@@ -219,6 +288,53 @@ class DiagnosticsManager:
             result["lsp_status"] = "failed"
             logger.debug("LSP diagnostics failed safely", exc_info=True)
         return result
+
+    async def semantic_query(
+        self,
+        action: str,
+        root: str,
+        *,
+        path: str | None = None,
+        line: int = 1,
+        column: int = 1,
+        query: str = "",
+        include_declaration: bool = True,
+        item: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Query an installed language server without mutating repository state."""
+        root_path = Path(root).resolve()
+        file_path = Path(path).resolve() if path else None
+        spec = _SERVERS.get(file_path.suffix.lower()) if file_path else None
+        if spec is None:
+            return {"status": "unsupported", "action": action, "result": None}
+        command, language_id = spec
+        if shutil.which(command[0]) is None:
+            return {"status": "unavailable", "action": action, "result": None}
+        text = None
+        if action not in {"workspace_symbols", "incoming_calls", "outgoing_calls"}:
+            if file_path is None or not file_path.is_file():
+                return {"status": "missing", "action": action, "result": None}
+            text = file_path.read_text(encoding="utf-8")
+        key = (str(root_path), language_id)
+        server = self._servers.setdefault(key, _LspProcess(command, root_path))
+        try:
+            result = await server.semantic(
+                action,
+                file_path,
+                text,
+                language_id,
+                line=line,
+                column=column,
+                query=query,
+                include_declaration=include_declaration,
+                item=item,
+            )
+            return {"status": "ok", "action": action, "result": result}
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            return {"status": "failed", "action": action, "error": str(error), "result": None}
+        except Exception:
+            logger.debug("LSP semantic query failed safely", exc_info=True)
+            return {"status": "failed", "action": action, "result": None}
 
     async def close(self) -> None:
         await asyncio.gather(

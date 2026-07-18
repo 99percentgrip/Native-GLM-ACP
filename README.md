@@ -28,6 +28,13 @@ subprocess inside Zed's Agent Panel — no Zed recompilation required.
 - **Promptware defense** — stored context and untrusted tool/MCP/recall output are scanned and delimited
 - **Bounded delegation** — permission-gated read-only GLM workers investigate or review with strict budgets
 - **Persistent scheduled automation** — one-shot, interval, timezone-aware cron, and ISO jobs run in isolated sessions with durable history
+- **Semantic code navigation** — installed language servers provide symbols, definitions, references, hover types, implementations, rename preparation, and call hierarchy
+- **Transactional multi-file patches** — content hashes, pre-commit syntax checks, and rollback keep coordinated refactors all-or-nothing
+- **Context-efficient batch reads** — bounded concurrent file/search operations return one reduced JSON result
+- **Cache-aware prompt layout** — volatile context stays behind a stable prefix; `/status` reports its hash and cache-hit ratio
+- **Redacted trajectory telemetry** — metadata-only events support tuning without prompts, outputs, commands, reasoning, credentials, or raw session IDs
+- **Playwright UI testing** — permission-gated isolated browser automation returns accessibility, console, network, interaction, and screenshot evidence
+- **Lifecycle hooks** — user-owned hash-pinned hooks can block tools, observe results, or request bounded pre-verification follow-up
 
 ### API Resilience
 
@@ -267,10 +274,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v1.0.0` before running the Unix
-installer, or pass `-Version v1.0.0` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v1.1.0` before running the Unix
+installer, or pass `-Version v1.1.0` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v1.0.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v1.0.0).
+[v1.1.0](https://github.com/99percentgrip/Native-GLM-5.2-Provider/releases/tag/v1.1.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -461,9 +468,12 @@ preserved-thinking requests.
 | `write_file` | Create or overwrite a file |
 | `edit_file` | Find-and-replace a unique text block |
 | `apply_patch` | Atomically apply validated unified-diff hunks |
+| `apply_patch_set` | Transactionally apply hash-pinned hunks across up to 20 files |
 | `list_directory` | List directory entries |
 | `search_files` | Glob pattern search (`.gitignore`-aware) |
 | `grep` | Regex content search (`.gitignore`-aware) |
+| `batch_read` | Concurrently run and reduce up to 20 read/list/search operations |
+| `semantic_code` | Query installed LSP servers for symbols and semantic navigation |
 | `run_command` | Live, bounded shell output; timeouts kill the process tree; inherited credentials are removed |
 | `update_plan` | Create/update the task plan checklist |
 | `recall_memory` / `store_memory` | Read or permission-gate durable project knowledge |
@@ -480,6 +490,7 @@ preserved-thinking requests.
 | `cronjob` | Permission-gated persistent scheduled automation and manual runs |
 | `web_search` / `web_reader` | Official Z.ai Coding Plan MCP services |
 | `vision_analyze` | Optional official local Z.ai Vision MCP |
+| `browser_ui` | Permission-gated Playwright MCP inspection and interaction |
 | `mcp_list_tools` / `mcp_call` | Generic configured MCP access |
 
 After changing files, the agent requires a successful auto-detected canonical
@@ -498,6 +509,28 @@ three-worker, 24-tool-call, 120K-input-token, and 16K-output-token budget across
 all delegates. Their API usage is added to the parent session totals. Promptware
 scanning is defense in depth: destructive operations still rely on ACP
 permissions and workspace sandboxing.
+
+### Local trajectory telemetry and lifecycle hooks
+
+Metadata-only trajectory events are appended with user-only permissions to
+`trajectory.jsonl` in the Native GLM ACP configuration directory. Set
+`GLM_ACP_TELEMETRY=0` to disable them. Records include model/tool names,
+durations, token counts, cache hits, changed-path counts, and verification state;
+they exclude prompts, tool arguments and bodies, commands, reasoning, credentials,
+and raw session IDs.
+
+Lifecycle hooks are opt-in through user-only `hooks.json` (or
+`GLM_ACP_HOOKS_CONFIG`). Each entry declares an event, an argv-form command, the
+exact SHA-256 of its executable, an optional exact workspace scope, and a timeout
+of at most 10 seconds. Supported events are `pre_tool_call`, `post_tool_call`,
+`pre_verify`, and `post_llm_call`. Hash drift disables a hook, failures are
+isolated, child environments are credential-scrubbed, and pre-verification
+continuations are capped at three.
+
+Playwright uses the optional `playwright` stdio MCP preset
+(`npx -y @playwright/mcp@latest --headless --isolated`). Starting or calling it
+is permission-gated, inherited credentials are removed, and the stable adapter
+does not expose Playwright MCP's arbitrary JavaScript evaluation tools.
 
 ## Testing
 
@@ -566,7 +599,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-1.0.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-1.1.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

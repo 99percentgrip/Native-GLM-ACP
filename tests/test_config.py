@@ -99,6 +99,7 @@ class TestConstants:
         assert "edit_file" in DESTRUCTIVE_TOOLS
         assert "run_command" in DESTRUCTIVE_TOOLS
         assert "apply_patch" in DESTRUCTIVE_TOOLS
+        assert "apply_patch_set" in DESTRUCTIVE_TOOLS
         assert "learn_skill" in DESTRUCTIVE_TOOLS
         assert "forget_skill" in DESTRUCTIVE_TOOLS
         assert "store_user_profile" in DESTRUCTIVE_TOOLS
@@ -109,6 +110,7 @@ class TestConstants:
         assert "evolve_skill" in DESTRUCTIVE_TOOLS
         assert "delegate_task" in DESTRUCTIVE_TOOLS
         assert "vision_analyze" in DESTRUCTIVE_TOOLS
+        assert "browser_ui" in DESTRUCTIVE_TOOLS
         assert "read_file" not in DESTRUCTIVE_TOOLS
 
     def test_retry_config(self):

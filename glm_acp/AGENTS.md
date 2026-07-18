@@ -21,6 +21,8 @@ streaming, 1M context, and auto-continuation for long generations.
 - **Project discovery**: `project_context.py` — repository roots, progressive instruction files, manifests, package managers, git state, and canonical verification commands
 - **Verification evidence**: `verification.py` — persistent edit generations and bounded canonical command outcomes
 - **Post-write diagnostics**: `diagnostics.py` — deterministic syntax checks and lazy optional LSP clients
+- **Lifecycle extensions**: `hooks.py` — user-owned, hash-pinned, workspace-scoped lifecycle commands
+- **Trajectory evidence**: `telemetry.py` — bounded metadata-only JSONL events with session hashing and secret/body exclusion
 - **Loop guardrails**: `guardrails.py` — repeated failure and unchanged read-only result detection
 - **Untrusted-context defense**: `security.py` — promptware findings, stored-context blocking, and tool/MCP/recall delimiters
 - **Tools**: `tools.py` — file/shell operations sandboxed to workspace roots
@@ -253,6 +255,35 @@ and TOML receive deterministic syntax validation. If already installed,
 also receives the versioned document over LSP stdio and returns semantic
 diagnostics. Missing, timed-out, or failed servers fall back safely and are never
 installed by the agent.
+
+Installed language servers also back the read-only `semantic_code` tool for
+document/workspace symbols, definitions, references, hover, implementations,
+rename preparation, and call hierarchy. Tool positions are 1-based and converted
+to LSP 0-based positions; missing or failed servers return bounded status.
+
+`apply_patch_set` validates up to 20 existing UTF-8 files, exact pre-edit SHA-256
+hashes, every unified-diff hunk, and deterministic Python/JSON/TOML syntax before
+writing. It commits all candidates or restores previously written files after a
+commit failure. Every changed file advances verification evidence and receives
+post-write diagnostics. `batch_read` runs up to 20 read/list/search operations
+concurrently with per-result and aggregate output bounds.
+
+The managed system message keeps volatile project, knowledge, and task context
+after a byte-stable prefix marker. Status exposes the stable-prefix hash and
+provider cache-hit ratio; cache layout changes must preserve scoped instructions
+and compaction/session compatibility.
+
+Trajectory telemetry stores no prompts, content, tool arguments, commands,
+outputs, reasoning, credentials, or raw session IDs and is disabled by
+`GLM_ACP_TELEMETRY=0`. Lifecycle hooks require an exact executable SHA-256,
+optional exact workspace scope, argv execution without a shell,
+credential-scrubbed environments, a 10-second maximum timeout, fail-open
+isolation, and a three-nudge pre-verification cap.
+
+`browser_ui` is a stable permission-gated adapter over isolated headless
+Playwright MCP. It allowlists navigation, accessibility snapshots, console/network
+evidence, screenshots, ordinary interaction, waits, and close; arbitrary browser
+JavaScript evaluation is absent and the MCP child receives no inherited credentials.
 
 Persistent `/goal` state and `/subgoal` acceptance criteria survive session
 reloads and forks. A strict-JSON auxiliary judge evaluates the response, changed

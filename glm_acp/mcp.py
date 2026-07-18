@@ -42,6 +42,26 @@ DEFAULT_SERVERS: dict[str, dict[str, Any]] = {
             "video_analysis",
         ],
     },
+    "playwright": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@latest", "--headless", "--isolated"],
+        "auth": "playwright",
+    },
+}
+
+_PLAYWRIGHT_TOOLS = {
+    "navigate": "browser_navigate",
+    "snapshot": "browser_snapshot",
+    "console": "browser_console_messages",
+    "network": "browser_network_requests",
+    "screenshot": "browser_take_screenshot",
+    "click": "browser_click",
+    "type": "browser_type",
+    "fill_form": "browser_fill_form",
+    "press_key": "browser_press_key",
+    "wait": "browser_wait_for",
+    "close": "browser_close",
 }
 
 MCP_TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -84,6 +104,27 @@ MCP_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "prompt": {"type": "string"},
                 },
                 "required": ["path", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_ui",
+            "description": (
+                "Permission-gated Playwright MCP browser testing. Navigate, inspect the "
+                "accessibility tree, console and network, interact, capture evidence, or close. "
+                "Uses an isolated headless browser and never exposes arbitrary JavaScript eval."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {"type": "string", "enum": list(_PLAYWRIGHT_TOOLS)},
+                    "arguments": {"type": "object"},
+                    "server": {"type": "string"},
+                },
+                "required": ["action", "arguments"],
             },
         },
     },
@@ -216,6 +257,22 @@ class McpManager:
                 "Z.ai Vision MCP requires Node.js 22+ and npx"
             )
         env = os.environ.copy()
+        if server.get("auth") == "playwright":
+            sensitive_suffixes = (
+                "_API_KEY",
+                "_TOKEN",
+                "_SECRET",
+                "_PASSWORD",
+                "_CREDENTIAL",
+                "_PRIVATE_KEY",
+                "_ACCESS_KEY",
+            )
+            env = {
+                key: value
+                for key, value in env.items()
+                if not key.upper().endswith(sensitive_suffixes)
+                and key.upper() not in {"ZAI_API_KEY", "Z_AI_API_KEY", "SSH_AUTH_SOCK"}
+            }
         if server.get("auth") == "zai_vision":
             env["Z_AI_API_KEY"] = get_api_key()
             env["Z_AI_MODE"] = "ZAI"
@@ -438,6 +495,16 @@ class McpManager:
                 "image_analysis",
                 {"image_path": arguments["path"], "prompt": arguments["prompt"]},
             )
+        if name == "browser_ui":
+            action = str(arguments.get("action", ""))
+            tool = _PLAYWRIGHT_TOOLS.get(action)
+            if tool is None:
+                raise McpError(f"Unknown Playwright browser action: {action}")
+            server = str(arguments.get("server", "playwright")) or "playwright"
+            payload = arguments.get("arguments")
+            if not isinstance(payload, dict):
+                raise McpError("browser_ui arguments must be an object")
+            return await self.call(server, tool, payload)
         raise McpError(f"Unknown MCP preset: {name}")
 
     async def aclose(self) -> None:
