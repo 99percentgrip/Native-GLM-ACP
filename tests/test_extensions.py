@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -93,24 +95,21 @@ def test_trajectory_telemetry_fails_open_on_unwritable_path(tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 async def test_lifecycle_hook_requires_matching_hash_and_returns_directive(tmp_path):
-    script = tmp_path / "hook.py"
-    script.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, sys\n"
-        "json.load(sys.stdin)\n"
-        "print(json.dumps({'action': 'continue', 'message': 'run formatter'}))\n"
+    hook_code = (
+        "import json, sys; json.load(sys.stdin); "
+        "print(json.dumps({'action': 'continue', 'message': 'run formatter'}))"
     )
-    script.chmod(0o700)
+    executable = sys.executable
     config = tmp_path / "hooks.json"
     config.write_text(
         json.dumps(
             {
                 "hooks": [
-                    {
-                        "event": "pre_verify",
-                        "command": [str(script)],
-                        "sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
-                        "workspace": str(tmp_path),
+                        {
+                            "event": "pre_verify",
+                            "command": [executable, "-c", hook_code],
+                            "sha256": hashlib.sha256(Path(executable).read_bytes()).hexdigest(),
+                            "workspace": str(tmp_path),
                     }
                 ]
             }
@@ -120,7 +119,9 @@ async def test_lifecycle_hook_requires_matching_hash_and_returns_directive(tmp_p
     results = await LifecycleHooks(config).emit("pre_verify", str(tmp_path), {"attempt": 0})
     assert results == [{"action": "continue", "message": "run formatter"}]
 
-    script.write_text(script.read_text() + "# changed\n")
+    payload = json.loads(config.read_text())
+    payload["hooks"][0]["sha256"] = "0" * 64
+    config.write_text(json.dumps(payload))
     assert await LifecycleHooks(config).emit("pre_verify", str(tmp_path), {}) == []
 
 

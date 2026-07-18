@@ -249,6 +249,27 @@ class TestToolExecution:
         assert result.changed_paths == [str(first), str(second)]
 
     @pytest.mark.asyncio
+    async def test_apply_patch_set_hashes_raw_bytes_and_preserves_crlf(self, tmp_path):
+        path = tmp_path / "windows.py"
+        path.write_bytes(b"value = 1\r\n")
+
+        await execute_tool(
+            "apply_patch_set",
+            {
+                "patches": [
+                    {
+                        "path": "windows.py",
+                        "expected_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                        "patch": "@@ -1 +1 @@\n-value = 1\n+value = 2\n",
+                    }
+                ]
+            },
+            Sandbox(str(tmp_path)),
+        )
+
+        assert path.read_bytes() == b"value = 2\r\n"
+
+    @pytest.mark.asyncio
     async def test_apply_patch_set_hash_failure_changes_nothing(self, tmp_path):
         first = tmp_path / "first.py"
         second = tmp_path / "second.py"

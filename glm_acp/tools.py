@@ -1352,7 +1352,7 @@ def _apply_patch_set_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
     raw_patches = args.get("patches")
     if not isinstance(raw_patches, list) or not 1 <= len(raw_patches) <= 20:
         raise ToolError("patches must contain between 1 and 20 entries")
-    candidates: list[tuple[Path, str, str, int]] = []
+    candidates: list[tuple[Path, bytes, bytes, int]] = []
     seen: set[Path] = set()
     for entry in raw_patches:
         if not isinstance(entry, dict):
@@ -1363,8 +1363,12 @@ def _apply_patch_set_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
         seen.add(path)
         if not path.is_file():
             raise ToolError(f"File not found: {path}")
-        old_text = _read_utf8_text(path, "patch")
-        actual_hash = hashlib.sha256(old_text.encode()).hexdigest()
+        raw_content = path.read_bytes()
+        try:
+            decoded_text = raw_content.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ToolError(f"Cannot patch non-UTF-8 file: {path}") from error
+        actual_hash = hashlib.sha256(raw_content).hexdigest()
         expected_hash = str(entry.get("expected_sha256", "")).lower()
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise ToolError(f"Invalid expected_sha256 for {path}")
@@ -1373,6 +1377,8 @@ def _apply_patch_set_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
                 f"Content hash mismatch for {path}: expected {expected_hash[:12]}, "
                 f"found {actual_hash[:12]}"
             )
+        newline = "\r\n" if "\r\n" in decoded_text else "\r" if "\r" in decoded_text else "\n"
+        old_text = decoded_text.replace("\r\n", "\n").replace("\r", "\n")
         new_text, hunks = _patched_text(old_text, str(entry.get("patch", "")))
         syntax = syntax_diagnostics(path, new_text)
         if syntax:
@@ -1381,18 +1387,19 @@ def _apply_patch_set_sync(args: dict[str, Any], sandbox: Sandbox) -> ToolResult:
                 f"Candidate syntax error in {path}:{first.get('line', 1)}: "
                 f"{first.get('message', 'invalid syntax')}"
             )
-        candidates.append((path, old_text, new_text, hunks))
+        encoded_text = new_text.replace("\n", newline).encode("utf-8")
+        candidates.append((path, raw_content, encoded_text, hunks))
 
-    committed: list[tuple[Path, str]] = []
+    committed: list[tuple[Path, bytes]] = []
     try:
-        for path, old_text, new_text, _ in candidates:
-            path.write_text(new_text, encoding="utf-8")
-            committed.append((path, old_text))
+        for path, old_content, new_content, _ in candidates:
+            path.write_bytes(new_content)
+            committed.append((path, old_content))
     except OSError as error:
         rollback_errors: list[str] = []
-        for path, old_text in reversed(committed):
+        for path, old_content in reversed(committed):
             try:
-                path.write_text(old_text, encoding="utf-8")
+                path.write_bytes(old_content)
             except OSError:
                 rollback_errors.append(str(path))
         detail = f"; rollback failed for {', '.join(rollback_errors)}" if rollback_errors else ""
