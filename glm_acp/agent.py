@@ -86,6 +86,13 @@ from .config import (
     persist_reasoning,
     thought_levels_for_model,
 )
+from .deliberation import (
+    MAX_CRITIC_REVIEWS_PER_TURN,
+    DeliberationError,
+    GroundedDeliberation,
+    fallback_hypotheses,
+    redact_diff,
+)
 from .diagnostics import DiagnosticsManager
 from .failure_corpus import FailureCorpus
 from .glm_client import GlmClient
@@ -152,6 +159,9 @@ materially reduces uncertainty; the primary agent remains responsible for verifi
 evidence IDs; distinguish observations, assumptions, hypotheses, contradictions, unknowns, \
 and capability limits. Resolve stale hypotheses instead of repeating them. Persistent-goal \
 completion requires fresh evidence-backed observations for every criterion.
+- For deliberate diagnosis, compare two or three falsifiable hypotheses and record each test \
+with update_deliberation using fresh harness evidence IDs. Prefer the highest-ranked allowed \
+value-of-information action; do not substitute private reasoning for external evidence.
 
 Learning:
 - Durable facts and learned skills are project-local, inspectable, and opt-in.
@@ -309,6 +319,7 @@ class Session:
         self.verification = VerificationLedger()
         self.awareness = EpistemicLedger()
         self.metacognition = MetacognitiveController()
+        self.deliberation = GroundedDeliberation()
         self.goal: str = ""
         self.subgoals: list[str] = []
         self.goal_paused = False
@@ -370,6 +381,23 @@ class Session:
             "\n\nManaged metacognitive controller (bounded metadata; follow its execution "
             "posture without expanding authority):\n" + assessment.model_context()
         )
+        available_tools = {
+            str(item.get("function", {}).get("name", ""))
+            for item in [*TOOL_DEFINITIONS, *MCP_TOOL_DEFINITIONS]
+        }
+        self.deliberation.prepare(
+            self.goal or self.task_context,
+            assessment,
+            available_tools,
+            self.permission_mode,
+            self.awareness.fresh_evidence_ids(),
+            self.verification.edit_generation,
+        )
+        if assessment.execution_mode != "direct" or self.deliberation.hypotheses:
+            content += (
+                "\n\nManaged grounded deliberation (bounded conclusions and evidence IDs; "
+                "never private reasoning):\n" + self.deliberation.model_context()
+            )
         prompt = {"role": "system", "content": content}
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = prompt
@@ -421,6 +449,7 @@ class Session:
             "verification": self.verification.to_dict(),
             "awareness": self.awareness.to_dict(),
             "metacognition": self.metacognition.to_dict(),
+            "deliberation": self.deliberation.to_dict(),
             "goal": self.goal,
             "subgoals": self.subgoals,
             "goal_paused": self.goal_paused,
@@ -475,6 +504,7 @@ class Session:
         session.verification = VerificationLedger(data.get("verification"))
         session.awareness = EpistemicLedger(data.get("awareness"))
         session.metacognition = MetacognitiveController(data.get("metacognition"))
+        session.deliberation = GroundedDeliberation(data.get("deliberation"))
         session.goal = str(data.get("goal", ""))[:4000]
         session.subgoals = [
             str(value)[:1000] for value in data.get("subgoals", []) if isinstance(value, str)
@@ -863,6 +893,263 @@ class GlmAcpAgent(acp.Agent):
             "Continue using tools and fresh verification evidence."
         )
 
+    @staticmethod
+    def _fresh_deliberation_evidence(session: Session) -> list[dict[str, Any]]:
+        """Expose fresh harness metadata only; never conversation or reasoning state."""
+        return [
+            {
+                "id": item.id,
+                "source": item.source,
+                "summary": item.summary,
+                "scopes": item.scopes[:20],
+                "edit_generation": item.edit_generation,
+            }
+            for item in session.awareness.evidence[-40:]
+            if not item.stale and item.source != "user"
+        ]
+
+    async def _prepare_diagnostic_hypotheses(self, session: Session) -> None:
+        """Generate one isolated 2-3 hypothesis set for ambiguous diagnostic work."""
+        assessment = session.metacognition.assessment
+        if (
+            assessment is None
+            or not session.deliberation.requires_hypotheses(assessment)
+            or session.deliberation.hypotheses
+        ):
+            return
+        packet = {
+            "objective": session.goal or session.task_context,
+            "criteria": session.subgoals[:20],
+            "fresh_evidence": self._fresh_deliberation_evidence(session),
+            "uncertainty_classes": [item.kind for item in assessment.uncertainties],
+        }
+        source = "auxiliary"
+        try:
+            client = self._aux_client_for_session(session)
+            response = await client.complete_auxiliary(
+                "Generate two or three distinct falsifiable explanations for an ambiguous "
+                "software failure. Use only the supplied objective and fresh evidence. Do not "
+                "assume any private reasoning or invent observations. Return strict JSON: "
+                '{"hypotheses":[{"statement":"...","prediction":"observable result",'
+                '"falsifier":"observable result"}]}. Each prediction must distinguish its '
+                "hypothesis from at least one alternative.",
+                wrap_untrusted_output(
+                    json.dumps(packet, ensure_ascii=False), "diagnostic-evidence"
+                ),
+                max_tokens=600,
+            )
+            self._record_auxiliary_usage(session, response.usage)
+            match = re.search(r"\{.*\}", response.content, re.DOTALL)
+            parsed = json.loads(match.group(0)) if match else {}
+            session.deliberation.set_hypotheses(parsed.get("hypotheses", []), source="auxiliary")
+        except Exception:
+            logger.warning(
+                "Independent hypothesis generation failed; using bounded fallback",
+                exc_info=True,
+            )
+            source = "fallback"
+            session.deliberation.set_hypotheses(fallback_hypotheses(), source=source)
+        self._telemetry.record(
+            "hypothesis_set",
+            session.id,
+            count=len(session.deliberation.hypotheses),
+            source=source,
+            task_family=assessment.task_family,
+        )
+        session.refresh_system_prompt()
+
+    @staticmethod
+    async def _bounded_session_diff(session: Session) -> str:
+        """Read a bounded, credential-redacted Git diff without a shell."""
+        root = Path(session.cwd).resolve()
+        relative_paths: list[str] = []
+        for raw in session.verification.changed_paths[-40:]:
+            try:
+                resolved = Path(session.sandbox.resolve(raw)).resolve()
+                relative = resolved.relative_to(root).as_posix()
+            except (ToolError, ValueError, OSError):
+                continue
+            if relative not in relative_paths:
+                relative_paths.append(relative)
+        if not relative_paths:
+            return "(no workspace diff paths recorded)"
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key in {"PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL"}
+        }
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--unified=2",
+                "HEAD",
+                "--",
+                *relative_paths,
+                cwd=str(root),
+                env=environment,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+            if process.returncode == 0:
+                diff = stdout.decode("utf-8", errors="replace")
+                # Ordinary git diff omits new untracked files. Include only the
+                # already-recorded changed paths, with a strict shared byte cap.
+                if len(diff) < 16_000:
+                    untracked = await asyncio.create_subprocess_exec(
+                        "git",
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                        "--",
+                        *relative_paths,
+                        cwd=str(root),
+                        env=environment,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    names, _ = await asyncio.wait_for(untracked.communicate(), timeout=5)
+                    for name in names.decode("utf-8", errors="replace").splitlines():
+                        try:
+                            candidate = (root / name).resolve()
+                            candidate.relative_to(root)
+                            content = candidate.read_text(encoding="utf-8")
+                        except (OSError, UnicodeDecodeError, ValueError):
+                            continue
+                        remaining = 16_000 - len(diff)
+                        if remaining <= 0:
+                            break
+                        diff += (
+                            f"\n--- /dev/null\n+++ b/{name}\n@@ new file @@\n{content[:remaining]}"
+                        )
+                return redact_diff(diff)
+        except asyncio.TimeoutError:
+            for child in (locals().get("process"), locals().get("untracked")):
+                if child is not None and child.returncode is None:
+                    child.kill()
+                    await child.communicate()
+        except OSError:
+            pass
+        return json.dumps(
+            {"changed_files": len(relative_paths), "diff_unavailable": True},
+            separators=(",", ":"),
+        )
+
+    async def _evidence_only_critique(
+        self,
+        session: Session,
+    ) -> tuple[str, bool]:
+        """Run one bounded independent completion review without primary reasoning."""
+        assessment = session.metacognition.assessment
+        if assessment is None or not session.deliberation.requires_critic(
+            assessment, session.verification.changed_paths, bool(session.goal)
+        ):
+            return "", False
+        # The existing result-aware verification guard owns this cheaper failure mode.
+        # Run the independent critic only after the diff has a fresh evidence packet.
+        if session.verification.changed_paths and session.verification.fresh_pass is None:
+            return "", False
+        fresh_evidence = self._fresh_deliberation_evidence(session)
+        fresh_ids = {str(item["id"]) for item in fresh_evidence}
+        structural = session.deliberation.structural_critique(
+            assessment,
+            session.verification.changed_paths,
+            session.verification.fresh_pass is not None,
+            fresh_ids,
+            session.verification.edit_generation,
+        )
+        if structural is not None:
+            self._telemetry.record(
+                "evidence_critic",
+                session.id,
+                outcome=structural.outcome,
+                source=structural.source,
+                concerns=len(structural.concerns),
+                evidence_count=0,
+                diff_chars=0,
+            )
+            return (
+                "Independent evidence-only critic requests revision: "
+                + "; ".join(structural.concerns)
+                + ". Use the highest-value allowed evidence action, record hypothesis tests "
+                "with update_deliberation, and then reassess completion.",
+                True,
+            )
+
+        certificate = session.awareness.build_certificate(
+            goal=session.goal,
+            criteria=session.subgoals,
+            task=session.task_context,
+            edit_generation=session.verification.edit_generation,
+            changed_paths=session.verification.changed_paths,
+            fresh_verification=session.verification.fresh_pass is not None,
+        )
+        diff = await self._bounded_session_diff(session)
+        packet = {
+            "objective": session.goal or session.task_context,
+            "criteria": session.subgoals[:20],
+            "diff": diff,
+            "fresh_evidence": fresh_evidence,
+            "completion_certificate": certificate.to_dict(),
+            "hypotheses": [item.to_dict() for item in session.deliberation.hypotheses],
+        }
+        try:
+            client = self._aux_client_for_session(session)
+            response = await client.complete_auxiliary(
+                "Act as an independent evidence-only coding critic. You receive no private "
+                "reasoning and must not infer any. Evaluate only the objective, bounded diff, "
+                "fresh harness evidence, hypothesis results, and completion certificate. "
+                'Return strict JSON: {"outcome":"approve|revise|blocked",'
+                '"summary":"...","concerns":["..."],'
+                '"evidence_ids":["evN"]}. Approval must cite fresh evidence. A concern '
+                "must identify an observable gap, contradiction, regression risk, or missing "
+                "criterion—not style preference or unverifiable speculation.",
+                wrap_untrusted_output(
+                    json.dumps(packet, ensure_ascii=False), "critic-evidence-packet"
+                ),
+                max_tokens=500,
+            )
+            self._record_auxiliary_usage(session, response.usage)
+            match = re.search(r"\{.*\}", response.content, re.DOTALL)
+            parsed = json.loads(match.group(0)) if match else {}
+            verdict = session.deliberation.validate_critic(
+                parsed,
+                fresh_evidence_ids=fresh_ids,
+                edit_generation=session.verification.edit_generation,
+            )
+            self._telemetry.record(
+                "evidence_critic",
+                session.id,
+                outcome=verdict.outcome,
+                source=verdict.source,
+                concerns=len(verdict.concerns),
+                evidence_count=len(verdict.evidence_ids),
+                diff_chars=len(diff),
+            )
+            session.refresh_system_prompt()
+            if verdict.outcome == "approve":
+                return "", True
+            return (
+                f"Independent evidence-only critic returned {verdict.outcome}: "
+                + "; ".join(verdict.concerns or (verdict.summary,))
+                + ". Resolve the observable concern or report the established blocker.",
+                True,
+            )
+        except Exception:
+            logger.warning("Evidence-only critic unavailable", exc_info=True)
+            self._telemetry.record(
+                "evidence_critic",
+                session.id,
+                outcome="unavailable",
+                source="auxiliary",
+                concerns=0,
+                evidence_count=len(fresh_ids),
+                diff_chars=len(diff),
+            )
+            return "", True
+
     def _record_capability_outcome(
         self,
         session: Session,
@@ -1228,6 +1515,7 @@ class GlmAcpAgent(acp.Agent):
         new_session.verification = VerificationLedger(parent.verification.to_dict())
         new_session.awareness = EpistemicLedger(parent.awareness.to_dict())
         new_session.metacognition = MetacognitiveController(parent.metacognition.to_dict())
+        new_session.deliberation = GroundedDeliberation(parent.deliberation.to_dict())
         new_session.goal = parent.goal
         new_session.subgoals = list(parent.subgoals)
         new_session.goal_paused = parent.goal_paused
@@ -1824,9 +2112,11 @@ class GlmAcpAgent(acp.Agent):
                     "mcp_list_tools",
                     "update_plan",
                     "update_awareness",
+                    "update_deliberation",
                 )
             ]
         )
+        await self._prepare_diagnostic_hypotheses(session)
 
         previous_tool_batch = ""
         repeated_tool_batches = 0
@@ -1847,6 +2137,8 @@ class GlmAcpAgent(acp.Agent):
         capability_output_start = session.total_output_tokens
         capability_tool_calls = 0
         capability_tool_failures = 0
+        critic_review_count = 0
+        voi_selection_recorded = False
         delegation_budget = {
             "workers": MAX_DELEGATIONS_PER_TURN,
             "tool_calls": MAX_DELEGATE_TOOL_CALLS_PER_TURN,
@@ -2048,6 +2340,14 @@ class GlmAcpAgent(acp.Agent):
                         )
                         continue
                     pre_verify_checked = True
+                if critic_review_count < MAX_CRITIC_REVIEWS_PER_TURN:
+                    critic_continuation, critic_reviewed = await self._evidence_only_critique(
+                        session
+                    )
+                    critic_review_count += int(critic_reviewed)
+                    if critic_continuation:
+                        session.messages.append({"role": "system", "content": critic_continuation})
+                        continue
                 if not session.goal:
                     certificate = session.awareness.build_certificate(
                         goal="",
@@ -2175,6 +2475,29 @@ class GlmAcpAgent(acp.Agent):
                 )
             )
             if read_only_batch:
+                recommendation = session.deliberation.recommendation
+                batch_tools = [str(call["function"].get("name", "")) for call in result.tool_calls]
+                matched_recommendation = bool(recommendation and recommendation.tool in batch_tools)
+                selected_tool = (
+                    recommendation.tool
+                    if recommendation and matched_recommendation
+                    else batch_tools[0]
+                )
+                if (
+                    not voi_selection_recorded
+                    and recommendation is not None
+                    and recommendation.tool not in {"ask_user", "request_permission"}
+                ):
+                    self._telemetry.record(
+                        "voi_selection",
+                        session.id,
+                        recommended_tool=recommendation.tool,
+                        selected_tool=selected_tool,
+                        matched=matched_recommendation,
+                        recommended_score=round(recommendation.score, 3),
+                        resolves=list(recommendation.resolves),
+                    )
+                    voi_selection_recorded = True
                 for tc in result.tool_calls:
                     self._prepare_progressive_context(
                         session,
@@ -2247,6 +2570,23 @@ class GlmAcpAgent(acp.Agent):
             for tc in result.tool_calls:
                 tool_name = tc["function"]["name"]
                 tool_args = tc["function"]["arguments"]
+                recommendation = session.deliberation.recommendation
+                if (
+                    not voi_selection_recorded
+                    and recommendation is not None
+                    and recommendation.tool not in {"ask_user", "request_permission"}
+                    and TOOL_KINDS.get(tool_name) in {"read", "search", "execute"}
+                ):
+                    self._telemetry.record(
+                        "voi_selection",
+                        session.id,
+                        recommended_tool=recommendation.tool,
+                        selected_tool=tool_name,
+                        matched=tool_name == recommendation.tool,
+                        recommended_score=round(recommendation.score, 3),
+                        resolves=list(recommendation.resolves),
+                    )
+                    voi_selection_recorded = True
                 if tool_name == "cronjob":
                     tool_args = {**tool_args, "_origin_session_id": session.id}
                 tc_id = tc["id"]
@@ -2338,6 +2678,19 @@ class GlmAcpAgent(acp.Agent):
                         await self._complete_tool(session.id, tc_id, output)
                     except (AwarenessError, ValueError) as error:
                         output = f"Error updating awareness: {error}"
+                        await self._fail_tool(session.id, tc_id, output)
+                    session.messages.append(
+                        {"role": "tool", "tool_call_id": tc_id, "content": output}
+                    )
+                    continue
+
+                # Deliberation stores falsifiable conclusions and fresh evidence IDs only.
+                if tool_name == "update_deliberation":
+                    try:
+                        output = await self._handle_update_deliberation(session, tool_args)
+                        await self._complete_tool(session.id, tc_id, output)
+                    except (DeliberationError, ValueError) as error:
+                        output = f"Error updating deliberation: {error}"
                         await self._fail_tool(session.id, tc_id, output)
                     session.messages.append(
                         {"role": "tool", "tool_call_id": tc_id, "content": output}
@@ -3258,6 +3611,53 @@ class GlmAcpAgent(acp.Agent):
             ensure_ascii=False,
         )
 
+    async def _handle_update_deliberation(self, session: Session, args: dict[str, Any]) -> str:
+        """Update bounded hypotheses or one fresh evidence-backed test result."""
+        action = str(args.get("action", "")).strip().lower()
+        if action == "replace_hypotheses":
+            values = session.deliberation.set_hypotheses(
+                args.get("hypotheses", []), source="primary"
+            )
+            self._telemetry.record(
+                "hypothesis_set",
+                session.id,
+                count=len(values),
+                source="primary",
+                task_family=(
+                    session.metacognition.assessment.task_family
+                    if session.metacognition.assessment
+                    else "general"
+                ),
+            )
+            result: dict[str, Any] = {
+                "hypotheses": [item.to_dict() for item in values],
+            }
+        elif action == "record_test":
+            fresh_ids = {
+                item.id
+                for item in session.awareness.evidence
+                if not item.stale and item.source != "user"
+            }
+            hypothesis = session.deliberation.record_test(
+                str(args.get("hypothesis_id", "")).strip().lower(),
+                str(args.get("status", "")).strip().lower(),
+                args.get("evidence_ids", []),
+                fresh_ids,
+            )
+            self._telemetry.record(
+                "hypothesis_test",
+                session.id,
+                hypothesis=hypothesis.id,
+                status=hypothesis.status,
+                evidence_count=len(hypothesis.evidence_ids),
+            )
+            result = {"hypothesis": hypothesis.to_dict()}
+        else:
+            raise DeliberationError("Deliberation action must be replace_hypotheses or record_test")
+        session.refresh_system_prompt()
+        await self._save_session(session)
+        return json.dumps(result, ensure_ascii=False)
+
     async def _send_plan(self, session: Session) -> None:
         """Send the current plan as an ACP plan session update.
 
@@ -3457,6 +3857,13 @@ class GlmAcpAgent(acp.Agent):
                 description=(
                     "Show uncertainty classes, adaptive execution mode, risk, and the "
                     "matching empirical capability profile"
+                ),
+            ),
+            AvailableCommand(
+                name="deliberation",
+                description=(
+                    "Show falsifiable hypotheses, evidence-backed test status, the "
+                    "evidence-only critic, and value-of-information action ranking"
                 ),
             ),
             AvailableCommand(
@@ -3716,6 +4123,11 @@ class GlmAcpAgent(acp.Agent):
             await self._save_session(session)
             return session.metacognition.render()
 
+        elif command == "/deliberation":
+            session.refresh_system_prompt()
+            await self._save_session(session)
+            return session.deliberation.render()
+
         elif command == "/clear-history":
             system_msg = (
                 session.messages[0]
@@ -3733,6 +4145,7 @@ class GlmAcpAgent(acp.Agent):
             session.task_context = ""
             session.awareness = EpistemicLedger()
             session.metacognition = MetacognitiveController()
+            session.deliberation = GroundedDeliberation()
             session.compaction_learning_proposals = []
             session.compaction_quality_history = []
             session.refresh_system_prompt()
@@ -3873,6 +4286,8 @@ class GlmAcpAgent(acp.Agent):
             assessment = session.metacognition.assessment
             execution_mode = assessment.execution_mode if assessment else "not assessed"
             uncertainty_count = len(assessment.uncertainties) if assessment else 0
+            recommendation = session.deliberation.recommendation
+            critic = session.deliberation.critic
             return (
                 f"\n📊 **Session Status**\n"
                 f"- **Model:** {session.model}\n"
@@ -3886,6 +4301,9 @@ class GlmAcpAgent(acp.Agent):
                 f"- **Permissions:** {session.permission_mode}\n"
                 f"- **Adaptive execution:** {execution_mode} · "
                 f"{uncertainty_count} uncertainty classes\n"
+                f"- **Information action:** "
+                f"{recommendation.tool if recommendation else 'none'}\n"
+                f"- **Evidence critic:** {critic.outcome if critic else 'not run'}\n"
                 f"- **Isolated profile:** {active_profile()}\n"
                 f"- **OS sandbox mode:** {sandbox_mode()}\n"
                 f"- **Latest checkpoint:** {session.last_checkpoint_id or 'none'}\n"
@@ -4000,6 +4418,7 @@ class GlmAcpAgent(acp.Agent):
             return (
                 f"Unknown command: {command}\nAvailable commands: /compact, "
                 "/clear-plan, /clear-history, /diff, /export, /status, /memory, "
+                "/awareness, /metacognition, /deliberation, "
                 "/skills, /profile, /curator, /sessions"
                 ", /lineage, /goal, /subgoal"
                 ", /checkpoint, /rollback, /plugins"
@@ -4755,6 +5174,7 @@ class GlmAcpAgent(acp.Agent):
             "mcp_call": "Calling MCP tool",
             "update_plan": "Updating plan",
             "update_awareness": "Updating evidence and uncertainty",
+            "update_deliberation": "Testing diagnostic hypotheses",
         }.get(name, name)
 
     def _build_model_option(self, session: Session) -> SessionConfigOptionSelect:

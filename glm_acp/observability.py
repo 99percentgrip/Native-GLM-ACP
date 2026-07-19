@@ -22,6 +22,14 @@ def _percentile(values: list[int], fraction: float) -> int:
     return int(ordered[index])
 
 
+def _safe_int(value: Any) -> int:
+    """Treat malformed metadata as zero instead of breaking the dashboard."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _events(path: Path, max_events: int) -> list[dict[str, Any]]:
     try:
         size = path.stat().st_size
@@ -57,15 +65,19 @@ def observability_snapshot(
     turns = [event for event in events if event.get("event") == "turn_complete"]
     certificates = [event for event in events if event.get("event") == "completion_certificate"]
     capability = [event for event in events if event.get("event") == "capability_outcome"]
-    durations = [int(event.get("duration_ms", 0) or 0) for event in tools]
-    llm_durations = [int(event.get("duration_ms", 0) or 0) for event in llm]
+    critics = [event for event in events if event.get("event") == "evidence_critic"]
+    hypothesis_sets = [event for event in events if event.get("event") == "hypothesis_set"]
+    hypothesis_tests = [event for event in events if event.get("event") == "hypothesis_test"]
+    voi = [event for event in events if event.get("event") == "voi_selection"]
+    durations = [_safe_int(event.get("duration_ms")) for event in tools]
+    llm_durations = [_safe_int(event.get("duration_ms")) for event in llm]
     tool_counts = Counter(str(event.get("tool", "unknown")) for event in tools)
     tool_failures = Counter(
         str(event.get("tool", "unknown")) for event in tools if not event.get("success", False)
     )
-    input_tokens = sum(int(event.get("input_tokens", 0) or 0) for event in llm)
-    output_tokens = sum(int(event.get("output_tokens", 0) or 0) for event in llm)
-    cached_tokens = sum(int(event.get("cached_tokens", 0) or 0) for event in llm)
+    input_tokens = sum(_safe_int(event.get("input_tokens")) for event in llm)
+    output_tokens = sum(_safe_int(event.get("output_tokens")) for event in llm)
+    cached_tokens = sum(_safe_int(event.get("cached_tokens")) for event in llm)
     sessions = {str(event.get("session", "")) for event in events if event.get("session")}
     modes = Counter(str(event.get("execution_mode", "unknown")) for event in capability)
     families = Counter(str(event.get("task_family", "unknown")) for event in capability)
@@ -80,7 +92,7 @@ def observability_snapshot(
         "turns": {
             "completed": len(turns),
             "freshly_verified": sum(bool(event.get("fresh_verification")) for event in turns),
-            "changed_files": sum(int(event.get("changed_files", 0) or 0) for event in turns),
+            "changed_files": sum(_safe_int(event.get("changed_files")) for event in turns),
         },
         "awareness": {
             "certificates": len(certificates),
@@ -94,11 +106,9 @@ def observability_snapshot(
                 4,
             ),
             "active_contradictions": sum(
-                int(event.get("contradictions", 0) or 0) for event in certificates
+                _safe_int(event.get("contradictions")) for event in certificates
             ),
-            "stale_evidence": sum(
-                int(event.get("stale_evidence", 0) or 0) for event in certificates
-            ),
+            "stale_evidence": sum(_safe_int(event.get("stale_evidence")) for event in certificates),
         },
         "metacognition": {
             "outcomes": len(capability),
@@ -116,13 +126,27 @@ def observability_snapshot(
             ),
             "mean_tokens": (
                 sum(
-                    int(event.get("input_tokens", 0) or 0) + int(event.get("output_tokens", 0) or 0)
+                    _safe_int(event.get("input_tokens")) + _safe_int(event.get("output_tokens"))
                     for event in capability
                 )
                 // max(len(capability), 1)
             ),
             "by_mode": dict(modes.most_common(4)),
             "by_task_family": dict(families.most_common(8)),
+        },
+        "grounded_deliberation": {
+            "critic_reviews": len(critics),
+            "critic_approved": sum(event.get("outcome") == "approve" for event in critics),
+            "critic_revisions": sum(event.get("outcome") == "revise" for event in critics),
+            "critic_unavailable": sum(event.get("outcome") == "unavailable" for event in critics),
+            "hypothesis_sets": len(hypothesis_sets),
+            "hypotheses_generated": sum(_safe_int(event.get("count")) for event in hypothesis_sets),
+            "hypotheses_tested": len(hypothesis_tests),
+            "voi_selections": len(voi),
+            "voi_match_rate": round(
+                sum(bool(event.get("matched")) for event in voi) / max(len(voi), 1),
+                4,
+            ),
         },
         "llm": {
             "calls": len(llm),
@@ -167,6 +191,7 @@ def render_observability(snapshot: dict[str, Any]) -> str:
     safety = snapshot["safety"]
     awareness = snapshot["awareness"]
     metacognition = snapshot["metacognition"]
+    deliberation = snapshot["grounded_deliberation"]
     by_tool = (
         "\n".join(
             f"- `{item['tool']}`: {item['calls']} calls, {item['failures']} failures"
@@ -195,5 +220,10 @@ def render_observability(snapshot: dict[str, Any]) -> str:
         f"{metacognition['verified_rate']:.1%} verified · "
         f"{metacognition['mean_tokens']:,} mean tokens\n"
         f"- Adaptive modes: {json.dumps(metacognition['by_mode'], sort_keys=True)}\n\n"
+        f"- Grounded deliberation: {deliberation['critic_reviews']} critic reviews · "
+        f"{deliberation['critic_revisions']} revisions requested · "
+        f"{deliberation['hypotheses_tested']}/"
+        f"{deliberation['hypotheses_generated']} hypotheses tested · "
+        f"{deliberation['voi_match_rate']:.1%} VOI match\n\n"
         "**Most-used tools**\n" + by_tool
     )

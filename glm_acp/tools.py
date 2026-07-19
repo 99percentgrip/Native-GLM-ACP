@@ -456,6 +456,54 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "update_deliberation",
+            "description": (
+                "Maintain bounded grounded-deliberation conclusions without private reasoning. "
+                "Replace the current diagnosis with exactly two or three distinct falsifiable "
+                "hypotheses, or record a supported/refuted/inconclusive hypothesis test using "
+                "only fresh harness-issued evidence IDs from the managed context."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["replace_hypotheses", "record_test"],
+                    },
+                    "hypotheses": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "statement": {"type": "string", "maxLength": 400},
+                                "prediction": {"type": "string", "maxLength": 400},
+                                "falsifier": {"type": "string", "maxLength": 400},
+                            },
+                            "required": ["statement", "prediction", "falsifier"],
+                        },
+                    },
+                    "hypothesis_id": {"type": "string", "pattern": "^h[1-3]$"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["supported", "refuted", "inconclusive"],
+                    },
+                    "evidence_ids": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string", "maxLength": 40},
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "recall_memory",
             "description": "Read opt-in durable knowledge recorded for this project.",
             "parameters": {"type": "object", "properties": {}},
@@ -1010,6 +1058,7 @@ TOOL_KINDS: dict[str, str] = {
     "run_command": "execute",
     "update_plan": "other",
     "update_awareness": "other",
+    "update_deliberation": "other",
     "recall_memory": "read",
     "store_memory": "edit",
     "recall_user_profile": "read",

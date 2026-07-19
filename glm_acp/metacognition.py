@@ -62,7 +62,8 @@ _TASK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 _AMBIGUITY = re.compile(
-    r"\b(?:maybe|perhaps|not sure|either|whichever|somehow|something|as usual)\b|"
+    r"\b(?:maybe|perhaps|ambiguous|unclear|underspecified|not sure|either|whichever|"
+    r"somehow|something|as usual)\b|"
     r"\bor\b.{0,40}\bor\b",
     re.IGNORECASE,
 )

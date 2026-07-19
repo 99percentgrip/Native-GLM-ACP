@@ -22,6 +22,7 @@ streaming, 1M context, and auto-continuation for long generations.
 - **Verification evidence**: `verification.py` — persistent edit generations and bounded canonical command outcomes
 - **Awareness and completion evidence**: `awareness.py` — bounded typed epistemic records, harness-issued evidence references, scope-aware invalidation, and completion certificates
 - **Metacognitive control**: `metacognition.py` — typed uncertainty classification, deterministic adaptive execution modes, and telemetry-derived aggregate capability profiles
+- **Grounded deliberation**: `deliberation.py` — evidence-only criticism, falsifiable hypothesis testing, and deterministic value-of-information action ranking
 - **Post-write diagnostics**: `diagnostics.py` — deterministic syntax checks and lazy optional LSP clients
 - **Lifecycle extensions**: `hooks.py` — user-owned, hash-pinned, workspace-scoped lifecycle commands
 - **Trajectory evidence**: `telemetry.py` and `observability.py` — bounded metadata-only events plus local aggregate quality, latency, cache, tool, and safety reporting
@@ -145,6 +146,15 @@ previous compaction produces a warning.
 - Metadata-only `capability_outcome` events aggregate success, failure, token cost, latency, and targeted/full verification by a fixed task family and coarse ecosystem/VCS/session-mode/OS label. They store no task text, paths, prompts, commands, outputs, or identities and disappear when telemetry is disabled.
 - Three or more weak matching outcomes may raise the selected posture by one level. Empirical history never lowers the deterministic baseline, keeping small direct tasks from accumulating reflection overhead.
 - `/metacognition` exposes current classes, risk, mode, and matching aggregate profile; `/status` and `/observability` expose bounded mode/outcome summaries.
+
+### Grounded deliberation
+
+- Deliberate/high-assurance diagnosis uses exactly two or three distinct hypothesis records. Each contains a concise statement, observable prediction, observable falsifier, and `untested`, `supported`, `refuted`, or `inconclusive` status; tested states require fresh non-user harness evidence IDs.
+- Hypotheses come from one thinking-disabled auxiliary call over the objective and fresh evidence only, with a bounded deterministic fallback. Objective changes clear them; stale evidence resets affected tests.
+- The independent critic runs at most twice per turn and receives no conversation history, assistant answer, or `reasoning_content`. Its packet is limited to the objective/criteria, bounded credential-redacted Git diff, fresh harness evidence, hypothesis results, and completion certificate.
+- Structural verification guards run before the critic. An auxiliary approval must cite fresh evidence; relevant edits invalidate the verdict. Critic output is advisory loop guidance and never authorizes tools, workers, policy changes, or completion by itself.
+- Value-of-information ranking scores only available/virtual actions by expected information gain, reliability, and cost. Direct tasks receive no ranking; Read Only never recommends command execution; permissions and policy still evaluate the selected action normally.
+- `/deliberation` exposes hypothesis/test state, ranked actions, and the latest critic verdict. Telemetry records only counts, enums, tool names, scores, and match outcomes—never objectives, hypotheses, diffs, evidence bodies, paths, or reasoning.
 
 ### Auxiliary routing and delegation
 
@@ -449,7 +459,7 @@ from close.
 Forks persist `parent_session_id` plus `branch_root_id`; `/lineage` exposes direct
 children and identifies the parent session as the rollback path.
 Instruction targets, verification ledger, epistemic ledger, metacognitive assessment,
-persistent goal/subgoals, judge budget, and Mixture-of-Agents selection are serialized with the session; read
+grounded-deliberation conclusions, persistent goal/subgoals, judge budget, and Mixture-of-Agents selection are serialized with the session; read
 fingerprints, active checkpoint state, and reference-response caches remain runtime-only.
 
 **Critical:** The ACP `LoadSessionResponse` and `ResumeSessionResponse` only

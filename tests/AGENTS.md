@@ -24,6 +24,7 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
 - `test_hardening_roadmap.py` covers macOS/Windows sandbox capability truth, digest-pinned worker promotion and rollback, language-aware references, failure-case promotion, observability, Ed25519 plugin trust, and offline fuzz/fault injection.
 - `test_awareness.py` covers typed epistemic state, provenance validation, secret/promptware rejection, scope-aware staleness, contradiction resolution, completion certificates, `/awareness`, judge gating, and awareness observability.
 - `test_metacognition.py` covers uncertainty separation, risk/mode selection, small-task restraint, empirical escalation, telemetry opt-out, profile corruption/promptware rejection, persistence, commands, and observability.
+- `test_deliberation.py` covers evidence-only critic isolation, bounded falsifiable hypotheses, fresh test evidence, stale invalidation, value-of-information ranking, diff redaction, persistence, commands, and metadata-only observability.
 
 ## Local Contracts
 
@@ -52,6 +53,7 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
 - Hardening-roadmap tests must prove platform backends do not overclaim isolation, reviewed worker hashes and verification gate atomic promotion, primary conflicts/faults preserve prior content, language ranking prioritizes definitions, failure drafts exclude bodies/paths/secrets, observability ignores corruption, signatures require exact trusted keys, and fuzzing is deterministic/offline.
 - Awareness tests must prove unsupported evidence/criteria fail closed, relevant edits stale support without invalidating user evidence, every criterion and fresh post-edit verification gates persistent completion, active contradictions block completion, external bodies are excluded, and incomplete certificates bypass the auxiliary judge.
 - Metacognition tests must prove every uncertainty category remains distinct, unverified edits and release operations select high assurance, trivial tasks remain direct, weak profiles only escalate after enough outcomes, corrupt/malicious metadata is ignored, telemetry opt-out disables profiles, and no task text or path enters outcome events.
+- Deliberation tests must prove direct tasks add no overhead, diagnosis uses two or three distinct predictions/falsifiers, test results cite fresh non-user evidence, stale support resets tests and critic approval, approval cites known evidence, critic packets exclude primary reasoning, diff secrets are redacted, Read Only excludes command recommendations, and telemetry stores metadata only.
 
 ## Work Guidance
 
