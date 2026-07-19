@@ -21,6 +21,7 @@ streaming, 1M context, and auto-continuation for long generations.
 - **Project discovery**: `project_context.py` — repository roots, progressive instruction files, manifests, package managers, git state, and canonical verification commands
 - **Verification evidence**: `verification.py` — persistent edit generations and bounded canonical command outcomes
 - **Awareness and completion evidence**: `awareness.py` — bounded typed epistemic records, harness-issued evidence references, scope-aware invalidation, and completion certificates
+- **Metacognitive control**: `metacognition.py` — typed uncertainty classification, deterministic adaptive execution modes, and telemetry-derived aggregate capability profiles
 - **Post-write diagnostics**: `diagnostics.py` — deterministic syntax checks and lazy optional LSP clients
 - **Lifecycle extensions**: `hooks.py` — user-owned, hash-pinned, workspace-scoped lifecycle commands
 - **Trajectory evidence**: `telemetry.py` and `observability.py` — bounded metadata-only events plus local aggregate quality, latency, cache, tool, and safety reporting
@@ -135,6 +136,15 @@ previous compaction produces a warning.
 - `/awareness` renders active observations, assumptions, hypotheses, contradictions, unknowns, capability limits, stale state, fresh evidence IDs, completion coverage, and the next evidence need.
 - Persistent goals reach the bounded auxiliary judge only when every goal/criterion has a fresh evidence-backed observation, no contradiction remains active, and changed files have fresh verification.
 - Ordinary turns emit informational completion-certificate metrics without adding a new hard completion loop.
+
+### Metacognitive controller
+
+- The controller separately classifies ambiguity, knowledge gaps, diagnostic uncertainty, capability limits, verification gaps, and permission uncertainty from task-family heuristics, the epistemic ledger, permission mode, and verification freshness.
+- It selects one bounded posture: `direct` for simple low-risk work, `grounded` for minimum-evidence work, `deliberate` for competing diagnoses, or `high-assurance` for operations, high risk, and unverified edits.
+- Mode guidance is managed prompt metadata only. It cannot alter provider reasoning settings, expand permissions, bypass policy/sandbox/plugin trust, invoke delegates, or write trusted rules.
+- Metadata-only `capability_outcome` events aggregate success, failure, token cost, latency, and targeted/full verification by a fixed task family and coarse ecosystem/VCS/session-mode/OS label. They store no task text, paths, prompts, commands, outputs, or identities and disappear when telemetry is disabled.
+- Three or more weak matching outcomes may raise the selected posture by one level. Empirical history never lowers the deterministic baseline, keeping small direct tasks from accumulating reflection overhead.
+- `/metacognition` exposes current classes, risk, mode, and matching aggregate profile; `/status` and `/observability` expose bounded mode/outcome summaries.
 
 ### Auxiliary routing and delegation
 
@@ -438,8 +448,8 @@ history; deletion is a separate storage operation and must never be inferred
 from close.
 Forks persist `parent_session_id` plus `branch_root_id`; `/lineage` exposes direct
 children and identifies the parent session as the rollback path.
-Instruction targets, verification ledger, persistent goal/subgoals, judge
-budget, and Mixture-of-Agents selection are serialized with the session; read
+Instruction targets, verification ledger, epistemic ledger, metacognitive assessment,
+persistent goal/subgoals, judge budget, and Mixture-of-Agents selection are serialized with the session; read
 fingerprints, active checkpoint state, and reference-response caches remain runtime-only.
 
 **Critical:** The ACP `LoadSessionResponse` and `ResumeSessionResponse` only
@@ -478,14 +488,16 @@ import asyncio
 class ClientStub:
     async def session_update(self, **kwargs):
         pass
-agent = GlmAcpAgent()
-agent.on_connect(ClientStub())
-r = asyncio.run(agent.initialize(protocol_version=1))
-assert r.protocol_version == 1
-s = asyncio.run(agent.new_session(cwd='/tmp'))
-assert s.config_options[0].category == 'model'
-assert s.config_options[1].category == 'thought_level'
-asyncio.run(agent.aclose())
+async def verify():
+    agent = GlmAcpAgent()
+    agent.on_connect(ClientStub())
+    r = await agent.initialize(protocol_version=1)
+    assert r.protocol_version == 1
+    s = await agent.new_session(cwd='/tmp')
+    assert s.config_options[0].category == 'model'
+    assert s.config_options[1].category == 'thought_level'
+    await agent.aclose()
+asyncio.run(verify())
 print('Handshake OK')
 "
 ```

@@ -100,6 +100,7 @@ from .memory import (
     skill_curator_status,
     user_knowledge,
 )
+from .metacognition import CapabilityProfiles, MetacognitiveController
 from .policy import PolicyEngine
 from .profiles import active_profile
 from .project_context import detect_project_facts, instruction_files
@@ -307,6 +308,7 @@ class Session:
         self.instruction_targets: list[str] = []
         self.verification = VerificationLedger()
         self.awareness = EpistemicLedger()
+        self.metacognition = MetacognitiveController()
         self.goal: str = ""
         self.subgoals: list[str] = []
         self.goal_paused = False
@@ -354,6 +356,20 @@ class Session:
                 "\n\nManaged epistemic state (metadata only; record updates must cite listed "
                 "evidence IDs):\n" + awareness
             )
+        assessment = self.metacognition.assess(
+            task=self.goal or self.task_context,
+            facts=detect_project_facts(self.cwd),
+            ledger=self.awareness,
+            permission_mode=self.permission_mode,
+            session_mode=self.mode,
+            changed_paths=self.verification.changed_paths,
+            fresh_verification=self.verification.fresh_pass is not None,
+            persistent_goal=bool(self.goal),
+        )
+        content += (
+            "\n\nManaged metacognitive controller (bounded metadata; follow its execution "
+            "posture without expanding authority):\n" + assessment.model_context()
+        )
         prompt = {"role": "system", "content": content}
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = prompt
@@ -404,6 +420,7 @@ class Session:
             "instruction_targets": self.instruction_targets,
             "verification": self.verification.to_dict(),
             "awareness": self.awareness.to_dict(),
+            "metacognition": self.metacognition.to_dict(),
             "goal": self.goal,
             "subgoals": self.subgoals,
             "goal_paused": self.goal_paused,
@@ -457,6 +474,7 @@ class Session:
         ][-100:]
         session.verification = VerificationLedger(data.get("verification"))
         session.awareness = EpistemicLedger(data.get("awareness"))
+        session.metacognition = MetacognitiveController(data.get("metacognition"))
         session.goal = str(data.get("goal", ""))[:4000]
         session.subgoals = [
             str(value)[:1000] for value in data.get("subgoals", []) if isinstance(value, str)
@@ -845,6 +863,44 @@ class GlmAcpAgent(acp.Agent):
             "Continue using tools and fresh verification evidence."
         )
 
+    def _record_capability_outcome(
+        self,
+        session: Session,
+        *,
+        success: bool,
+        started: float,
+        input_start: int,
+        output_start: int,
+        tool_calls: int,
+        tool_failures: int,
+    ) -> None:
+        """Persist one metadata-only empirical outcome for the selected task posture."""
+        assessment = session.metacognition.assessment
+        if assessment is None:
+            session.refresh_system_prompt()
+            assessment = session.metacognition.assessment
+        if assessment is None:
+            return
+        verification = session.verification.fresh_pass
+        strength = verification.scope if verification is not None else "none"
+        self._telemetry.record(
+            "capability_outcome",
+            session.id,
+            task_family=assessment.task_family,
+            environment=assessment.environment,
+            execution_mode=assessment.execution_mode,
+            risk_score=assessment.risk_score,
+            uncertainty_kinds=[item.kind for item in assessment.uncertainties],
+            success=success,
+            verification_strength=strength,
+            input_tokens=max(0, session.total_input_tokens - input_start),
+            output_tokens=max(0, session.total_output_tokens - output_start),
+            duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+            tool_calls=max(0, tool_calls),
+            tool_failures=max(0, tool_failures),
+        )
+        session.metacognition.profiles = CapabilityProfiles.load()
+
     async def _invalidate_session_client(self, session: Session) -> None:
         client = session.client
         aux_client = session.aux_client
@@ -1171,10 +1227,12 @@ class GlmAcpAgent(acp.Agent):
         new_session.instruction_targets = list(parent.instruction_targets)
         new_session.verification = VerificationLedger(parent.verification.to_dict())
         new_session.awareness = EpistemicLedger(parent.awareness.to_dict())
+        new_session.metacognition = MetacognitiveController(parent.metacognition.to_dict())
         new_session.goal = parent.goal
         new_session.subgoals = list(parent.subgoals)
         new_session.goal_paused = parent.goal_paused
         new_session.goal_turns = parent.goal_turns
+        new_session.refresh_system_prompt()
 
         self._sessions[new_session.id] = new_session
         await self._save_session(new_session)
@@ -1297,6 +1355,8 @@ class GlmAcpAgent(acp.Agent):
         if current_client_key != previous_client_key:
             session.refresh_system_prompt()
             await self._invalidate_session_client(session)
+        elif config_id == "permission_mode":
+            session.refresh_system_prompt()
 
         await self._save_session(session)
 
@@ -1337,6 +1397,7 @@ class GlmAcpAgent(acp.Agent):
 
             return SetSessionModeResponse()
         session.mode = mode_id
+        session.refresh_system_prompt()
         await self._save_session(session)
         from acp.schema import SetSessionModeResponse
 
@@ -1781,6 +1842,11 @@ class GlmAcpAgent(acp.Agent):
         pre_verify_checked = False
         hook_verify_nudges = 0
         loop_guard = ToolLoopGuard()
+        capability_started = time.monotonic()
+        capability_input_start = session.total_input_tokens
+        capability_output_start = session.total_output_tokens
+        capability_tool_calls = 0
+        capability_tool_failures = 0
         delegation_budget = {
             "workers": MAX_DELEGATIONS_PER_TURN,
             "tool_calls": MAX_DELEGATE_TOOL_CALLS_PER_TURN,
@@ -1791,6 +1857,15 @@ class GlmAcpAgent(acp.Agent):
         for turn_iter in range(MAX_TOOL_ITERATIONS):
             # --- Check for cancellation ---
             if client.cancelled:
+                self._record_capability_outcome(
+                    session,
+                    success=False,
+                    started=capability_started,
+                    input_start=capability_input_start,
+                    output_start=capability_output_start,
+                    tool_calls=capability_tool_calls,
+                    tool_failures=capability_tool_failures,
+                )
                 await self._send_message(
                     session.id,
                     "\n\n_⏹ Generation cancelled by user._\n",
@@ -1866,6 +1941,15 @@ class GlmAcpAgent(acp.Agent):
                             {"role": "tool", "tool_call_id": tc["id"], "content": recovery}
                         )
                     if repeated_tool_batches > MAX_REPEATED_TOOL_BATCHES:
+                        self._record_capability_outcome(
+                            session,
+                            success=False,
+                            started=capability_started,
+                            input_start=capability_input_start,
+                            output_start=capability_output_start,
+                            tool_calls=capability_tool_calls,
+                            tool_failures=capability_tool_failures,
+                        )
                         await self._send_message(
                             session.id,
                             "\n\n⚠️ **Stopped a repeated tool-call loop.** "
@@ -1995,6 +2079,15 @@ class GlmAcpAgent(acp.Agent):
                 if notice:
                     await self._send_message(session.id, f"\n\n{notice}\n")
                 if result.finish_reason == "cancelled":
+                    self._record_capability_outcome(
+                        session,
+                        success=False,
+                        started=capability_started,
+                        input_start=capability_input_start,
+                        output_start=capability_output_start,
+                        tool_calls=capability_tool_calls,
+                        tool_failures=capability_tool_failures,
+                    )
                     return "cancelled"
                 await self._hooks.emit(
                     "post_llm_call",
@@ -2021,6 +2114,26 @@ class GlmAcpAgent(acp.Agent):
                         else 0.0
                     ),
                     iterations=turn_iter + 1,
+                )
+                self._record_capability_outcome(
+                    session,
+                    success=(
+                        result.finish_reason == "stop"
+                        and not failed_command_pending
+                        and (
+                            not edited_paths_this_turn
+                            or session.verification.fresh_pass is not None
+                        )
+                        and not bool(
+                            session.awareness.last_certificate
+                            and session.awareness.last_certificate.blocked
+                        )
+                    ),
+                    started=capability_started,
+                    input_start=capability_input_start,
+                    output_start=capability_output_start,
+                    tool_calls=capability_tool_calls,
+                    tool_failures=capability_tool_failures,
                 )
                 return "end_turn"
 
@@ -2499,6 +2612,8 @@ class GlmAcpAgent(acp.Agent):
                         failed_command_pending = True
 
                 duration_ms = int((time.monotonic() - tool_started) * 1000)
+                capability_tool_calls += 1
+                capability_tool_failures += int(tool_failed)
                 self._telemetry.record(
                     "tool_call",
                     session.id,
@@ -2545,6 +2660,15 @@ class GlmAcpAgent(acp.Agent):
                     }
                 )
                 if decision.action == "halt":
+                    self._record_capability_outcome(
+                        session,
+                        success=False,
+                        started=capability_started,
+                        input_start=capability_input_start,
+                        output_start=capability_output_start,
+                        tool_calls=capability_tool_calls,
+                        tool_failures=capability_tool_failures,
+                    )
                     await self._send_message(session.id, "\n\n⚠️ " + decision.message + "\n")
                     return "end_turn"
         else:
@@ -2557,6 +2681,16 @@ class GlmAcpAgent(acp.Agent):
                 "Ask me to continue if needed.\n",
             )
             logger.warning("Turn ended: %d-iteration limit reached", MAX_TOOL_ITERATIONS)
+
+            self._record_capability_outcome(
+                session,
+                success=False,
+                started=capability_started,
+                input_start=capability_input_start,
+                output_start=capability_output_start,
+                tool_calls=capability_tool_calls,
+                tool_failures=capability_tool_failures,
+            )
 
         return "end_turn"
 
@@ -3319,6 +3453,13 @@ class GlmAcpAgent(acp.Agent):
                 ),
             ),
             AvailableCommand(
+                name="metacognition",
+                description=(
+                    "Show uncertainty classes, adaptive execution mode, risk, and the "
+                    "matching empirical capability profile"
+                ),
+            ),
+            AvailableCommand(
                 name="memory",
                 description="Show durable project facts learned with permission",
             ),
@@ -3570,6 +3711,11 @@ class GlmAcpAgent(acp.Agent):
                 session.verification.edit_generation,
             )
 
+        elif command == "/metacognition":
+            session.refresh_system_prompt()
+            await self._save_session(session)
+            return session.metacognition.render()
+
         elif command == "/clear-history":
             system_msg = (
                 session.messages[0]
@@ -3586,6 +3732,7 @@ class GlmAcpAgent(acp.Agent):
             session.context_pressure_level = 0
             session.task_context = ""
             session.awareness = EpistemicLedger()
+            session.metacognition = MetacognitiveController()
             session.compaction_learning_proposals = []
             session.compaction_quality_history = []
             session.refresh_system_prompt()
@@ -3723,6 +3870,9 @@ class GlmAcpAgent(acp.Agent):
             latest_quality_text = (
                 f"{float(latest_quality):.0%}" if latest_quality is not None else "not measured"
             )
+            assessment = session.metacognition.assessment
+            execution_mode = assessment.execution_mode if assessment else "not assessed"
+            uncertainty_count = len(assessment.uncertainties) if assessment else 0
             return (
                 f"\n📊 **Session Status**\n"
                 f"- **Model:** {session.model}\n"
@@ -3734,6 +3884,8 @@ class GlmAcpAgent(acp.Agent):
                 f"- **Auxiliary model:** {session.auxiliary_model}\n"
                 f"- **Mixture of Agents:** {session.mixture_mode}\n"
                 f"- **Permissions:** {session.permission_mode}\n"
+                f"- **Adaptive execution:** {execution_mode} · "
+                f"{uncertainty_count} uncertainty classes\n"
                 f"- **Isolated profile:** {active_profile()}\n"
                 f"- **OS sandbox mode:** {sandbox_mode()}\n"
                 f"- **Latest checkpoint:** {session.last_checkpoint_id or 'none'}\n"

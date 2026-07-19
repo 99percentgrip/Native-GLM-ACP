@@ -128,6 +128,7 @@ class TestSessionSerialization:
             "compaction_learning_proposals",
             "compaction_quality_history",
             "awareness",
+            "metacognition",
         ]:
             assert field in d, f"Missing field: {field}"
 
@@ -1049,7 +1050,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "1.4.0"
+        assert resp.agent_info.version == "1.5.0"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):

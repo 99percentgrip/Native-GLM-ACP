@@ -19,6 +19,7 @@ Native GLM ACP — an open-source ACP-native coding agent runtime for Z.ai GLM m
 - **Persistent session lineage** — conversations survive restarts; forks retain parent/root rollback paths
 - **Persistent goals and criteria** — `/goal` plus `/subgoal` continue across restarts and use a bounded auxiliary completion judge
 - **Inspectable awareness** — typed evidence-backed observations, assumptions, hypotheses, contradictions, unknowns, and capability limits with edit-aware freshness and completion certificates
+- **Adaptive metacognitive control** — separates six uncertainty classes, selects direct/grounded/deliberate/high-assurance posture, and learns only from redacted aggregate outcomes
 - **Multi-root workspaces** — full support for additional workspace directories
 - **Progressive repository rules** — scoped AGENTS, Claude, Hermes, and Cursor instructions load before affected edits
 - **Evidence-led verification** — canonical project checks are recorded with scope and invalidated by later edits
@@ -95,6 +96,7 @@ Type these in the chat input:
 | `/rollback [checkpoint-id]` | Restore recorded agent changes unless a later conflicting edit is detected |
 | `/plugins` | List installed declarative plugins and their integrity state |
 | `/awareness` | Show knowledge, uncertainty, stale evidence, capability limits, next evidence, and completion coverage |
+| `/metacognition` | Show uncertainty classes, risk, adaptive execution mode, and matching empirical capability profile |
 | `/observability [json]` | Show the local metadata-only quality, efficiency, and safety dashboard |
 
 ### Task Plans
@@ -203,6 +205,18 @@ makes observations, uncertainty, contradictions, capability limits, freshness, a
 the next useful evidence visible. For persistent goals, every goal and `/subgoal`
 criterion needs a fresh evidence-backed observation, active contradictions must be
 resolved, and edited files need fresh verification before the completion judge runs.
+
+The metacognitive controller classifies ambiguity, knowledge gaps, diagnostic
+uncertainty, capability limits, verification gaps, and permission uncertainty.
+It deterministically selects a `direct`, `grounded`, `deliberate`, or
+`high-assurance` posture from task family, risk, epistemic state, permissions,
+and verification freshness. Redacted `capability_outcome` telemetry aggregates
+success, failure, tokens, latency, and verification strength by fixed task family
+and coarse environment. After at least three weak matching outcomes it may raise
+the posture one level, but never lower the baseline, invoke workers, change model
+reasoning, expand permissions, bypass policy, or store task text and paths.
+`/metacognition` makes the decision inspectable; telemetry opt-out disables
+empirical profiles entirely.
 
 ### Scheduled Automation
 
@@ -390,10 +404,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v1.4.0` before running the Unix
-installer, or pass `-Version v1.4.0` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v1.5.0` before running the Unix
+installer, or pass `-Version v1.5.0` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v1.4.0](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v1.4.0).
+[v1.5.0](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v1.5.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -520,6 +534,7 @@ glm_acp/
 ├── launcher.py      # Frozen-executable entry point
 ├── agent.py         # ACP agent: session lifecycle, prompt loop, slash commands
 ├── awareness.py     # Typed epistemic ledger and completion certificates
+├── metacognition.py # Uncertainty, adaptive modes, and aggregate capability profiles
 ├── config.py        # Model registry, API endpoints, constants
 ├── glm_client.py    # Streaming Z.ai API client (SSE, retry, reasoning, tools)
 ├── mcp.py           # Z.ai and user-configured MCP transports
@@ -721,7 +736,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-1.4.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-1.5.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

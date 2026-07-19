@@ -56,6 +56,7 @@ def observability_snapshot(
     llm = [event for event in events if event.get("event") == "llm_call"]
     turns = [event for event in events if event.get("event") == "turn_complete"]
     certificates = [event for event in events if event.get("event") == "completion_certificate"]
+    capability = [event for event in events if event.get("event") == "capability_outcome"]
     durations = [int(event.get("duration_ms", 0) or 0) for event in tools]
     llm_durations = [int(event.get("duration_ms", 0) or 0) for event in llm]
     tool_counts = Counter(str(event.get("tool", "unknown")) for event in tools)
@@ -66,6 +67,8 @@ def observability_snapshot(
     output_tokens = sum(int(event.get("output_tokens", 0) or 0) for event in llm)
     cached_tokens = sum(int(event.get("cached_tokens", 0) or 0) for event in llm)
     sessions = {str(event.get("session", "")) for event in events if event.get("session")}
+    modes = Counter(str(event.get("execution_mode", "unknown")) for event in capability)
+    families = Counter(str(event.get("task_family", "unknown")) for event in capability)
     return {
         "schema": 1,
         "events": len(events),
@@ -96,6 +99,30 @@ def observability_snapshot(
             "stale_evidence": sum(
                 int(event.get("stale_evidence", 0) or 0) for event in certificates
             ),
+        },
+        "metacognition": {
+            "outcomes": len(capability),
+            "success_rate": round(
+                sum(bool(event.get("success")) for event in capability) / max(len(capability), 1),
+                4,
+            ),
+            "verified_rate": round(
+                sum(
+                    str(event.get("verification_strength", "none")) in {"targeted", "full"}
+                    for event in capability
+                )
+                / max(len(capability), 1),
+                4,
+            ),
+            "mean_tokens": (
+                sum(
+                    int(event.get("input_tokens", 0) or 0) + int(event.get("output_tokens", 0) or 0)
+                    for event in capability
+                )
+                // max(len(capability), 1)
+            ),
+            "by_mode": dict(modes.most_common(4)),
+            "by_task_family": dict(families.most_common(8)),
         },
         "llm": {
             "calls": len(llm),
@@ -139,6 +166,7 @@ def render_observability(snapshot: dict[str, Any]) -> str:
     turns = snapshot["turns"]
     safety = snapshot["safety"]
     awareness = snapshot["awareness"]
+    metacognition = snapshot["metacognition"]
     by_tool = (
         "\n".join(
             f"- `{item['tool']}`: {item['calls']} calls, {item['failures']} failures"
@@ -162,5 +190,10 @@ def render_observability(snapshot: dict[str, Any]) -> str:
         f"- Awareness: {awareness['complete']}/{awareness['certificates']} certificates complete · "
         f"{awareness['mean_evidence_coverage']:.1%} mean evidence coverage · "
         f"{awareness['prevented_false_completion']} unsupported completions prevented\n\n"
+        f"- Metacognition: {metacognition['outcomes']} empirical outcomes · "
+        f"{metacognition['success_rate']:.1%} success · "
+        f"{metacognition['verified_rate']:.1%} verified · "
+        f"{metacognition['mean_tokens']:,} mean tokens\n"
+        f"- Adaptive modes: {json.dumps(metacognition['by_mode'], sort_keys=True)}\n\n"
         "**Most-used tools**\n" + by_tool
     )
