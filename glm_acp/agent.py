@@ -2783,19 +2783,21 @@ class GlmAcpAgent(acp.Agent):
                     )
                 )
                 if workspace_mutation and not session.active_checkpoint_id:
-                    try:
-                        checkpoint = await asyncio.to_thread(
-                            self._checkpoints.create, session.cwd, f"before {tool_name}"
-                        )
-                        session.active_checkpoint_id = str(checkpoint["id"])
-                        session.last_checkpoint_id = session.active_checkpoint_id
-                    except CheckpointError as error:
-                        output = f"Safety checkpoint failed; tool was not run: {error}"
-                        await self._fail_tool(session.id, tc_id, output)
-                        session.messages.append(
-                            {"role": "tool", "tool_call_id": tc_id, "content": output}
-                        )
-                        continue
+                    auto_state = await asyncio.to_thread(self._checkpoints.auto_checkpoint)
+                    if auto_state.enabled:
+                        try:
+                            checkpoint = await asyncio.to_thread(
+                                self._checkpoints.create, session.cwd, f"before {tool_name}"
+                            )
+                            session.active_checkpoint_id = str(checkpoint["id"])
+                            session.last_checkpoint_id = session.active_checkpoint_id
+                        except CheckpointError as error:
+                            output = f"Safety checkpoint failed; tool was not run: {error}"
+                            await self._fail_tool(session.id, tc_id, output)
+                            session.messages.append(
+                                {"role": "tool", "tool_call_id": tc_id, "content": output}
+                            )
+                            continue
 
                 tool_failed = False
                 tool_started = time.monotonic()
@@ -3900,7 +3902,7 @@ class GlmAcpAgent(acp.Agent):
             ),
             AvailableCommand(
                 name="checkpoint",
-                description="Create/list checkpoints or configure their file and MiB limits",
+                description="Create/list checkpoints, toggle auto, or set file and MiB limits",
             ),
             AvailableCommand(
                 name="rollback",
@@ -3994,6 +3996,67 @@ class GlmAcpAgent(acp.Agent):
                     f"{limits.max_files:,} files ({limits.files_source}) / "
                     f"{limits.max_mib:,} MiB ({limits.mib_source})."
                 )
+            if argument.lower() in {"auto", "auto-checkpoint"}:
+                try:
+                    state = await asyncio.to_thread(self._checkpoints.auto_checkpoint)
+                except CheckpointError as error:
+                    return f"❌ Auto-checkpoint state is invalid: {error}"
+                status = "enabled ✅" if state.enabled else "disabled ⏸️"
+                hint = (
+                    "Auto-checkpointing snapshots the workspace before every agent edit "
+                    "so `/rollback` can undo changes. It is **off by default**."
+                )
+                return (
+                    "🛟 **Auto-Checkpoint**\n"
+                    f"- Status: **{status}** ({state.source})\n"
+                    f"{hint}\n"
+                    "Toggle: `/checkpoint auto on` · `/checkpoint auto off` · "
+                    "`/checkpoint auto reset`"
+                )
+            if argument.lower() in {"auto on", "auto-checkpoint on"}:
+                try:
+                    state = await asyncio.to_thread(
+                        self._checkpoints.set_auto_checkpoint, True
+                    )
+                except (CheckpointError, OSError) as error:
+                    return f"❌ Could not enable auto-checkpoint: {error}"
+                return (
+                    "🛟 Auto-checkpoint **enabled**. The workspace will be snapshotted "
+                    "before each agent edit so changes can be rolled back with `/rollback`. "
+                    "Watch disk usage; disable with `/checkpoint auto off`."
+                )
+            if argument.lower() in {"auto off", "auto-checkpoint off"}:
+                try:
+                    state = await asyncio.to_thread(
+                        self._checkpoints.set_auto_checkpoint, False
+                    )
+                except (CheckpointError, OSError) as error:
+                    return f"❌ Could not disable auto-checkpoint: {error}"
+                session.active_checkpoint_id = ""
+                await self._save_session(session)
+                return (
+                    "🛟 Auto-checkpoint **disabled**. The agent will no longer snapshot the "
+                    "workspace before edits. Existing checkpoints remain until removed "
+                    "manually."
+                )
+            if argument.lower() in {"auto reset", "auto-checkpoint reset"}:
+                try:
+                    state = await asyncio.to_thread(self._checkpoints.reset_auto_checkpoint)
+                except (CheckpointError, OSError) as error:
+                    return f"❌ Could not reset auto-checkpoint: {error}"
+                session.active_checkpoint_id = ""
+                await self._save_session(session)
+                return (
+                    "🛟 Auto-checkpoint override cleared. Default is **disabled** "
+                    f"(source: {state.source})."
+                )
+            if argument.lower().startswith("auto ") or argument.lower().startswith(
+                "auto-checkpoint "
+            ):
+                return (
+                    "Usage: `/checkpoint auto` · `/checkpoint auto on` · "
+                    "`/checkpoint auto off` · `/checkpoint auto reset`"
+                )
             try:
                 checkpoint = await asyncio.to_thread(
                     self._checkpoints.create, session.cwd, argument or "manual"
@@ -4003,10 +4066,17 @@ class GlmAcpAgent(acp.Agent):
             session.active_checkpoint_id = str(checkpoint["id"])
             session.last_checkpoint_id = session.active_checkpoint_id
             await self._save_session(session)
+            auto_state = await asyncio.to_thread(self._checkpoints.auto_checkpoint)
+            auto_hint = (
+                ""
+                if auto_state.enabled
+                else "\n\n💡 Auto-checkpoint is **off**. Enable it with "
+                "`/checkpoint auto on` to snapshot before every edit."
+            )
             return (
                 f"🛟 Checkpoint `{checkpoint['id']}` captured "
                 f"{checkpoint['files']} files ({checkpoint['bytes']} bytes); "
-                f"excluded {checkpoint['excluded_sensitive_paths']} sensitive paths."
+                f"excluded {checkpoint['excluded_sensitive_paths']} sensitive paths.{auto_hint}"
             )
 
         elif command == "/rollback" or command.startswith("/rollback "):

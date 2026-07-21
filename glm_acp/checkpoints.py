@@ -20,6 +20,14 @@ HARD_CHECKPOINT_MAX_MIB = 10_240
 CHECKPOINT_MAX_FILES_ENV = "GLM_ACP_CHECKPOINT_MAX_FILES"
 CHECKPOINT_MAX_MIB_ENV = "GLM_ACP_CHECKPOINT_MAX_MIB"
 CHECKPOINT_LIMITS_FILENAME = "checkpoint-limits.json"
+# Auto-checkpoint is OFF by default. It must be enabled explicitly via
+# `/checkpoint auto on` or the GLM_ACP_AUTO_CHECKPOINT environment variable,
+# otherwise the agent never snapshots the workspace before edits.
+DEFAULT_AUTO_CHECKPOINT = False
+AUTO_CHECKPOINT_FILENAME = "checkpoint-auto.json"
+AUTO_CHECKPOINT_ENV = "GLM_ACP_AUTO_CHECKPOINT"
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
 _IGNORED = {".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__"}
 _SENSITIVE_NAMES = {".env", "credentials.json", "id_rsa", "id_ed25519"}
 _SENSITIVE_SUFFIXES = {".key", ".pem", ".p12", ".pfx"}
@@ -54,6 +62,30 @@ class CheckpointLimits:
         return self.max_mib * 1024 * 1024
 
 
+@dataclass(frozen=True)
+class AutoCheckpointState:
+    """Whether the agent snapshots the workspace before every workspace mutation."""
+
+    enabled: bool
+    source: str = "default"
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUTHY:
+            return True
+        if normalized in _FALSY:
+            return False
+    raise CheckpointError(
+        "Auto-checkpoint value must be one of: " + ", ".join(sorted(_TRUTHY | _FALSY))
+    )
+
+
 def _limit(value: object, name: str, maximum: int) -> int:
     if isinstance(value, bool):
         raise CheckpointError(f"{name} must be a whole number from 1 to {maximum}")
@@ -69,9 +101,66 @@ def _limit(value: object, name: str, maximum: int) -> int:
 class CheckpointManager:
     """Store baseline bytes and the exact agent-produced hashes needed for safe rollback."""
 
-    def __init__(self, base_dir: Path | None = None, limits_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        base_dir: Path | None = None,
+        limits_path: Path | None = None,
+        auto_path: Path | None = None,
+    ) -> None:
         self.base_dir = base_dir or config_dir() / "checkpoints"
         self.limits_path = limits_path or config_dir() / CHECKPOINT_LIMITS_FILENAME
+        self.auto_path = auto_path or config_dir() / AUTO_CHECKPOINT_FILENAME
+
+    def auto_checkpoint(self) -> AutoCheckpointState:
+        """Resolve whether auto-checkpoint is enabled and where the value came from.
+
+        Precedence (highest wins): GLM_ACP_AUTO_CHECKPOINT environment variable,
+        then the per-profile ``checkpoint-auto.json`` file, then the default OFF.
+        """
+        if AUTO_CHECKPOINT_ENV in os.environ:
+            try:
+                enabled = _coerce_bool(os.environ[AUTO_CHECKPOINT_ENV])
+            except CheckpointError:
+                enabled = DEFAULT_AUTO_CHECKPOINT
+            return AutoCheckpointState(enabled, "environment")
+        try:
+            payload = json.loads(self.auto_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return AutoCheckpointState(DEFAULT_AUTO_CHECKPOINT, "default")
+        except (OSError, json.JSONDecodeError) as error:
+            raise CheckpointError(f"Cannot read auto-checkpoint state: {error}") from error
+        if not isinstance(payload, dict) or payload.get("schema") != 1:
+            raise CheckpointError("Auto-checkpoint file must be a schema-1 JSON object")
+        try:
+            enabled = _coerce_bool(payload.get("enabled", DEFAULT_AUTO_CHECKPOINT))
+        except CheckpointError as error:
+            raise CheckpointError(f"Invalid auto-checkpoint state: {error}") from error
+        return AutoCheckpointState(enabled, "profile")
+
+    def set_auto_checkpoint(self, enabled: object) -> AutoCheckpointState:
+        """Atomically persist the auto-checkpoint toggle and return the new state."""
+        value = _coerce_bool(enabled)
+        parent = self.auto_path.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name != "nt":
+            os.chmod(parent, 0o700)
+        temporary = parent / f".{self.auto_path.name}.{uuid4().hex}.tmp"
+        try:
+            temporary.write_text(
+                json.dumps({"schema": 1, "enabled": value}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            if os.name != "nt":
+                os.chmod(temporary, 0o600)
+            os.replace(temporary, self.auto_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return self.auto_checkpoint()
+
+    def reset_auto_checkpoint(self) -> AutoCheckpointState:
+        """Delete the persisted auto-checkpoint override and return to the default."""
+        self.auto_path.unlink(missing_ok=True)
+        return self.auto_checkpoint()
 
     def limits(self) -> CheckpointLimits:
         max_files = DEFAULT_CHECKPOINT_MAX_FILES

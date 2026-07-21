@@ -126,6 +126,110 @@ async def test_checkpoint_limits_command_is_easy_to_change_and_reset(tmp_path, m
     await agent.aclose()
 
 
+def test_auto_checkpoint_is_off_by_default_and_togglable(tmp_path, monkeypatch):
+    """Auto-checkpoint must be OFF by default and only opt-in via toggle/env."""
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("GLM_ACP_AUTO_CHECKPOINT", raising=False)
+    auto_path = tmp_path / "profile" / "checkpoint-auto.json"
+    manager = CheckpointManager(tmp_path / "checkpoints", tmp_path / "limits.json", auto_path)
+
+    # 1. Default state is OFF, source is "default", and no override file exists.
+    state = manager.auto_checkpoint()
+    assert state.enabled is False
+    assert state.source == "default"
+    assert not auto_path.exists()
+
+    # 2. Opting in persists the value and survives a fresh manager instance.
+    enabled = manager.set_auto_checkpoint(True)
+    assert enabled.enabled is True
+    assert enabled.source == "profile"
+    assert auto_path.exists()
+    restored = CheckpointManager(
+        tmp_path / "other-checkpoints", tmp_path / "limits.json", auto_path
+    ).auto_checkpoint()
+    assert restored.enabled is True
+    assert restored.source == "profile"
+
+    # 3. Turning it off writes back to disabled.
+    disabled = manager.set_auto_checkpoint(False)
+    assert disabled.enabled is False
+    assert disabled.source == "profile"
+
+    # 4. Reset clears the override and returns to the default OFF state.
+    reset = manager.reset_auto_checkpoint()
+    assert reset.enabled is False
+    assert reset.source == "default"
+    assert not auto_path.exists()
+
+    # 5. Environment variable takes precedence over the profile file.
+    manager.set_auto_checkpoint(False)
+    monkeypatch.setenv("GLM_ACP_AUTO_CHECKPOINT", "1")
+    overridden = manager.auto_checkpoint()
+    assert overridden.enabled is True
+    assert overridden.source == "environment"
+    monkeypatch.setenv("GLM_ACP_AUTO_CHECKPOINT", "off")
+    assert manager.auto_checkpoint().enabled is False
+    # Invalid env value falls back to the safe default rather than crashing.
+    monkeypatch.setenv("GLM_ACP_AUTO_CHECKPOINT", "maybe")
+    fallback = manager.auto_checkpoint()
+    assert fallback.enabled is False
+    assert fallback.source == "environment"
+
+    # 6. Invalid persisted payload raises CheckpointError instead of silently misbehaving.
+    monkeypatch.delenv("GLM_ACP_AUTO_CHECKPOINT", raising=False)
+    auto_path.parent.mkdir(parents=True, exist_ok=True)
+    auto_path.write_text(json.dumps({"schema": 2, "enabled": True}), encoding="utf-8")
+    with pytest.raises(CheckpointError, match="schema-1"):
+        manager.auto_checkpoint()
+
+
+@pytest.mark.asyncio
+async def test_auto_checkpoint_command_round_trip_and_default_off(tmp_path, monkeypatch):
+    """The /checkpoint auto slash commands toggle state and the bare create hints at off."""
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("GLM_ACP_AUTO_CHECKPOINT", raising=False)
+    auto_path = tmp_path / "profile" / "checkpoint-auto.json"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "file.txt").write_text("hello")
+
+    agent = GlmAcpAgent()
+    agent._save_session = AsyncMock()
+    agent._checkpoints = CheckpointManager(
+        tmp_path / "checkpoints", tmp_path / "limits.json", auto_path
+    )
+    session = Session("auto-toggle", str(workspace))
+
+    # Bare status reads default OFF.
+    status = await agent._handle_command(session, "/checkpoint auto")
+    assert "disabled" in status
+    assert "default" in status
+
+    # Enable.
+    on = await agent._handle_command(session, "/checkpoint auto on")
+    assert "enabled" in on
+    assert auto_path.exists()
+
+    # A manual checkpoint no longer appends the "auto is off" hint.
+    manual = await agent._handle_command(session, "/checkpoint")
+    assert "captured" in manual
+    assert "auto is **off**" not in manual
+
+    # Disable.
+    off = await agent._handle_command(session, "/checkpoint auto off")
+    assert "disabled" in off
+
+    # Reset clears the override and restores default OFF.
+    reset = await agent._handle_command(session, "/checkpoint auto reset")
+    assert "default" in reset
+    assert not auto_path.exists()
+
+    # Unknown auto argument shows usage.
+    usage = await agent._handle_command(session, "/checkpoint auto maybe")
+    assert "Usage" in usage
+    await agent.aclose()
+
+
 def test_explicit_references_are_bounded_and_untrusted(tmp_path):
     (tmp_path / "a.py").write_text("def useful_symbol():\n    return 1\n")
     expanded, targets = expand_references(

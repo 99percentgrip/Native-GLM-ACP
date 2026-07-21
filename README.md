@@ -37,7 +37,7 @@ Native GLM ACP — an open-source ACP-native coding agent runtime for Z.ai GLM m
 - **Redacted trajectory telemetry** — metadata-only events support tuning without prompts, outputs, commands, reasoning, credentials, or raw session IDs
 - **Playwright UI testing** — permission-gated isolated browser automation returns accessibility, console, network, interaction, and screenshot evidence
 - **Lifecycle hooks** — user-owned hash-pinned hooks can block tools, observe results, or request bounded pre-verification follow-up
-- **Conflict-aware checkpoints** — automatic pre-mutation snapshots and `/rollback` restore only exact agent-produced hashes
+- **Conflict-aware checkpoints** — opt-in pre-mutation snapshots with `/checkpoint auto on` and `/rollback` restore only exact agent-produced hashes
 - **Language-aware context references** — bounded `@file:`, `@folder:`, `@symbol:`, and `@diff` expansion ranks definitions, references, task terms, tests, and changed files
 - **Declarative policy and workflows** — ordered allow/ask/deny rules and static DAGs add control without arbitrary orchestration code
 - **Cross-platform command containment** — Bubblewrap isolates Linux, macOS Seatbelt is capability-detected, and Windows Job Objects contain process trees without overstating filesystem isolation
@@ -94,6 +94,7 @@ Type these in the chat input:
 | `/goal [objective\|pause\|resume\|clear]` | Set, inspect, pause, resume, or clear a persistent coding goal |
 | `/subgoal [criterion\|remove N\|clear]` | Manage persistent acceptance criteria for the active goal |
 | `/checkpoint [label\|list]` | Create or list a bounded secret-safe workspace checkpoint |
+| `/checkpoint auto [on\|off\|reset]` | Show or toggle auto-checkpointing before each agent edit (off by default) |
 | `/checkpoint limits [files MiB\|reset]` | Show, persist, or reset checkpoint size limits |
 | `/rollback [checkpoint-id]` | Restore recorded agent changes unless a later conflicting edit is detected |
 | `/plugins` | List installed declarative plugins and their integrity state |
@@ -110,12 +111,29 @@ completed status with priority indicators.
 
 ### Safe orchestration, rollback, and isolation
 
-Before the first workspace-mutating tool in each user turn, Native GLM ACP
-captures a bounded checkpoint outside the repository. Common credential,
-private-key, SSH, and `.env` files are never copied. After each mutation, the
-checkpoint records the exact resulting hashes. `/rollback` restores only those
-paths; if any current hash differs, rollback stops without overwriting the later
-change. Use `/checkpoint list` to inspect recent checkpoints.
+**Auto-checkpointing is OFF by default.** The agent does **not** snapshot the
+workspace before edits unless you opt in. This prevents large workspaces
+(for example, ones with big `*.sqlite`, `node_modules/`, or `.git/` trees) from
+filling the disk with multi-GB copies on every edit.
+
+When you want conflict-aware `/rollback`, enable it for the session:
+
+```text
+/checkpoint auto        # show current state
+/checkpoint auto on     # snapshot the workspace before each agent edit
+/checkpoint auto off    # stop auto-snapshotting
+/checkpoint auto reset  # clear the override and return to the default (off)
+```
+
+You can also create a one-off checkpoint any time with `/checkpoint [label]`,
+or inspect existing ones with `/checkpoint list`. Each checkpoint stays outside
+the repository; common credential, private-key, SSH, and `.env` files are never
+copied. After each mutation, the checkpoint records the exact resulting hashes.
+`/rollback` restores only those paths; if any current hash differs, rollback
+stops without overwriting the later change.
+
+For process-managed installations, `GLM_ACP_AUTO_CHECKPOINT=1` overrides the
+profile setting without persisting anything to disk.
 
 The default checkpoint ceiling is 20,000 files or 250 MiB. Large-repository
 users can inspect or change the active profile's persistent limits directly in
@@ -435,10 +453,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v1.6.1` before running the Unix
-installer, or pass `-Version v1.6.1` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v1.6.2` before running the Unix
+installer, or pass `-Version v1.6.2` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v1.6.1](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v1.6.1).
+[v1.6.2](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v1.6.2).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -768,7 +786,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-1.6.1.dist-info  (and editable-install metadata)
+# expect: glm_acp-1.6.2.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

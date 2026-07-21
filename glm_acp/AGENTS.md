@@ -27,7 +27,7 @@ streaming, 1M context, and auto-continuation for long generations.
 - **Lifecycle extensions**: `hooks.py` — user-owned, hash-pinned, workspace-scoped lifecycle commands
 - **Trajectory evidence**: `telemetry.py` and `observability.py` — bounded metadata-only events plus local aggregate quality, latency, cache, tool, and safety reporting
 - **Failure-driven evaluation**: `failure_corpus.py` — metadata-only drafts and permission-gated runnable project regression cases
-- **Workspace checkpoints**: `checkpoints.py` — configurable bounded secret-excluding baselines, exact agent hashes, and conflict-aware rollback
+- **Workspace checkpoints**: `checkpoints.py` — default-off opt-in auto-checkpointing, configurable bounded secret-excluding baselines, exact agent hashes, and conflict-aware rollback
 - **Explicit references**: `references.py` — bounded workspace-contained references with language/task/change-aware ranking
 - **Declarative controls**: `policy.py` and `workflows.py` — ordered allow/ask/deny rules and static dependency graphs
 - **OS command isolation**: `os_sandbox.py` — Linux Bubblewrap, capability-detected macOS Seatbelt, Windows Job Object containment, and required-mode fail closure
@@ -325,12 +325,20 @@ Playwright MCP. It allowlists navigation, accessibility snapshots, console/netwo
 evidence, screenshots, ordinary interaction, waits, and close; arbitrary browser
 JavaScript evaluation is absent and the MCP child receives no inherited credentials.
 
-Automatic workspace checkpoints are created once per mutating user turn before
-the first edit or command. They default to 20,000 files/250 MiB, exclude common
-credential, SSH, private-key, and `.env` paths, and record current hashes after
-each successful mutation. `/checkpoint limits <files> <MiB>` atomically persists
-profile-isolated limits; `limits` displays their source and `limits reset` restores
-defaults. `GLM_ACP_CHECKPOINT_MAX_FILES` and `GLM_ACP_CHECKPOINT_MAX_MIB` take
+Auto-checkpoint is **OFF by default**. The agent only snapshots the workspace
+before a mutating user turn when the operator opts in via `/checkpoint auto on`
+or sets `GLM_ACP_AUTO_CHECKPOINT=1`; this prevents large workspaces (for
+example ones containing big `*.sqlite`, `node_modules/`, or `.git/` trees) from
+filling the disk with multi-GB copies on every edit. The toggle persists in
+`config_dir()/checkpoint-auto.json` (schema 1, profile-scoped); `auto` shows
+the current state and source, `auto on/off` writes the value atomically, and
+`auto reset` clears the override back to the default OFF. Manual `/checkpoint`
+remains available regardless of the toggle. When enabled, snapshots default to
+20,000 files/250 MiB, exclude common credential, SSH, private-key, and `.env`
+paths, and record current hashes after each successful mutation.
+`/checkpoint limits <files> <MiB>` atomically persists profile-isolated limits;
+`limits` displays their source and `limits reset` restores defaults.
+`GLM_ACP_CHECKPOINT_MAX_FILES` and `GLM_ACP_CHECKPOINT_MAX_MIB` take
 precedence. Values remain hard-bounded to 1,000,000 files/10,240 MiB and invalid
 configuration fails closed. `/rollback` restores only recorded paths whose current
 hash still equals the exact agent-produced hash; any later conflict aborts the
