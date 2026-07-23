@@ -583,6 +583,7 @@ class NativeGlmTui(App[int]):
         self._replaying = False
         self._current_agent: Static | None = None
         self._current_agent_text = ""
+        self._last_agent_render: float = 0.0
         self._thinking_text = ""
         self._pending_images = list(args.image)
         self._slash_commands = dict(LOCAL_COMMANDS)
@@ -1015,6 +1016,10 @@ class NativeGlmTui(App[int]):
                     await self._append_system(f"Turn failed: {error}")
                     return
 
+                if self._current_agent is not None and self._current_agent_text:
+                    self._current_agent.update(RichMarkdown(self._current_agent_text))
+                    self._last_agent_render = time.monotonic()
+
                 if not self._prompt_queue or self._shutdown_requested:
                     return
 
@@ -1209,7 +1214,10 @@ class NativeGlmTui(App[int]):
             self._current_agent = Static("", classes="agent-message", markup=False)
             await transcript.mount(self._current_agent)
         self._current_agent_text += text
-        self._current_agent.update(RichMarkdown(self._current_agent_text))
+        now = time.monotonic()
+        if now - self._last_agent_render > 0.12:
+            self._last_agent_render = now
+            self._current_agent.update(RichMarkdown(self._current_agent_text))
         transcript.scroll_end(animate=False)
 
     async def _append_system(self, text: str) -> None:
