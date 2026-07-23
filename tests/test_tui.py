@@ -170,13 +170,21 @@ def _args(tmp_path, *extra):
     )
 
 
+async def _wait_for_agent_ready(app, pilot) -> None:
+    for _ in range(40):
+        await pilot.pause(0.05)
+        if app._agent_ready:
+            return
+    raise AssertionError("TUI agent initialization did not complete")
+
+
 @pytest.mark.asyncio
 async def test_tui_mounts_full_screen_panels_and_toggles_thinking(tmp_path):
     agent = FakeAgent()
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
 
     async with app.run_test(size=(120, 40)) as pilot:
-        await pilot.pause()
+        await _wait_for_agent_ready(app, pilot)
         assert app._agent_ready is True
         assert app.query_one("#composer", Input).disabled is False
         assert "tui-sess…" in str(app.query_one("#session", Static).render())
@@ -200,7 +208,7 @@ async def test_tui_f1_submits_help_and_documented_keys_are_actionable(tmp_path):
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
 
     async with app.run_test(size=(120, 45)) as pilot:
-        await pilot.pause()
+        await _wait_for_agent_ready(app, pilot)
 
         await pilot.press("f1")
         for _ in range(20):
@@ -235,11 +243,11 @@ async def test_tui_footer_actions_are_clickable_and_quit_uses_terminal_safe_key(
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
 
     async with app.run_test(size=(130, 45)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
         for _ in range(40):
             await pilot.pause(0.05)
-            if app._agent_ready and agent.usage_calls:
+            if agent.usage_calls:
                 break
-        assert app._agent_ready is True
         assert agent.usage_calls == 1
         await pilot.pause(0.1)
 
@@ -313,7 +321,7 @@ async def test_tui_local_slash_controls_and_forwarded_command(tmp_path):
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
 
     async with app.run_test(size=(120, 45)) as pilot:
-        await pilot.pause()
+        await _wait_for_agent_ready(app, pilot)
         composer = app.query_one("#composer", Input)
 
         composer.value = "/reasoning-panel"
@@ -362,7 +370,7 @@ async def test_slash_menu_filters_live_agent_commands_and_supports_tab_escape(tm
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
 
     async with app.run_test(size=(120, 45)) as pilot:
-        await pilot.pause()
+        await _wait_for_agent_ready(app, pilot)
         composer = app.query_one("#composer", Input)
         menu = app.query_one("#command-menu", OptionList)
 
@@ -409,7 +417,7 @@ async def test_slash_model_menu_navigates_and_changes_shared_session(tmp_path):
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
 
     async with app.run_test(size=(120, 45)) as pilot:
-        await pilot.pause()
+        await _wait_for_agent_ready(app, pilot)
         composer = app.query_one("#composer", Input)
         menu = app.query_one("#command-menu", OptionList)
 
@@ -443,7 +451,7 @@ async def test_inline_permission_and_mode_commands_use_shared_agent_methods(tmp_
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
 
     async with app.run_test(size=(120, 45)) as pilot:
-        await pilot.pause()
+        await _wait_for_agent_ready(app, pilot)
         composer = app.query_one("#composer", Input)
 
         composer.value = "/permission r"
@@ -472,7 +480,7 @@ async def test_api_plan_and_thinking_commands_have_full_zed_parity(tmp_path):
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
 
     async with app.run_test(size=(140, 48)) as pilot:
-        await pilot.pause()
+        await _wait_for_agent_ready(app, pilot)
         composer = app.query_one("#composer", Input)
 
         composer.value = "/plan "
@@ -538,7 +546,7 @@ async def test_every_inline_configuration_command_opens_valid_choices(tmp_path):
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
 
     async with app.run_test(size=(120, 45)) as pilot:
-        await pilot.pause()
+        await _wait_for_agent_ready(app, pilot)
         composer = app.query_one("#composer", Input)
         menu = app.query_one("#command-menu", OptionList)
 
@@ -557,7 +565,7 @@ async def test_tui_permission_modal_is_redacted_and_returns_allow(tmp_path):
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
 
     async with app.run_test(size=(120, 40)) as pilot:
-        await pilot.pause()
+        await _wait_for_agent_ready(app, pilot)
         composer = app.query_one("#composer", Input)
         composer.value = "Make the requested edit"
         await pilot.press("enter")
@@ -585,7 +593,7 @@ async def test_tui_settings_change_shared_session_configuration(tmp_path):
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
 
     async with app.run_test(size=(120, 45)) as pilot:
-        await pilot.pause()
+        await _wait_for_agent_ready(app, pilot)
         await pilot.press("f3")
         for _ in range(20):
             await pilot.pause(0.05)
