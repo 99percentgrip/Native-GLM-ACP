@@ -20,7 +20,7 @@ from a terminal with `glm-acp chat`—Zed is optional.
 - **Structured context compaction** — preserves plans, edits, verification evidence, and an optional user focus
 - **Context-pressure diagnostics** — one-time 60%/75%/85% warnings explain when compaction approaches
 - **Persistent session lineage** — conversations survive restarts; forks retain parent/root rollback paths
-- **Standalone full-screen TUI** — `glm-acp chat` provides conversation, reasoning, tool, plan, usage, approval, and live settings panels over the same sessions, tools, MCP, browser, workers, learning, awareness, and verification runtime as ACP editors
+- **Standalone full-screen TUI** — `glm-acp chat` provides conversation, reasoning, tool, plan, usage, approval, and live settings panels over the same sessions, tools, MCP, browser, workers, learning, awareness, and verification runtime as ACP editors; includes push-to-talk voice (F5, local Whisper), prompt queue (type ahead during work), four-view working-tree panel (F4), opt-in notification sounds, and smart desktop notifications
 - **Persistent goals and criteria** — `/goal` plus `/subgoal` continue across restarts and use a bounded auxiliary completion judge
 - **Inspectable awareness** — typed evidence-backed observations, assumptions, hypotheses, contradictions, unknowns, and capability limits with edit-aware freshness and completion certificates
 - **Adaptive metacognitive control** — separates six uncertainty classes, selects direct/grounded/deliberate/high-assurance posture, and learns only from redacted aggregate outcomes
@@ -636,11 +636,38 @@ session controls through the same APIs as ACP editors. `/api-plan` and
 `/endpoint` remain aliases for `/plan`; `/reasoning` remains an alias for
 `/thinking`.
 
-F1 displays `/help`, F2 toggles the live reasoning view, and F3 opens all session
-settings with models filtered by API plan and thinking levels filtered by model.
+F1 displays `/help`, F2 toggles the live reasoning view, F3 opens all session
+settings with models filtered by API plan and thinking levels filtered by model,
+**F4 cycles a four-view working-tree panel** (session changes, git status, diff,
+file browser) on the left side, and **F5 toggles push-to-talk** voice input.
 Ctrl-C cancels the active turn, Ctrl-L clears only the visible transcript, and
 Ctrl-X exits; F10 and `/exit` are equivalent. Ctrl-Q remains a hidden
 compatibility binding because POSIX XON/XOFF terminals commonly swallow it.
+
+The **composer stays enabled during active turns** — typing and pressing Enter
+queues prompts that auto-drain FIFO when each turn completes, with a visible
+queue-status line. Build the queue as long as needed; the agent processes each
+queued prompt in order without losing input. Local and config commands
+(`/plan`, `/thinking`, `/clear-view`, etc.) still work immediately during work.
+
+**Push-to-talk (F5)** records from the microphone via `arecord` and transcribes
+locally with `faster-whisper` (base model, 74 MB, cached after first use).
+No API key, no internet, no per-request cost — voice stays on-device. The
+transcribed text appends to the composer for review before sending. The frozen
+binary bundles faster-whisper (156 MB on Linux); source installs use
+`uv pip install -e ".[voice]"`.
+
+**Notification sounds** (opt-in: `GLM_ACP_SOUND=1`) play a terminal bell on
+turn completion or failure with a 5-second cooldown and are suppressed during
+voice recording. **Smart desktop notifications** fire only for turns exceeding
+10 seconds, are rate-limited to one per 30 seconds, and use `notify-send`
+(Linux), `osascript` (macOS), or PowerShell (Windows). Disable with
+`GLM_ACP_NOTIFY=0`.
+
+Agent output is rendered as **structured Markdown** — headers, bullet points,
+numbered lists, code blocks with syntax highlighting, and bold emphasis — with
+a streaming-safe debounce that prevents re-parsing on every token.
+
 Destructive Ask-mode actions use a bounded, credential-redacted
 approval modal and deny by default. If a terminal reserves function keys,
 `/reasoning-panel`, `/settings`, and `/clear-view` provide the same presentation
