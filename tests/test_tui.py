@@ -56,6 +56,13 @@ class FakeAgent:
 
     async def prompt(self, prompt, session_id, message_id=None, **kwargs):
         self.prompts.append(prompt)
+        text = str(getattr(prompt[0], "text", ""))
+        if text.startswith("/"):
+            await self.conn.session_update(
+                session_id,
+                acp.update_agent_message_text(f"Handled {text}"),
+            )
+            return
         tool_id = "tool-1"
         await self.conn.session_update(
             session_id,
@@ -107,6 +114,81 @@ async def test_tui_mounts_full_screen_panels_and_toggles_thinking(tmp_path):
         app.exit(0)
 
     assert agent.closed is True
+
+
+@pytest.mark.asyncio
+async def test_tui_f1_submits_help_and_documented_keys_are_actionable(tmp_path):
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 45)) as pilot:
+        await pilot.pause()
+
+        await pilot.press("f1")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if app._current_agent_text:
+                break
+        assert app._current_agent_text == "Handled /help"
+        assert str(getattr(agent.prompts[-1][0], "text", "")) == "/help"
+
+        await pilot.press("f2")
+        await pilot.pause()
+        assert app.query_one("#thinking").has_class("hidden")
+        await pilot.press("f2")
+        await pilot.pause()
+        assert not app.query_one("#thinking").has_class("hidden")
+
+        await pilot.press("f3")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SettingsScreen):
+                break
+        assert isinstance(app.screen, SettingsScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, SettingsScreen)
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_local_slash_controls_and_forwarded_command(tmp_path):
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 45)) as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+
+        composer.value = "/thinking"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#thinking").has_class("hidden")
+        assert agent.prompts == []
+
+        composer.value = "/settings"
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SettingsScreen):
+                break
+        assert isinstance(app.screen, SettingsScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+
+        composer.value = "/status"
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if app._current_agent_text == "Handled /status":
+                break
+        assert app._current_agent_text == "Handled /status"
+
+        composer.value = "/clear-view"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert len(app.query("#transcript > *")) == 0
+        app.exit(0)
 
 
 @pytest.mark.asyncio

@@ -528,8 +528,11 @@ retains the line REPL, while `--prompt`, `--stdin`, and `--json` remain
 non-full-screen automation surfaces. The TUI must expose separate conversation,
 reasoning, tool, plan, usage, and session state, awaited fail-closed approval
 modals with bounded credential-redacted arguments, cancellation, and live settings
-that call `set_config_option`/`set_session_mode`. TUI state is presentation-only
-and must never become an alternate source of session truth or stored reasoning.
+that call `set_config_option`/`set_session_mode`. F1 must submit the shared
+`/help` command directly, F2 must report the reasoning-panel state, and
+presentation controls must also remain reachable through `/thinking`,
+`/settings`, and `/clear-view`. TUI state is presentation-only and must never
+become an alternate source of session truth or stored reasoning.
 
 ## Work Guidance
 

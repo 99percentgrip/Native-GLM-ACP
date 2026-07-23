@@ -397,6 +397,8 @@ class NativeGlmTui(App[int]):
         if not text or not self._agent_ready or self._prompt_worker is not None:
             return
         event.input.clear()
+        if await self._handle_local_command(text):
+            return
         if text in {"/exit", "/quit"}:
             await self.action_quit_agent()
             return
@@ -415,6 +417,20 @@ class NativeGlmTui(App[int]):
         self._refresh_session_panel("Running")
         self._prompt_worker = self.run_prompt(text, list(self._pending_images))
         self._pending_images.clear()
+
+    async def _handle_local_command(self, text: str) -> bool:
+        """Handle presentation-only commands without entering the model loop."""
+        if text == "/thinking":
+            self.action_toggle_thinking()
+            return True
+        if text == "/settings":
+            self.action_settings()
+            return True
+        if text == "/clear-view":
+            await self.action_clear_transcript()
+            self.notify("Transcript view cleared", severity="information")
+            return True
+        return False
 
     @work(exclusive=True, group="agent-prompt", exit_on_error=False)
     async def run_prompt(self, text: str, images: list[str]) -> None:
@@ -535,16 +551,26 @@ class NativeGlmTui(App[int]):
         self._current_agent = None
         self._current_agent_text = ""
 
-    def action_show_help(self) -> None:
-        self.query_one("#composer", Input).value = "/help"
-        self.query_one("#composer", Input).focus()
+    async def action_show_help(self) -> None:
+        composer = self.query_one("#composer", Input)
+        if composer.disabled:
+            self.notify("Help is unavailable while a turn is running", severity="warning")
+            return
+        composer.value = "/help"
+        composer.focus()
+        await composer.action_submit()
 
     def action_toggle_thinking(self) -> None:
-        self.query_one("#thinking", RichLog).toggle_class("hidden")
+        thinking = self.query_one("#thinking", RichLog)
+        thinking.toggle_class("hidden")
+        state = "hidden" if thinking.has_class("hidden") else "shown"
+        self.notify(f"Reasoning panel {state}", severity="information")
 
     def action_settings(self) -> None:
         if self._agent_ready and self._prompt_worker is None:
             self.open_settings()
+        else:
+            self.notify("Settings are unavailable while a turn is running", severity="warning")
 
     @work(exclusive=True, group="settings")
     async def open_settings(self) -> None:

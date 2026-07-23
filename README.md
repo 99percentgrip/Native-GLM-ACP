@@ -513,10 +513,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v1.8.0` before running the Unix
-installer, or pass `-Version v1.8.0` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v1.8.1` before running the Unix
+installer, or pass `-Version v1.8.1` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v1.8.0](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v1.8.0).
+[v1.8.1](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v1.8.1).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -610,11 +610,16 @@ glm-acp chat --plain
 ```
 
 The TUI separates conversation, reasoning, tool activity, plan, context usage,
-and session state. F1 prepares `/help`, F2 toggles reasoning, F3 opens live model,
+and session state. F1 displays `/help`, F2 toggles reasoning with visible state
+feedback, and F3 opens live model,
 endpoint, reasoning, permission, generation, auxiliary, Mixture-of-Agents, and
 session-mode settings; Ctrl-C cancels the active turn, Ctrl-L clears only the
 visible transcript, and Ctrl-Q exits. Destructive Ask-mode actions use a bounded,
 credential-redacted approval modal and deny by default.
+
+If a terminal reserves function keys, `/thinking`, `/settings`, and `/clear-view`
+provide the same presentation controls. Other slash commands—including `/status`,
+`/checkpoint`, and `/awareness`—continue through the shared ACP agent runtime.
 
 Use `/image path/to/image.png` in an interactive chat to queue an image for the
 next prompt, or repeat `--image PATH` for a one-shot vision prompt. `--json`
@@ -893,7 +898,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-1.8.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-1.8.1.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

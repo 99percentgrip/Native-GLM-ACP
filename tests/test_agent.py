@@ -595,6 +595,16 @@ class TestSetSessionMode:
 
 class TestSlashCommands:
     @pytest.mark.asyncio
+    async def test_help_lists_harness_and_terminal_commands(self, agent, session):
+        result = await agent._handle_command(session, "/help")
+
+        assert "Harness Commands" in result
+        assert "/status" in result
+        assert "/checkpoint" in result
+        assert "F2 reasoning panel" in result
+        assert "/settings" in result
+
+    @pytest.mark.asyncio
     async def test_status(self, agent, session):
         session.total_input_tokens = 1000
         result = await agent._handle_command(session, "/status")
@@ -1051,7 +1061,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "1.8.0"
+        assert resp.agent_info.version == "1.8.1"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):

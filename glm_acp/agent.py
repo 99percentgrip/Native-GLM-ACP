@@ -3948,6 +3948,10 @@ class GlmAcpAgent(acp.Agent):
 
         commands = [
             AvailableCommand(
+                name="help",
+                description="Show available harness slash commands",
+            ),
+            AvailableCommand(
                 name="compact",
                 description=(
                     "Manually trigger context compaction — summarize older "
@@ -4057,6 +4061,23 @@ class GlmAcpAgent(acp.Agent):
         Returns the human-readable response to display.
         """
         command = command.strip()
+
+        if command == "/help":
+            return (
+                "⌨️ **Harness Commands**\n\n"
+                "- `/status` — session, model, permissions, context, and evidence\n"
+                "- `/compact [focus]` — compact older context\n"
+                "- `/diff` · `/export` · `/clear-plan` · `/clear-history`\n"
+                "- `/checkpoint …` · `/rollback [id]` · `/plugins`\n"
+                "- `/goal …` · `/subgoal …` · `/awareness`\n"
+                "- `/metacognition` · `/deliberation` · `/repository`\n"
+                "- `/meta-learning …` · `/observability [json]`\n"
+                "- `/memory` · `/skills` · `/profile` · `/curator`\n"
+                "- `/sessions [query]` · `/lineage`\n\n"
+                "Terminal UI: F1 help · F2 reasoning panel · F3 settings · "
+                "Ctrl-L clear view · Ctrl-C cancel · Ctrl-Q quit. "
+                "You can also use `/thinking`, `/settings`, and `/clear-view`."
+            )
 
         if command == "/compact" or command.startswith("/compact "):
             focus = command.partition(" ")[2].strip()
@@ -4840,7 +4861,7 @@ class GlmAcpAgent(acp.Agent):
         else:
             return (
                 f"Unknown command: {command}\nAvailable commands: /compact, "
-                "/clear-plan, /clear-history, /diff, /export, /status, /memory, "
+                "/help, /clear-plan, /clear-history, /diff, /export, /status, /memory, "
                 "/awareness, /metacognition, /deliberation, /repository, /meta-learning, "
                 "/skills, /profile, /curator, /sessions"
                 ", /lineage, /goal, /subgoal"

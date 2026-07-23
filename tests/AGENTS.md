@@ -27,7 +27,7 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
 - `test_deliberation.py` covers evidence-only critic isolation, bounded falsifiable hypotheses, fresh test evidence, stale invalidation, value-of-information ranking, diff redaction, persistence, commands, and metadata-only observability.
 - `test_repository_intelligence.py` covers lazy bounded world slices, imports/tests/instructions/ownership/failure metadata, prediction comparison, high-risk pre-mortems, small-task restraint, causal strategy drafts, explicit promotion, fresh/mutated evaluation gates, CLI surfaces, persistence, and metadata-only observability.
 - `test_terminal_cli.py` covers standalone parser parity, streamed update rendering, reasoning visibility control, fail-closed non-interactive permissions, credential-redacted permission context, and routing every session option through the shared agent methods.
-- `test_tui.py` covers full-screen panel mounting, shared-runtime prompts, thinking visibility, credential-redacted modal approvals, and automatic interactive TUI routing.
+- `test_tui.py` covers full-screen panel mounting, shared-runtime prompts, every documented function-key action, local slash controls, thinking visibility, credential-redacted modal approvals, and automatic interactive TUI routing.
 
 ## Local Contracts
 

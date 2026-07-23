@@ -88,3 +88,4 @@ esac
 
 printf '\nNext: glm-acp --setup\n'
 printf 'Then start the full-screen agent: glm-acp chat\n'
+printf 'Inside the TUI, press F1 or type /help for commands.\n'

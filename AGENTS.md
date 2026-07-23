@@ -106,11 +106,11 @@ Native GLM ACP is an open-source ACP-native coding agent runtime for Z.ai GLM mo
 
 ## Current Project Status
 
-- Package and ACP implementation version is `1.8.0` from `glm_acp.__version__`.
-- GitHub release `v1.8.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
+- Package and ACP implementation version is `1.8.1` from `glm_acp.__version__`.
+- GitHub release `v1.8.1` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
 - ACP Registry publication is tracked in `agentclientprotocol/registry#439` and remains pending until Registry maintainers merge it.
 - Source installs, the `glm-acp` console script, module execution, and frozen binaries share `cli.main()`.
-- `glm-acp chat` and `native-glm-acp chat` open a cross-platform full-screen Textual interface over the full existing `GlmAcpAgent` runtime without an editor; conversation/reasoning/tool/plan/status panels, credential-redacted modal approvals, and live F3 session settings remain presentation-only while persistence, tools, commands, MCP/browser integration, workers, learning, awareness, repository intelligence, checkpoints, and verification stay shared with ACP clients. `--plain`, `--prompt`, `--stdin`, and `--json` preserve line and automation surfaces.
+- `glm-acp chat` and `native-glm-acp chat` open a cross-platform full-screen Textual interface over the full existing `GlmAcpAgent` runtime without an editor; conversation/reasoning/tool/plan/status panels, credential-redacted modal approvals, direct F1 help, visible F2 state, live F3 session settings, and equivalent `/thinking`, `/settings`, and `/clear-view` controls remain presentation-only while persistence, tools, commands, MCP/browser integration, workers, learning, awareness, repository intelligence, checkpoints, and verification stay shared with ACP clients. `--plain`, `--prompt`, `--stdin`, and `--json` preserve line and automation surfaces.
 - Public frozen binaries support one-command removal of installer-owned commands, PATH markers, and matching custom Zed configuration with an automatic settings backup.
 - ACP initialization advertises Registry-compatible `zai-api-key-setup` Terminal Auth.
 - Terminal setup stores credentials atomically without echoing or logging the key; environment credentials take precedence.
@@ -167,7 +167,7 @@ Verify the install:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: editable glm_acp metadata and glm_acp-1.8.0.dist-info
+# expect: editable glm_acp metadata and glm_acp-1.8.1.dist-info
 ```
 
 ## Verification
