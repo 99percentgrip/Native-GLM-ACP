@@ -62,6 +62,7 @@ try {
     Write-Host "  $(Join-Path $InstallDir 'glm-acp.exe')"
     Write-Host ""
     Write-Host "Open a new terminal, then run: glm-acp --setup"
+    Write-Host "Then start the full-screen agent: glm-acp chat"
 } finally {
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }

@@ -19,6 +19,7 @@ Own continuous verification and reproducible cross-platform release publication.
 - Release archives must match the filenames in `registry/agent.json`.
 - Generated Registry identity and description must match `registry/agent.json`.
 - Linux x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x86-64 artifacts must each run `--version` before publication.
+- Every frozen artifact must expose `chat --help`, including the full-screen/plain frontend selector.
 - Each frozen executable must remain below the 40 MiB release-size ceiling.
 - Published archives receive SHA-256 files and GitHub build-provenance attestations.
 - Public installers must remain release assets and verify archive checksums before installation.

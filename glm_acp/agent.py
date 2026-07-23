@@ -3906,6 +3906,7 @@ class GlmAcpAgent(acp.Agent):
         tc_update = acp.update_tool_call(
             tool_call_id=tool_call_id,
             status="pending",
+            raw_input=tool_args,
         )
         opts = [
             PermissionOption(
@@ -4033,7 +4034,10 @@ class GlmAcpAgent(acp.Agent):
             ),
             AvailableCommand(
                 name="checkpoint",
-                description="Create/list checkpoints, toggle auto, or set file and MiB limits",
+                description=(
+                    "Create/list checkpoints, manage deduplicated storage, toggle auto, "
+                    "or set limits"
+                ),
             ),
             AvailableCommand(
                 name="rollback",
@@ -4098,6 +4102,106 @@ class GlmAcpAgent(acp.Agent):
                     f"- Size: **{limits.max_mib:,} MiB** ({limits.mib_source})\n"
                     "Change: `/checkpoint limits <files> <MiB>`\n"
                     "Reset: `/checkpoint limits reset`"
+                )
+            if argument.lower() == "storage":
+                try:
+                    status = await asyncio.to_thread(self._checkpoints.storage_status, session.cwd)
+                except CheckpointError as error:
+                    return f"❌ Checkpoint storage policy is invalid: {error}"
+                policy = status["policy"]
+                return (
+                    "🛟 **Deduplicated Checkpoint Storage**\n"
+                    f"- Objects: **{int(status['store_bytes']):,} bytes**\n"
+                    f"- Manifests: **{int(status['manifests_bytes']):,} bytes**\n"
+                    f"- Checkpoints: **{int(status['checkpoints']):,}**\n"
+                    f"- Legacy workspace copies: **{int(status['legacy_bytes']):,} bytes**\n"
+                    f"- Global ceiling: **{int(policy['store_max_mib']):,} MiB**\n"
+                    f"- History/project: **{int(policy['project_history'])}**\n"
+                    f"- Retention: **{int(policy['max_age_days'])} days**\n"
+                    f"- Large-file exclusion: **>{int(policy['max_file_mib'])} MiB**\n"
+                    "Change: `/checkpoint storage <store-MiB> <history> "
+                    "<days> <max-file-MiB>`\n"
+                    "Cleanup: `/checkpoint prune` · `/checkpoint migrate-legacy`"
+                )
+            if argument.lower() == "storage reset":
+                try:
+                    policy = await asyncio.to_thread(self._checkpoints.reset_storage)
+                except (CheckpointError, OSError) as error:
+                    return f"❌ Could not reset checkpoint storage policy: {error}"
+                return (
+                    "🛟 Checkpoint storage reset: "
+                    f"{policy.store_max_mib:,} MiB global / "
+                    f"{policy.project_history} per project / {policy.max_age_days} days / "
+                    f"{policy.max_file_mib} MiB per file."
+                )
+            if argument.lower().startswith("storage "):
+                values = argument.split()
+                if len(values) != 5:
+                    return (
+                        "Usage: `/checkpoint storage <store-MiB> <history> <days> <max-file-MiB>`"
+                    )
+                try:
+                    policy = await asyncio.to_thread(
+                        self._checkpoints.configure_storage,
+                        values[1],
+                        values[2],
+                        values[3],
+                        values[4],
+                    )
+                    cleanup = await asyncio.to_thread(self._checkpoints.prune)
+                except (CheckpointError, OSError) as error:
+                    return f"❌ Could not configure checkpoint storage: {error}"
+                return (
+                    "🛟 Checkpoint storage policy saved and pruned: "
+                    f"{policy.store_max_mib:,} MiB global / "
+                    f"{policy.project_history} per project / {policy.max_age_days} days / "
+                    f"{policy.max_file_mib} MiB per file; removed "
+                    f"{cleanup['removed_bytes']:,} bytes."
+                )
+            if argument.lower() == "prune":
+                try:
+                    cleanup = await asyncio.to_thread(self._checkpoints.prune)
+                except (CheckpointError, OSError) as error:
+                    return f"❌ Checkpoint pruning failed: {error}"
+                return (
+                    f"🧹 Checkpoints pruned; removed {cleanup['removed_bytes']:,} bytes, "
+                    f"{cleanup['remaining_checkpoints']} checkpoints remain."
+                )
+            if argument.lower() == "migrate-legacy":
+                try:
+                    migrated = await asyncio.to_thread(
+                        self._checkpoints.migrate_legacy, session.cwd
+                    )
+                except (CheckpointError, OSError) as error:
+                    return f"❌ Legacy checkpoint migration failed: {error}"
+                return (
+                    f"♻️ Migrated {migrated['migrated']} legacy checkpoints into the "
+                    f"deduplicated store and removed {migrated['removed_bytes']:,} old bytes."
+                )
+            if argument.lower() == "clear":
+                return (
+                    "This removes this workspace's deduplicated checkpoint history. "
+                    "Confirm with `/checkpoint clear confirm`. Legacy copies remain until "
+                    "migrated or cleared explicitly."
+                )
+            if argument.lower() == "clear confirm":
+                cleared = await asyncio.to_thread(self._checkpoints.clear, session.cwd)
+                session.active_checkpoint_id = ""
+                session.last_checkpoint_id = ""
+                await self._save_session(session)
+                return (
+                    f"🧹 Workspace checkpoints cleared; removed {cleared['removed_bytes']:,} bytes."
+                )
+            if argument.lower() == "clear legacy confirm":
+                cleared = await asyncio.to_thread(
+                    self._checkpoints.clear, session.cwd, include_legacy=True
+                )
+                session.active_checkpoint_id = ""
+                session.last_checkpoint_id = ""
+                await self._save_session(session)
+                return (
+                    "🧹 Workspace checkpoints and legacy copies cleared; removed "
+                    f"{cleared['removed_bytes']:,} bytes."
                 )
             if argument.lower() == "limits reset":
                 try:
@@ -4203,7 +4307,8 @@ class GlmAcpAgent(acp.Agent):
             return (
                 f"🛟 Checkpoint `{checkpoint['id']}` captured "
                 f"{checkpoint['files']} files ({checkpoint['bytes']} bytes); "
-                f"excluded {checkpoint['excluded_sensitive_paths']} sensitive paths.{auto_hint}"
+                f"excluded {checkpoint['excluded_sensitive_paths']} sensitive and "
+                f"{checkpoint.get('excluded_large_paths', 0)} large paths.{auto_hint}"
             )
 
         elif command == "/rollback" or command.startswith("/rollback "):

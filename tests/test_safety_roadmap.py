@@ -73,6 +73,117 @@ def test_checkpoint_never_copies_sensitive_files(tmp_path):
     )
 
 
+def test_checkpoint_content_is_deduplicated_across_workspaces(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    payload = "same content across projects"
+    (first / "a.txt").write_text(payload)
+    (second / "b.txt").write_text(payload)
+    manager = CheckpointManager(tmp_path / "checkpoints", storage_path=tmp_path / "storage.json")
+
+    manager.create(str(first))
+    objects_after_first = list(manager.objects_dir.glob("??/*"))
+    manager.create(str(second))
+    objects_after_second = list(manager.objects_dir.glob("??/*"))
+
+    assert len(objects_after_first) == 1
+    assert objects_after_second == objects_after_first
+    assert not any(path.name in {"a.txt", "b.txt"} for path in manager.base_dir.rglob("*"))
+
+
+def test_checkpoint_prunes_history_and_excludes_large_files(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    path = workspace / "tracked.txt"
+    path.write_text("one")
+    large = workspace / "large.bin"
+    large.write_bytes(b"x" * (1024 * 1024 + 1))
+    manager = CheckpointManager(tmp_path / "checkpoints", storage_path=tmp_path / "storage.json")
+    manager.configure_storage(64, 1, 30, 1)
+    first = manager.create(str(workspace))
+    path.write_text("two")
+    second = manager.create(str(workspace))
+
+    listed = manager.list(str(workspace))
+    assert [item["id"] for item in listed] == [second["id"]]
+    assert first["excluded_large_paths"] == second["excluded_large_paths"] == 1
+
+
+def test_checkpoint_global_ceiling_fails_instead_of_returning_pruned_id(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "random.bin").write_bytes(__import__("os").urandom(2 * 1024 * 1024))
+    manager = CheckpointManager(tmp_path / "checkpoints", storage_path=tmp_path / "storage.json")
+    manager.configure_storage(1, 10, 30, 10)
+
+    with pytest.raises(CheckpointError, match="global storage ceiling"):
+        manager.create(str(workspace))
+
+    assert manager.list(str(workspace)) == []
+    assert list(manager.objects_dir.glob("??/*")) == []
+    assert not (manager.base_dir / ".store-lock").exists()
+
+
+def test_checkpoint_migrates_verified_legacy_copy_then_removes_it(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    path = workspace / "file.txt"
+    path.write_text("before")
+    manager = CheckpointManager(tmp_path / "checkpoints")
+    identity = manager._workspace_identity(workspace)
+    legacy = manager.base_dir / identity / "legacy-id"
+    (legacy / "files").mkdir(parents=True)
+    (legacy / "files" / "file.txt").write_text("before")
+    digest = hashlib.sha256(b"before").hexdigest()
+    (legacy / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "id": "legacy-id",
+                "cwd": str(workspace.resolve()),
+                "label": "legacy",
+                "created_at": "2099-01-01T00:00:00+00:00",
+                "files": {"file.txt": digest},
+                "agent_hashes": {},
+                "excluded_sensitive_paths": [],
+            }
+        )
+    )
+
+    result = manager.migrate_legacy(str(workspace))
+
+    assert result["migrated"] == 1
+    assert not legacy.exists()
+    assert manager.list(str(workspace))[0]["id"] == "legacy-id"
+
+
+def test_checkpoint_refuses_legacy_manifest_path_traversal(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = CheckpointManager(tmp_path / "checkpoints")
+    identity = manager._workspace_identity(workspace)
+    legacy = manager.base_dir / identity / "unsafe-id"
+    (legacy / "files").mkdir(parents=True)
+    outside = legacy / "outside.txt"
+    outside.write_text("outside")
+    (legacy / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "id": "unsafe-id",
+                "cwd": str(workspace.resolve()),
+                "created_at": "2099-01-01T00:00:00+00:00",
+                "files": {"../outside.txt": hashlib.sha256(b"outside").hexdigest()},
+            }
+        )
+    )
+
+    assert manager.migrate_legacy(str(workspace))["migrated"] == 0
+    assert legacy.exists()
+
+
 def test_checkpoint_limits_are_persistent_bounded_and_overridable(tmp_path, monkeypatch):
     limits_path = tmp_path / "profile" / "checkpoint-limits.json"
     manager = CheckpointManager(tmp_path / "checkpoints", limits_path)
@@ -123,6 +234,35 @@ async def test_checkpoint_limits_command_is_easy_to_change_and_reset(tmp_path, m
     reset = await agent._handle_command(session, "/checkpoint limits reset")
     assert "20,000 files / 250 MiB" in reset
     assert not limits_path.exists()
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_storage_commands_are_inspectable_and_confirm_clear(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "config"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "file.txt").write_text("hello")
+    agent = GlmAcpAgent()
+    agent._save_session = AsyncMock()
+    agent._checkpoints = CheckpointManager(
+        tmp_path / "checkpoints",
+        tmp_path / "limits.json",
+        tmp_path / "auto.json",
+        tmp_path / "storage.json",
+    )
+    session = Session("checkpoint-storage", str(workspace))
+
+    configured = await agent._handle_command(session, "/checkpoint storage 64 2 7 1")
+    assert "64 MiB global" in configured
+    shown = await agent._handle_command(session, "/checkpoint storage")
+    assert "History/project: **2**" in shown
+    await agent._handle_command(session, "/checkpoint release-test")
+    preview = await agent._handle_command(session, "/checkpoint clear")
+    assert "Confirm" in preview
+    cleared = await agent._handle_command(session, "/checkpoint clear confirm")
+    assert "cleared" in cleared
+    assert agent._checkpoints.list(str(workspace)) == []
     await agent.aclose()
 
 

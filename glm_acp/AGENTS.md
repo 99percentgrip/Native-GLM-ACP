@@ -12,6 +12,7 @@ streaming, 1M context, and auto-continuation for long generations.
 
 - **Entry point**: `__main__.py` → `cli.py:main()` → `agent.py:run()`
 - **CLI, terminal auth, and uninstall routing**: `cli.py` → `main()` / `configure_credentials()`
+- **Standalone terminal frontends**: `terminal_cli.py` owns line/JSON routing and `tui.py` owns the cross-platform Textual conversation/reasoning/tool/plan/status panels, approval/settings modals, and key bindings; both must use the same `GlmAcpAgent` session/update and permission interfaces as ACP editors without forking the harness loop
 - **Public-install removal**: `uninstall.py` — frozen-copy validation, command/PATH cleanup, credential purge, and guarded Zed JSONC editing
 - **Frozen executable entry**: `launcher.py` → absolute import of `cli.main()`
 - **ACP protocol**: `agent.py` — implements `acp.Agent` (initialize, new_session, load_session, resume_session, close_session, list_sessions, prompt, set_config_option, set_session_mode)
@@ -29,7 +30,7 @@ streaming, 1M context, and auto-continuation for long generations.
 - **Lifecycle extensions**: `hooks.py` — user-owned, hash-pinned, workspace-scoped lifecycle commands
 - **Trajectory evidence**: `telemetry.py` and `observability.py` — bounded metadata-only events plus local aggregate quality, latency, cache, tool, and safety reporting
 - **Failure-driven evaluation**: `failure_corpus.py` — metadata-only drafts and permission-gated runnable project regression cases
-- **Workspace checkpoints**: `checkpoints.py` — default-off opt-in auto-checkpointing, configurable bounded secret-excluding baselines, exact agent hashes, and conflict-aware rollback
+- **Workspace checkpoints**: `checkpoints.py` — default-off opt-in auto-checkpointing, shared compressed Git-compatible blob objects, automatic bounded retention/GC, large/secret exclusion, verified legacy migration, exact agent hashes, and conflict-aware rollback
 - **Explicit references**: `references.py` — bounded workspace-contained references with language/task/change-aware ranking
 - **Declarative controls**: `policy.py` and `workflows.py` — ordered allow/ask/deny rules and static dependency graphs
 - **OS command isolation**: `os_sandbox.py` — Linux Bubblewrap, capability-detected macOS Seatbelt, Windows Job Object containment, and required-mode fail closure
@@ -345,13 +346,17 @@ Auto-checkpoint is **OFF by default**. The agent only snapshots the workspace
 before a mutating user turn when the operator opts in via `/checkpoint auto on`
 or sets `GLM_ACP_AUTO_CHECKPOINT=1`; this prevents large workspaces (for
 example ones containing big `*.sqlite`, `node_modules/`, or `.git/` trees) from
-filling the disk with multi-GB copies on every edit. The toggle persists in
+filling the disk with checkpoint data on every edit. The toggle persists in
 `config_dir()/checkpoint-auto.json` (schema 1, profile-scoped); `auto` shows
 the current state and source, `auto on/off` writes the value atomically, and
 `auto reset` clears the override back to the default OFF. Manual `/checkpoint`
 remains available regardless of the toggle. When enabled, snapshots default to
 20,000 files/250 MiB, exclude common credential, SSH, private-key, and `.env`
-paths, and record current hashes after each successful mutation.
+paths, exclude individual files larger than 25 MiB by default, and record current
+hashes after each successful mutation. File bodies are compressed loose Git blob
+objects in a private shadow store; identical content deduplicates across projects
+without reading or changing workspace Git metadata. Small schema-2 manifests
+reference objects and preserve executable modes.
 `/checkpoint limits <files> <MiB>` atomically persists profile-isolated limits;
 `limits` displays their source and `limits reset` restores defaults.
 `GLM_ACP_CHECKPOINT_MAX_FILES` and `GLM_ACP_CHECKPOINT_MAX_MIB` take
@@ -359,6 +364,14 @@ precedence. Values remain hard-bounded to 1,000,000 files/10,240 MiB and invalid
 configuration fails closed. `/rollback` restores only recorded paths whose current
 hash still equals the exact agent-produced hash; any later conflict aborts the
 entire rollback before writes.
+
+Checkpoint creation automatically retains ten manifests per project for 30 days,
+enforces a 1,024 MiB global object ceiling, and garbage-collects unreferenced
+objects. `/checkpoint storage` exposes and configures those bounds plus maximum
+file size; `/checkpoint prune` applies them immediately. Schema-1 full-copy
+snapshots remain readable. `/checkpoint migrate-legacy` verifies every old file
+hash, writes and rereads the schema-2 manifest, and only then removes the verified
+legacy directory. Clear operations require an explicit `confirm` argument.
 
 Explicit `@file:`, `@folder:`, `@symbol:`, and `@diff` prompt references are
 limited to 12 references and 48,000 aggregate characters. Paths remain inside
@@ -499,6 +512,24 @@ walks the persisted messages and sends each user turn as a
 System messages and tool-result entries are skipped (internal bookkeeping).
 The server runs with `use_unstable_protocol=True` to expose
 `session/list`, `session/resume`, and `session/close`.
+
+### Standalone terminal frontend
+
+`glm-acp chat` and `native-glm-acp chat` construct `GlmAcpAgent`, attach a
+terminal `Client`, and call the same initialize/new-or-resume/config/prompt methods
+as an ACP editor. The frontend may render or serialize updates but must not copy
+the tool loop, system prompt, session model, permission rules, or slash-command
+handling. One-shot Ask mode fails closed because no operator is available;
+Read Only and Bypass remain explicit choices. Bare command invocation must remain
+the stdio ACP server for Zed and Registry compatibility.
+
+Interactive TTY input/output selects the full-screen Textual interface; `--plain`
+retains the line REPL, while `--prompt`, `--stdin`, and `--json` remain
+non-full-screen automation surfaces. The TUI must expose separate conversation,
+reasoning, tool, plan, usage, and session state, awaited fail-closed approval
+modals with bounded credential-redacted arguments, cancellation, and live settings
+that call `set_config_option`/`set_session_mode`. TUI state is presentation-only
+and must never become an alternate source of session truth or stored reasoning.
 
 ## Work Guidance
 

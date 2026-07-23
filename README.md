@@ -6,6 +6,9 @@
 
 Native GLM ACP — an open-source ACP-native coding agent runtime for Z.ai GLM models.
 
+Run it inside any ACP-compatible editor, or use the same complete harness directly
+from a terminal with `glm-acp chat`—Zed is optional.
+
 ## Features
 
 ### Core
@@ -17,6 +20,7 @@ Native GLM ACP — an open-source ACP-native coding agent runtime for Z.ai GLM m
 - **Structured context compaction** — preserves plans, edits, verification evidence, and an optional user focus
 - **Context-pressure diagnostics** — one-time 60%/75%/85% warnings explain when compaction approaches
 - **Persistent session lineage** — conversations survive restarts; forks retain parent/root rollback paths
+- **Standalone full-screen TUI** — `glm-acp chat` provides conversation, reasoning, tool, plan, usage, approval, and live settings panels over the same sessions, tools, MCP, browser, workers, learning, awareness, and verification runtime as ACP editors
 - **Persistent goals and criteria** — `/goal` plus `/subgoal` continue across restarts and use a bounded auxiliary completion judge
 - **Inspectable awareness** — typed evidence-backed observations, assumptions, hypotheses, contradictions, unknowns, and capability limits with edit-aware freshness and completion certificates
 - **Adaptive metacognitive control** — separates six uncertainty classes, selects direct/grounded/deliberate/high-assurance posture, and learns only from redacted aggregate outcomes
@@ -40,7 +44,7 @@ Native GLM ACP — an open-source ACP-native coding agent runtime for Z.ai GLM m
 - **Redacted trajectory telemetry** — metadata-only events support tuning without prompts, outputs, commands, reasoning, credentials, or raw session IDs
 - **Playwright UI testing** — permission-gated isolated browser automation returns accessibility, console, network, interaction, and screenshot evidence
 - **Lifecycle hooks** — user-owned hash-pinned hooks can block tools, observe results, or request bounded pre-verification follow-up
-- **Conflict-aware checkpoints** — opt-in pre-mutation snapshots with `/checkpoint auto on` and `/rollback` restore only exact agent-produced hashes
+- **Deduplicated conflict-aware checkpoints** — opt-in snapshots use a pruned content-addressed shadow Git object store; `/rollback` restores only exact agent-produced hashes
 - **Language-aware context references** — bounded `@file:`, `@folder:`, `@symbol:`, and `@diff` expansion ranks definitions, references, task terms, tests, and changed files
 - **Declarative policy and workflows** — ordered allow/ask/deny rules and static DAGs add control without arbitrary orchestration code
 - **Cross-platform command containment** — Bubblewrap isolates Linux, macOS Seatbelt is capability-detected, and Windows Job Objects contain process trees without overstating filesystem isolation
@@ -99,6 +103,10 @@ Type these in the chat input:
 | `/checkpoint [label\|list]` | Create or list a bounded secret-safe workspace checkpoint |
 | `/checkpoint auto [on\|off\|reset]` | Show or toggle auto-checkpointing before each agent edit (off by default) |
 | `/checkpoint limits [files MiB\|reset]` | Show, persist, or reset checkpoint size limits |
+| `/checkpoint storage [store-MiB history days max-file-MiB\|reset]` | Configure global storage, retention, history, and large-file bounds |
+| `/checkpoint prune` | Apply retention/history limits and garbage-collect unreferenced objects |
+| `/checkpoint migrate-legacy` | Verify and convert old full-copy snapshots, then remove verified legacy bytes |
+| `/checkpoint clear [confirm]` | Preview or remove this workspace's deduplicated checkpoints |
 | `/rollback [checkpoint-id]` | Restore recorded agent changes unless a later conflicting edit is detected |
 | `/plugins` | List installed declarative plugins and their integrity state |
 | `/awareness` | Show knowledge, uncertainty, stale evidence, capability limits, next evidence, and completion coverage |
@@ -133,9 +141,11 @@ When you want conflict-aware `/rollback`, enable it for the session:
 ```
 
 You can also create a one-off checkpoint any time with `/checkpoint [label]`,
-or inspect existing ones with `/checkpoint list`. Each checkpoint stays outside
-the repository; common credential, private-key, SSH, and `.env` files are never
-copied. After each mutation, the checkpoint records the exact resulting hashes.
+or inspect existing ones with `/checkpoint list`. Payloads stay outside the
+repository in a private compressed Git-compatible object database. Identical
+file content is stored once across turns and projects; small manifests reference
+the shared objects. Common credential, private-key, SSH, and `.env` files are
+never captured. After each mutation, the checkpoint records the exact resulting hashes.
 `/rollback` restores only those paths; if any current hash differs, rollback
 stops without overwriting the later change.
 
@@ -157,6 +167,22 @@ For process-managed installations, `GLM_ACP_CHECKPOINT_MAX_FILES` and
 or excessive values fail closed; the supported maximum is 1,000,000 files and
 10,240 MiB. Limit changes never include ignored dependencies, build output, or
 sensitive files in checkpoints.
+
+Storage is bounded automatically. Defaults are 1,024 MiB globally, ten
+checkpoints per project, 30 days of retention, and exclusion of individual files
+larger than 25 MiB. Creation prunes expired/excess manifests and garbage-collects
+unreferenced objects. Inspect or tune those limits without editing configuration:
+
+```text
+/checkpoint storage
+/checkpoint storage 2048 20 60 50
+/checkpoint storage reset
+/checkpoint prune
+```
+
+Old schema-1 full-copy snapshots remain rollback-compatible. Convert and delete
+only verified copies with `/checkpoint migrate-legacy`, or explicitly remove
+both current and legacy workspace history with `/checkpoint clear legacy confirm`.
 
 Prompts may explicitly include `@file:path`, `@folder:path`, `@symbol:name`, or
 `@diff`. Expansion stays inside workspace roots, has file/character limits,
@@ -487,10 +513,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v1.7.0` before running the Unix
-installer, or pass `-Version v1.7.0` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v1.8.0` before running the Unix
+installer, or pass `-Version v1.8.0` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v1.7.0](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v1.7.0).
+[v1.8.0](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v1.8.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -552,6 +578,51 @@ uv pip install -e .
 > the venv's `site-packages`.
 
 Get your API key at https://z.ai/
+
+## Standalone terminal agent
+
+Zed is optional. On an interactive terminal, `chat` opens a full-screen TUI over the same
+`GlmAcpAgent` object used by ACP clients—there is no reduced CLI-only agent loop.
+Sessions, project instructions, every built-in tool, permissions, MCP/browser
+integration, workflows, isolated workers, memory, slash commands, awareness,
+metacognition, repository intelligence, checkpoints, and verification therefore
+share one implementation and persistence format.
+
+```bash
+# Interactive session in the current project
+glm-acp chat
+
+# Work in another repository with explicit permissions and model settings
+glm-acp chat --cwd /path/to/project --permission ask --model glm-5.2
+
+# Resume the session ID printed when chat starts
+glm-acp chat --cwd /path/to/project --resume SESSION_ID
+
+# One-shot automation (Ask fails closed because no operator can approve)
+glm-acp chat --cwd /path/to/project --permission read --prompt "Explain the test failure"
+printf '%s\n' 'Review @diff' | glm-acp chat --cwd /path/to/project --stdin
+
+# Explicitly authorized autonomous edit; use with care
+glm-acp chat --cwd /path/to/project --permission bypass --prompt "Fix and verify the bug"
+
+# Keep the original line-oriented interactive REPL
+glm-acp chat --plain
+```
+
+The TUI separates conversation, reasoning, tool activity, plan, context usage,
+and session state. F1 prepares `/help`, F2 toggles reasoning, F3 opens live model,
+endpoint, reasoning, permission, generation, auxiliary, Mixture-of-Agents, and
+session-mode settings; Ctrl-C cancels the active turn, Ctrl-L clears only the
+visible transcript, and Ctrl-Q exits. Destructive Ask-mode actions use a bounded,
+credential-redacted approval modal and deny by default.
+
+Use `/image path/to/image.png` in an interactive chat to queue an image for the
+next prompt, or repeat `--image PATH` for a one-shot vision prompt. `--json`
+emits ACP session updates as JSON Lines for integrations, `--plain` selects the
+line-oriented REPL, and `--no-thinking` hides live reasoning in plain mode.
+`/exit` and `/quit` close either interactive frontend.
+Bare `glm-acp` intentionally remains the stdio ACP server command used by Zed
+and Registry installations.
 
 ## Configure Zed
 
@@ -822,7 +893,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-1.7.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-1.8.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

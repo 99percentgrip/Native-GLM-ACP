@@ -87,3 +87,4 @@ case ":${PATH:-}:" in
 esac
 
 printf '\nNext: glm-acp --setup\n'
+printf 'Then start the full-screen agent: glm-acp chat\n'

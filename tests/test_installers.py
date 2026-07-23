@@ -64,6 +64,7 @@ def test_unix_installer_verifies_and_installs_both_commands(tmp_path):
         "1.6.1"
     )
     assert "Next: glm-acp --setup" in result.stdout
+    assert "full-screen agent: glm-acp chat" in result.stdout
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix installer integration test")
@@ -132,6 +133,7 @@ def test_installer_release_contract():
     assert '"glm-acp.exe"' in windows
     assert "scripts/install.sh" in workflow
     assert "scripts/install.ps1" in workflow
+    assert 'chat --help | grep -q -- "--plain"' in workflow
 
 
 def test_unix_installer_has_valid_shell_syntax():

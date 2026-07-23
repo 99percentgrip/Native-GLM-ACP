@@ -102,14 +102,15 @@ Native GLM ACP is an open-source ACP-native coding agent runtime for Z.ai GLM mo
 - Transport: ACP over stdio (JSON-RPC 2.0)
 - APIs: Z.ai Coding Plan, Standard API, and BigModel (CN)
 - Models: GLM-5.2, GLM-5-Turbo, GLM-4.7, GLM-5V-Turbo, GLM-4.5V, and GLM-4.6V according to the selected API plan
-- Entry points: `glm-acp`, `python3 -m glm_acp`, and the frozen `native-glm-acp` executable
+- Entry points: `glm-acp`, `python3 -m glm_acp`, and the frozen `native-glm-acp` executable; append `chat` for the standalone terminal frontend while bare invocation remains ACP stdio
 
 ## Current Project Status
 
-- Package and ACP implementation version is `1.7.0` from `glm_acp.__version__`.
-- GitHub release `v1.7.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
+- Package and ACP implementation version is `1.8.0` from `glm_acp.__version__`.
+- GitHub release `v1.8.0` publishes the five supported frozen binaries, checksums, provenance attestations, Python distributions, Registry metadata, the icon, checksum-verifying Unix and Windows installers, and safe one-command uninstall support.
 - ACP Registry publication is tracked in `agentclientprotocol/registry#439` and remains pending until Registry maintainers merge it.
 - Source installs, the `glm-acp` console script, module execution, and frozen binaries share `cli.main()`.
+- `glm-acp chat` and `native-glm-acp chat` open a cross-platform full-screen Textual interface over the full existing `GlmAcpAgent` runtime without an editor; conversation/reasoning/tool/plan/status panels, credential-redacted modal approvals, and live F3 session settings remain presentation-only while persistence, tools, commands, MCP/browser integration, workers, learning, awareness, repository intelligence, checkpoints, and verification stay shared with ACP clients. `--plain`, `--prompt`, `--stdin`, and `--json` preserve line and automation surfaces.
 - Public frozen binaries support one-command removal of installer-owned commands, PATH markers, and matching custom Zed configuration with an automatic settings backup.
 - ACP initialization advertises Registry-compatible `zai-api-key-setup` Terminal Auth.
 - Terminal setup stores credentials atomically without echoing or logging the key; environment credentials take precedence.
@@ -133,7 +134,7 @@ Native GLM ACP is an open-source ACP-native coding agent runtime for Z.ai GLM mo
 - Installed language servers provide read-only semantic navigation, transactional hash-pinned multi-file patches commit all-or-nothing, and bounded batch reads reduce tool round trips without arbitrary code execution.
 - Stable managed-prompt prefixes expose cache-hit ratios; metadata-only redacted trajectories and hash-pinned lifecycle hooks add evidence and policy without storing prompts, outputs, commands, reasoning, credentials, or raw session IDs.
 - Permission-gated isolated Playwright MCP supplies accessibility, console, network, screenshot, and interaction evidence without arbitrary browser JavaScript evaluation or inherited credentials.
-- Bounded secret-safe checkpoints precede workspace mutations only when auto-checkpoint is explicitly enabled (default **off** via `/checkpoint auto on` or `GLM_ACP_AUTO_CHECKPOINT=1`); `/checkpoint limits` persists profile-isolated file/MiB ceilings with bounded environment overrides, and exact post-agent hashes make `/rollback` stop on later conflicts instead of overwriting them.
+- Bounded secret-safe checkpoints precede workspace mutations only when auto-checkpoint is explicitly enabled (default **off** via `/checkpoint auto on` or `GLM_ACP_AUTO_CHECKPOINT=1`); compressed Git-compatible content-addressed objects deduplicate file bodies across projects, per-project history/age and a global ceiling prune automatically, large files are excluded, verified legacy copies can be migrated, and exact post-agent hashes make `/rollback` stop on later conflicts instead of overwriting them.
 - Explicit `@file:`, `@folder:`, `@symbol:`, and `@diff` references stay workspace-contained, bounded, secret-aware, and delimited as untrusted context.
 - Ordered repository policy rules, static dependency workflows, optional Bubblewrap isolation, detached worktree implementation workers, named user profiles, and permission-scoped hash-pinned data-only plugin packages provide safe extensibility without arbitrary orchestration code or automatic merges.
 - Cross-platform containment capability-detects Linux Bubblewrap and macOS Seatbelt, adds Windows process-tree Job Objects without treating them as filesystem isolation, and keeps required mode fail-closed.
@@ -166,7 +167,7 @@ Verify the install:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: editable glm_acp metadata and glm_acp-1.7.0.dist-info
+# expect: editable glm_acp metadata and glm_acp-1.8.0.dist-info
 ```
 
 ## Verification
