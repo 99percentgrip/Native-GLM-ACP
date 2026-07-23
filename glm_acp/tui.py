@@ -634,7 +634,11 @@ class NativeGlmTui(App[int]):
         from .terminal_cli import _configure
 
         try:
-            await self.agent.initialize(protocol_version=1, client_info={"name": "glm-acp-tui"})
+            await self.agent.initialize(
+                protocol_version=1,
+                client_info={"name": "glm-acp-tui"},
+                client_capabilities={"terminal": True},
+            )
             if self.args.resume:
                 self._replaying = True
                 await self.agent.resume_session(
@@ -1105,6 +1109,15 @@ class NativeGlmTui(App[int]):
                 used=int(getattr(update, "used", 0)),
                 size=int(getattr(update, "size", 0)),
             )
+        elif kind == "current_mode_update":
+            mode_id = str(getattr(update, "current_mode_id", ""))
+            if mode_id:
+                session = self.agent._sessions.get(self.session_id)
+                if session is not None:
+                    session.mode = mode_id
+                self._refresh_session_panel(
+                    "Running" if self._prompt_worker is not None else "Ready"
+                )
         elif kind == "session_info_update":
             self.sub_title = str(getattr(update, "title", "Full harness terminal"))
 
@@ -1162,6 +1175,7 @@ class NativeGlmTui(App[int]):
         reasoning_name = str(THOUGHT_LEVELS.get(reasoning, {}).get("name", reasoning))
         endpoint_name = str(API_ENDPOINTS.get(endpoint, {}).get("name", endpoint))
         quota = self._quota_summary()
+        awareness = self._awareness_summary()
         self.query_one("#session", Static).update(
             f"● {state}\n"
             f"{(self.session_id[:8] + '…') if self.session_id else 'starting'}\n\n"
@@ -1169,8 +1183,30 @@ class NativeGlmTui(App[int]):
             f"{endpoint_name}\n"
             f"{mode} · {permission}\n"
             f"context {context}\n"
+            f"{awareness}\n"
             f"{quota}"
         )
+
+    def _awareness_summary(self) -> str:
+        """Compact one-line epistemic and metacognitive state for the panel."""
+        session = getattr(self.agent, "_sessions", {}).get(self.session_id)
+        if session is None:
+            return "awareness —"
+        awareness = getattr(session, "awareness", None)
+        metacog = getattr(session, "metacognition", None)
+        if awareness is None or metacog is None:
+            return "awareness —"
+        active = awareness.active_records()
+        contradictions = sum(1 for r in active if r.kind == "contradiction")
+        observations = sum(1 for r in active if r.kind == "observation")
+        assessment = getattr(metacog, "assessment", None)
+        exec_mode = getattr(assessment, "execution_mode", None) or "direct"
+        risk = getattr(assessment, "risk_score", 0)
+        if contradictions:
+            return f"⚠ {exec_mode} · {contradictions} contradiction · /awareness"
+        if observations:
+            return f"⬡ {exec_mode} · {observations} evidence · risk {risk}"
+        return f"⬡ {exec_mode} · risk {risk}"
 
     def _quota_summary(self) -> str:
         if self._provider_usage is None:
