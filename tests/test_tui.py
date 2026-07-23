@@ -12,7 +12,8 @@ from acp.helpers import update_available_commands
 from acp.schema import AvailableCommand, PermissionOption
 from textual import events
 from textual._xterm_parser import XTermParser
-from textual.widgets import Footer, Input, OptionList, Select, Static
+from textual.containers import VerticalScroll
+from textual.widgets import ContentSwitcher, Footer, Input, OptionList, Select, Static
 from textual.widgets._footer import FooterKey
 
 from glm_acp.cli import build_parser
@@ -846,6 +847,48 @@ async def test_tui_composer_stays_enabled_and_queues_prompts_during_turn(tmp_pat
 
         # Queue display should be empty after draining
         assert str(app.query_one("#queue-status", Static).render()) == ""
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_working_tree_panel_toggles_and_cycles_four_views(tmp_path):
+    """F4 opens the working-tree panel; repeated F4 cycles through all 4 views then closes."""
+    (tmp_path / "hello.py").write_text("print('hi')")
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+
+        panel = app.query_one("#working-tree-panel")
+        assert panel.has_class("hidden")
+
+        await pilot.press("f4")
+        await pilot.pause(0.15)
+        assert app._wt_visible is True
+        assert not panel.has_class("hidden")
+        switcher = app.query_one("#wt-switcher", ContentSwitcher)
+        assert switcher.current == "wt-changes"
+
+        await pilot.press("f4")
+        await pilot.pause(0.15)
+        assert switcher.current == "wt-git"
+
+        await pilot.press("f4")
+        await pilot.pause(0.15)
+        assert switcher.current == "wt-diff"
+
+        await pilot.press("f4")
+        await pilot.pause(0.15)
+        assert switcher.current == "wt-files"
+
+        files_widget = app.query_one("#wt-files", VerticalScroll)
+        assert len(list(files_widget.children)) > 0
+
+        await pilot.press("f4")
+        await pilot.pause(0.1)
+        assert app._wt_visible is False
+        assert panel.has_class("hidden")
         app.exit(0)
 
 

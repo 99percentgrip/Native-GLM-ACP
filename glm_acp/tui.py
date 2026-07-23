@@ -26,6 +26,7 @@ from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import (
     Button,
+    ContentSwitcher,
     Footer,
     Header,
     Input,
@@ -487,6 +488,7 @@ class NativeGlmTui(App[int]):
         Binding("f1", "show_help", "Help", priority=True),
         Binding("f2", "toggle_thinking", "Reasoning view", priority=True),
         Binding("f3", "settings", "Settings", priority=True),
+        Binding("f4", "toggle_working_tree", "Working tree", priority=True),
     ]
 
     CSS = """
@@ -494,6 +496,16 @@ class NativeGlmTui(App[int]):
     Header { background: #111a24; color: #d7e3f4; }
     #workspace { height: 1fr; }
     #conversation { width: 1fr; }
+    #working-tree-panel {
+        width: 34; min-width: 24; border: round #4a9ee6; padding: 0 1;
+        background: #0c1118;
+    }
+    #working-tree-panel.hidden { display: none; }
+    #wt-switcher { height: 1fr; }
+    #wt-tabs {
+        height: 1; dock: bottom; background: #111a24; color: #7f96ab;
+        padding: 0 1;
+    }
     #transcript {
         height: 1fr; border: round #2589d8; padding: 0 1;
         background: #0d131b;
@@ -563,6 +575,8 @@ class NativeGlmTui(App[int]):
         self._agent_closed = False
         self._prompt_worker: Worker[None] | None = None
         self._prompt_queue: list[str] = []
+        self._wt_visible: bool = False
+        self._wt_view: int = 0
         self._replaying = False
         self._current_agent: Static | None = None
         self._current_agent_text = ""
@@ -590,6 +604,16 @@ class NativeGlmTui(App[int]):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="workspace"):
+            with Vertical(id="working-tree-panel", classes="hidden"):
+                yield ContentSwitcher(
+                    VerticalScroll(id="wt-changes"),
+                    VerticalScroll(id="wt-git"),
+                    VerticalScroll(id="wt-diff"),
+                    VerticalScroll(id="wt-files"),
+                    initial="wt-changes",
+                    id="wt-switcher",
+                )
+                yield Static("[1]Changes [2]Git [3]Diff [4]Files  (F4)", id="wt-tabs", markup=False)
             with Vertical(id="conversation"):
                 yield VerticalScroll(id="transcript")
                 yield RichLog(
@@ -1393,6 +1417,122 @@ class NativeGlmTui(App[int]):
             self.open_settings()
         else:
             self.notify("Settings are unavailable while a turn is running", severity="warning")
+
+    async def action_toggle_working_tree(self) -> None:
+        """Cycle: closed → Changes → Git → Diff → Files → closed."""
+        panel = self.query_one("#working-tree-panel")
+        if not self._wt_visible:
+            self._wt_visible = True
+            self._wt_view = 0
+            panel.remove_class("hidden")
+            await self._switch_wt_view(0)
+            return
+        self._wt_view += 1
+        if self._wt_view >= 4:
+            self._wt_visible = False
+            panel.add_class("hidden")
+            self.notify("Working tree panel closed", severity="information")
+        else:
+            await self._switch_wt_view(self._wt_view)
+
+    _WT_VIEW_IDS = ("wt-changes", "wt-git", "wt-diff", "wt-files")
+    _WT_VIEW_LABELS = ("Changes", "Git", "Diff", "Files")
+
+    async def _switch_wt_view(self, view: int) -> None:
+        switcher = self.query_one("#wt-switcher", ContentSwitcher)
+        switcher.current = self._WT_VIEW_IDS[view]
+        tabs = []
+        for i, label in enumerate(self._WT_VIEW_LABELS):
+            prefix = "▶ " if i == view else "  "
+            tabs.append(f"{prefix}[{i + 1}]{label}")
+        self.query_one("#wt-tabs", Static).update(" ".join(tabs) + "  (F4)")
+        await self._refresh_wt_view(view)
+
+    async def _refresh_wt_view(self, view: int) -> None:
+        refreshers = (
+            self._refresh_wt_changes,
+            self._refresh_wt_git,
+            self._refresh_wt_diff,
+            self._refresh_wt_files,
+        )
+        await refreshers[view]()
+
+    def _session_cwd(self) -> str:
+        session = getattr(self.agent, "_sessions", {}).get(self.session_id)
+        return str(getattr(session, "cwd", os.getcwd()))
+
+    async def _refresh_wt_changes(self) -> None:
+        widget = self.query_one("#wt-changes", VerticalScroll)
+        await widget.remove_children()
+        session = getattr(self.agent, "_sessions", {}).get(self.session_id)
+        verification = getattr(session, "verification", None)
+        paths = getattr(verification, "changed_paths", None) or []
+        if not paths:
+            await widget.mount(Static("No files changed this session yet.", markup=False))
+            return
+        for path in sorted(set(str(p) for p in paths)):
+            await widget.mount(Static(f"📝 {path}", markup=False))
+
+    async def _refresh_wt_git(self) -> None:
+        widget = self.query_one("#wt-git", VerticalScroll)
+        await widget.remove_children()
+        cwd = self._session_cwd()
+        result = await asyncio.to_thread(self._run_git, cwd, "status", "--short", "--porcelain")
+        if result is None:
+            await widget.mount(Static("Not a git repository.", markup=False))
+            return
+        if not result.strip():
+            await widget.mount(Static("Working tree clean — no changes.", markup=False))
+            return
+        for line in result.strip().splitlines():
+            await widget.mount(Static(line, markup=False))
+
+    async def _refresh_wt_diff(self) -> None:
+        widget = self.query_one("#wt-diff", VerticalScroll)
+        await widget.remove_children()
+        cwd = self._session_cwd()
+        result = await asyncio.to_thread(self._run_git, cwd, "diff", "--stat")
+        if not result or not result.strip():
+            await widget.mount(Static("No uncommitted changes to diff.", markup=False))
+            return
+        await widget.mount(Static(result[:8000], markup=False))
+
+    async def _refresh_wt_files(self) -> None:
+        widget = self.query_one("#wt-files", VerticalScroll)
+        await widget.remove_children()
+        cwd = self._session_cwd()
+        try:
+            entries = sorted(os.listdir(cwd))
+        except OSError:
+            await widget.mount(Static("Cannot read directory.", markup=False))
+            return
+        shown = 0
+        for entry in entries:
+            if entry.startswith("."):
+                continue
+            full = os.path.join(cwd, entry)
+            marker = "📁" if os.path.isdir(full) else "📄"
+            await widget.mount(Static(f"{marker} {entry}", markup=False))
+            shown += 1
+            if shown >= 200:
+                await widget.mount(Static(f"… ({len(entries) - shown} more)", markup=False))
+                break
+
+    @staticmethod
+    def _run_git(cwd: str, *args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return None
 
     @work(exclusive=True, group="settings")
     async def open_settings(self) -> None:
