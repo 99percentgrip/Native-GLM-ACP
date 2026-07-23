@@ -489,6 +489,7 @@ class NativeGlmTui(App[int]):
         Binding("f2", "toggle_thinking", "Reasoning view", priority=True),
         Binding("f3", "settings", "Settings", priority=True),
         Binding("f4", "toggle_working_tree", "Working tree", priority=True),
+        Binding("f5", "toggle_voice", "Push to talk", priority=True),
     ]
 
     CSS = """
@@ -577,6 +578,8 @@ class NativeGlmTui(App[int]):
         self._prompt_queue: list[str] = []
         self._wt_visible: bool = False
         self._wt_view: int = 0
+        self._recorder: object | None = None
+        self._turn_start_time: float = time.monotonic()
         self._replaying = False
         self._current_agent: Static | None = None
         self._current_agent_text = ""
@@ -996,6 +999,7 @@ class NativeGlmTui(App[int]):
         outcome = "completed"
         try:
             while True:
+                self._turn_start_time = time.monotonic()
                 try:
                     await self.agent.prompt(
                         prompt=_prompt_blocks(text, images),
@@ -1027,6 +1031,22 @@ class NativeGlmTui(App[int]):
         finally:
             self._prompt_worker = None
             if not self._shutdown_requested:
+                from .voice import play_sound, send_notification
+
+                turn_duration = time.monotonic() - self._turn_start_time
+                if outcome == "completed":
+                    play_sound("success")
+                    send_notification(
+                        "GLM ACP", "Task completed", turn_duration=turn_duration
+                    )
+                elif outcome == "failed":
+                    play_sound("error")
+                    send_notification(
+                        "GLM ACP", "Turn failed", error=True, turn_duration=turn_duration
+                    )
+                elif outcome == "cancelled":
+                    play_sound("warning")
+
                 composer = self.query_one("#composer", Input)
                 composer.focus()
                 self._refresh_session_panel("Ready")
@@ -1380,6 +1400,9 @@ class NativeGlmTui(App[int]):
         if self._agent_closed:
             return
         self._agent_closed = True
+        if self._recorder is not None:
+            getattr(self._recorder, "cleanup", lambda: None)()
+            self._recorder = None
         try:
             if self._prompt_worker is not None and self.session_id:
                 await self.agent.cancel(session_id=self.session_id)
@@ -1533,6 +1556,56 @@ class NativeGlmTui(App[int]):
             return result.stdout
         except (OSError, subprocess.TimeoutExpired):
             return None
+
+    async def action_toggle_voice(self) -> None:
+        """Push-to-talk: F5 toggles recording, transcribes via local Whisper."""
+        from .voice import (
+            VoiceRecorder,
+            is_voice_available,
+            suppress_sound_during_recording,
+            transcribe_audio,
+        )
+
+        if not is_voice_available():
+            self.notify(
+                "Voice requires: uv pip install -e '.[voice]'",
+                title="Push to talk unavailable",
+                severity="warning",
+            )
+            return
+
+        if self._recorder is not None and getattr(self._recorder, "recording", False):
+            wav_path = self._recorder.stop()
+            suppress_sound_during_recording()
+            self._set_activity("Transcribing…", active=True)
+            if wav_path:
+                text = await transcribe_audio(wav_path)
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+                if text:
+                    composer = self.query_one("#composer", Input)
+                    if composer.value and not composer.value.endswith(" "):
+                        composer.value += " "
+                    composer.value += text
+                    composer.cursor_position = len(composer.value)
+                    composer.focus()
+                    self._set_activity(f"✓ {text[:50]}", tone="success", hold=3.0)
+                else:
+                    self._set_activity("Transcription empty", tone="warning", hold=3.0)
+            else:
+                self._set_activity("Recording failed", tone="error", hold=3.0)
+            self._recorder = None
+        else:
+            recorder = VoiceRecorder()
+            if recorder.start():
+                self._recorder = recorder
+                suppress_sound_during_recording()
+                self._set_activity("🎤 Recording… (F5 to stop)", active=True)
+            else:
+                self._recorder = None
+                self.notify("Microphone unavailable", severity="warning")
 
     @work(exclusive=True, group="settings")
     async def open_settings(self) -> None:

@@ -40,6 +40,9 @@ dev = [
     "pytest-asyncio>=1,<2",
     "ruff>=0.12,<1",
 ]
+voice = [
+    "faster-whisper>=1,<2",
+]
 
 [project.urls]
 Homepage = "https://github.com/99percentgrip/Native-GLM-ACP"
