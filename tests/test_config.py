@@ -1,6 +1,7 @@
 """Tests for glm_acp.config — model registry, plans, thought levels."""
 
 import os
+import sys
 
 import pytest
 
@@ -286,8 +287,16 @@ class TestMaxToolIterations:
         max_tool_iterations_path().write_text(json.dumps({"schema": 1}))
         assert max_tool_iterations() == 50
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX file modes are not honored on Windows NTFS",
+    )
     def test_saved_file_is_user_read_write_only(self, monkeypatch, tmp_path):
-        """The persisted file is created with 0600 perms (credential-safety parity)."""
+        """The persisted file is created with 0600 perms (credential-safety parity).
+
+        Skipped on Windows because chmod() is a no-op there; the code still
+        calls it (matching cron.py and checkpoints.py) for Unix parity.
+        """
         monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
 
         from glm_acp.config import max_tool_iterations_path, save_max_tool_iterations
