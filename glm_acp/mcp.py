@@ -274,9 +274,13 @@ class McpManager:
             for key, value in configured_headers.items():
                 if isinstance(key, str) and isinstance(value, str):
                     headers[key] = os.path.expandvars(value)
-        client = httpx.AsyncClient(base_url=str(server["url"]), headers=headers, timeout=60)
+        client = httpx.AsyncClient(headers=headers, timeout=60)
         self._clients[name] = client
         return client
+
+    def _server_url(self, name: str) -> str:
+        """Return the server URL without a trailing slash."""
+        return str(self._server(name).get("url", "")).rstrip("/")
 
     async def _stdio_process(self, name: str) -> asyncio.subprocess.Process:
         process = self._stdio.get(name)
@@ -406,7 +410,7 @@ class McpManager:
         if server in self._sessions:
             headers["Mcp-Session-Id"] = self._sessions[server]
         response = await self._client(server).post(
-            "",
+            self._server_url(server),
             headers=headers,
             json={
                 "jsonrpc": "2.0",
@@ -441,7 +445,7 @@ class McpManager:
         if server in self._sessions:
             headers["Mcp-Session-Id"] = self._sessions[server]
         response = await self._client(server).post(
-            "",
+            self._server_url(server),
             headers=headers,
             json={"jsonrpc": "2.0", "method": method},
         )
