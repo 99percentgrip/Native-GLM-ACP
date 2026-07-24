@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -33,6 +37,8 @@ from textual.widgets import (
     Header,
     Input,
     Label,
+    ListItem,
+    ListView,
     OptionList,
     RichLog,
     Select,
@@ -73,6 +79,9 @@ LOCAL_COMMANDS = {
     "/clear-view": "Clear only the visible transcript",
     "/max-iterations": "Show or set the per-turn tool-call iteration cap (default 50, max 1000)",
     "/copy": "Copy the last response to clipboard (or /copy <N> for response N, /copy all)",
+    "/history": "Browse and resume past sessions (or press F6)",
+    "/search": "Grep the current conversation (or press Ctrl-F)",
+    "/export": "Export current session: /export [md|json] [file|clip] (default md clip)",
     "/native-mouse": "Toggle native terminal mouse mode (release TUI mouse capture)",
     "/planmode": "Activate Plan Mode with a PRD: /planmode <your requirements>",
     "/export last": "Export the last response to a Markdown file",
@@ -488,6 +497,225 @@ class SettingsScreen(ModalScreen[dict[str, str] | None]):
         thought_select.value = current if current in levels else "enabled"
 
 
+def _format_session_row(meta: dict[str, Any]) -> tuple[str, str]:
+    """Format a SessionStore.list() row into (first_line, second_line)."""
+    title = meta.get("title") or "Untitled session"
+    sid = str(meta.get("session_id", ""))[:8]
+    raw_when = meta.get("updated_at") or meta.get("saved_at") or ""
+    when: str
+    if raw_when:
+        try:
+            normalized = raw_when.replace("Z", "+00:00")
+            when = datetime.fromisoformat(normalized).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            when = raw_when[:16]
+    else:
+        when = "—"
+    cwd = str(meta.get("cwd") or "")
+    if cwd:
+        cwd_short = Path(cwd).name or cwd
+    else:
+        cwd_short = ""
+    branch = meta.get("branch_root_id") or meta.get("session_id") or sid
+    branch_marker = ""
+    if branch and str(branch) != str(meta.get("session_id")):
+        branch_marker = " · branched"
+    second = f"{when} · {sid} · {cwd_short}{branch_marker}"
+    return title, second
+
+
+class HistoryScreen(ModalScreen[str | None]):
+    """Browse persisted sessions and pick one to resume.
+
+    Returns the selected session_id (or None on cancel). The main app
+    resolves the resume via the shared agent.resume_session() method.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("q", "cancel", "Cancel", priority=True),
+    ]
+
+    CSS = """
+    HistoryScreen { align: center middle; background: $background 70%; }
+    #history-dialog {
+        width: 86; max-width: 96%; height: 80%;
+        border: thick $accent; background: $surface; padding: 1 2;
+    }
+    #history-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    #history-list { height: 1fr; border: solid $panel; margin-bottom: 1; }
+    #history-hint { color: $text-muted; height: 1; }
+    """
+
+    def __init__(self, sessions: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.sessions = sessions
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="history-dialog"):
+            yield Label(
+                f"Session history ({len(self.sessions)} persisted)",
+                id="history-title",
+            )
+            if self.sessions:
+                listview = ListView(id="history-list")
+                yield listview
+            else:
+                yield Static(
+                    "No persisted sessions yet.\nSessions are saved automatically after each turn.",
+                    id="history-list",
+                    markup=False,
+                )
+            yield Static(
+                "↑↓ navigate  ·  Enter resume  ·  Esc cancel",
+                id="history-hint",
+                markup=False,
+            )
+
+    def on_mount(self) -> None:
+        if not self.sessions:
+            return
+        listview = self.query_one("#history-list", ListView)
+        for meta in self.sessions:
+            title, second = _format_session_row(meta)
+            listview.append(
+                ListItem(
+                    Static(title, markup=False),
+                    Static(f"[dim]{escape(second)}[/dim]", markup=True),
+                )
+            )
+
+    @on(ListView.Selected)
+    def session_selected(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is None or idx >= len(self.sessions):
+            return
+        meta = self.sessions[idx]
+        self.dismiss(str(meta.get("session_id") or ""))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SearchScreen(ModalScreen[tuple[int, str] | None]):
+    """Grep the current conversation and show matching messages.
+
+    Searches the live in-memory session.messages (not the FTS5 store,
+    which only indexes on save). Returns (ordinal, full_text) on select,
+    or None on cancel.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+    ]
+
+    CSS = """
+    SearchScreen { align: center middle; background: $background 70%; }
+    #search-dialog {
+        width: 90; max-width: 96%; height: 84%;
+        border: thick $accent; background: $surface; padding: 1 2;
+    }
+    #search-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    #search-input { margin-bottom: 1; }
+    #search-results { height: 1fr; border: solid $panel; }
+    #search-hint { color: $text-muted; height: 1; margin-top: 1; }
+    """
+
+    def __init__(self, messages: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.messages = messages
+        self._matches: list[tuple[int, str, str, str]] = []  # (ord, role, snippet, full_text)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="search-dialog"):
+            yield Label("Search conversation", id="search-title")
+            yield Input(placeholder="Type to search messages…", id="search-input")
+            yield ListView(id="search-results")
+            yield Static(
+                "↑↓ navigate  ·  Enter view full message  ·  Esc cancel",
+                id="search-hint",
+                markup=False,
+            )
+
+    @on(Input.Changed, "#search-input")
+    def query_changed(self, event: Input.Changed) -> None:
+        query = event.value.strip()
+        listview = self.query_one("#search-results", ListView)
+        listview.clear()
+        self._matches = []
+        if not query:
+            return
+        try:
+            pattern = re.compile(re.escape(query), re.IGNORECASE)
+        except re.error:
+            return
+        for ordinal, msg in enumerate(self.messages):
+            role = str(msg.get("role", "?"))
+            text = _extract_message_text(msg)
+            if not text:
+                continue
+            match = pattern.search(text)
+            if not match:
+                continue
+            start = max(0, match.start() - 60)
+            end = min(len(text), match.end() + 120)
+            prefix = "…" if start > 0 else ""
+            suffix = "…" if end < len(text) else ""
+            snippet = (prefix + text[start:end].replace("\n", " ") + suffix).strip()
+            label_role = {"user": "You", "assistant": "Agent", "tool": "Tool", "system": "Sys"}.get(
+                role, role.capitalize()
+            )
+            listview.append(
+                ListItem(
+                    Static(
+                        f"[bold]{escape(label_role)} #{ordinal}[/bold]  {escape(snippet)}",
+                        markup=True,
+                    )
+                )
+            )
+            self._matches.append((ordinal, role, snippet, text))
+
+    @on(ListView.Selected, "#search-results")
+    def match_selected(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is None or idx >= len(self._matches):
+            return
+        _ordinal, _role, _snippet, full_text = self._matches[idx]
+        self.dismiss((idx, full_text))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+def _extract_message_text(msg: dict[str, Any]) -> str:
+    """Best-effort plain-text extraction from a session message dict."""
+    parts: list[str] = []
+    content = msg.get("content")
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif block.get("type") in {"tool_use", "function"}:
+                    fn = block.get("function") or block.get("name") or ""
+                    args = block.get("arguments") or block.get("input")
+                    if isinstance(args, dict):
+                        args = str(args)
+                    parts.append(f"{fn}({args})")
+            else:
+                text_attr = getattr(block, "text", None)
+                if isinstance(text_attr, str):
+                    parts.append(text_attr)
+    if msg.get("tool_calls"):
+        for tc in msg["tool_calls"]:
+            fn = (tc.get("function") or {}).get("name", "") if isinstance(tc, dict) else ""
+            args = (tc.get("function") or {}).get("arguments", "") if isinstance(tc, dict) else ""
+            parts.append(f"{fn}({args})")
+    return "\n".join(p for p in parts if p)
+
 
 class SelectableStatic(Static):
     """A ``Static`` whose text is exposed to Textual selection.
@@ -645,6 +873,8 @@ class NativeGlmTui(App[int]):
         Binding("f3", "settings", "Settings", priority=True),
         Binding("f4", "toggle_working_tree", "Working tree", priority=True),
         Binding("f5", "toggle_voice", "Push to talk", priority=True),
+        Binding("f6", "open_history", "History", priority=True),
+        Binding("ctrl+f", "open_search", "Search", priority=True),
         Binding("ctrl+y", "copy_last_response", "Copy response", priority=True),
         Binding("ctrl+shift+c", "copy_selection", "Copy selection", show=False, priority=True),
         # Native mouse mode toggle. When ON, Textual releases mouse capture
@@ -1006,6 +1236,18 @@ class NativeGlmTui(App[int]):
                 return True
         if text == "/export last":
             await self._export_last_response()
+            return True
+        if text == "/history":
+            await self.action_open_history()
+            return True
+        if text == "/search":
+            await self.action_open_search()
+            return True
+        if text == "/export":
+            await self._export_session("")
+            return True
+        if text.startswith("/export "):
+            await self._export_session(text[len("/export ") :].strip())
             return True
         command, separator, argument = text.partition(" ")
         if command in CONFIG_COMMANDS:
@@ -1532,6 +1774,7 @@ class NativeGlmTui(App[int]):
         endpoint_name = str(API_ENDPOINTS.get(endpoint, {}).get("name", endpoint))
         quota = self._quota_summary()
         awareness = self._awareness_summary()
+        tokens = self._token_summary(session)
         self.query_one("#session", Static).update(
             f"● {state}\n"
             f"{(self.session_id[:8] + '…') if self.session_id else 'starting'}\n\n"
@@ -1539,9 +1782,23 @@ class NativeGlmTui(App[int]):
             f"{endpoint_name}\n"
             f"{mode} · {permission}\n"
             f"context {context}\n"
+            f"{tokens}\n"
             f"{awareness}\n"
             f"{quota}"
         )
+
+    @staticmethod
+    def _token_summary(session: Any) -> str:
+        """Live session token totals (real, not estimated)."""
+        if session is None:
+            return "tokens —"
+        inp = int(getattr(session, "total_input_tokens", 0) or 0)
+        out = int(getattr(session, "total_output_tokens", 0) or 0)
+        cached = int(getattr(session, "total_cached_tokens", 0) or 0)
+        if inp == 0 and out == 0:
+            return "tokens waiting"
+        cached_pct = f" · cache {cached * 100 // inp:g}%" if inp and cached else ""
+        return f"tokens ↑{inp:,} ↓{out:,}{cached_pct}"
 
     def _awareness_summary(self) -> str:
         """Compact one-line epistemic and metacognitive state for the panel."""
@@ -1727,6 +1984,66 @@ class NativeGlmTui(App[int]):
             self.open_settings()
         else:
             self.notify("Settings are unavailable while a turn is running", severity="warning")
+
+    async def action_open_history(self) -> None:
+        """F6 / /history: browse and resume persisted sessions."""
+        if not self._agent_ready:
+            self.notify("Session not ready", severity="warning")
+            return
+        if self._prompt_worker is not None:
+            self.notify("Finish the current turn before switching sessions", severity="warning")
+            return
+        sessions = await asyncio.to_thread(self.agent._store.list)
+        # Prefer the current workspace; fall back to all when it has none.
+        cwd = self._session_cwd()
+        same_workspace = [s for s in sessions if s.get("cwd") == cwd] if cwd else []
+        candidates = same_workspace if same_workspace else sessions
+        selected = await self.push_screen_wait(HistoryScreen(candidates[:200]))
+        if not selected:
+            return
+        await self._resume_session(selected)
+
+    async def action_open_search(self) -> None:
+        """Ctrl-F / /search: grep the current conversation."""
+        session = getattr(self.agent, "_sessions", {}).get(self.session_id)
+        messages = list(getattr(session, "messages", None) or [])
+        if session is None or not messages:
+            self.notify("Nothing to search yet", severity="information")
+            return
+        result = await self.push_screen_wait(SearchScreen(messages))
+        if result is None:
+            return
+        _idx, full_text = result
+        # Show the full message in a fresh transcript entry (read-only).
+        await self._append_system(
+            f"Search match · full message:\n\n{full_text[:4000]}"
+            + (" …[truncated]" if len(full_text) > 4000 else "")
+        )
+
+    async def _resume_session(self, session_id: str) -> None:
+        """Resume a persisted session through the shared agent runtime."""
+        if session_id == self.session_id:
+            self.notify("Already on this session", severity="information")
+            return
+        cwd = self._session_cwd()
+        try:
+            await self.agent.resume_session(cwd=cwd, session_id=session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.notify(f"Resume failed: {exc}", severity="error")
+            return
+        # Switch the live view to the resumed session.
+        await self.action_clear_transcript()
+        self.session_id = session_id
+        self._agent_responses.clear()
+        self._current_agent = None
+        self._current_agent_text = ""
+        self._replaying = True
+        # The agent replays history via session_update notifications which
+        # handle_session_update() will append to the transcript.
+        await asyncio.sleep(0)
+        self._replaying = False
+        self.query_one("#composer", Input).focus()
+        self.notify(f"Resumed session {session_id[:8]}", severity="success")
 
     async def action_toggle_working_tree(self) -> None:
         """Cycle: closed → Changes → Git → Diff → Files → closed."""
@@ -2029,8 +2346,6 @@ class NativeGlmTui(App[int]):
         if not text:
             self.notify("No response to export", severity="warning")
             return
-        from datetime import datetime
-
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = f"glm-acp-export-{timestamp}.md"
         cwd = self._session_cwd()
@@ -2041,6 +2356,108 @@ class NativeGlmTui(App[int]):
             self.notify(f"Exported to {filename}", severity="success")
         except OSError as exc:
             self.notify(f"Export failed: {exc}", severity="error")
+
+    async def _export_session(self, args: str) -> None:
+        """Export the full current session.
+
+        Syntax: ``/export [md|json] [file|clip]``
+        Defaults: markdown format, copied to clipboard.
+        """
+        tokens = args.split() if args else []
+        fmt = "md"
+        target = "clip"
+        for tok in tokens:
+            if tok.lower() in {"md", "markdown"}:
+                fmt = "md"
+            elif tok.lower() == "json":
+                fmt = "json"
+            elif tok.lower() in {"file", "f"}:
+                target = "file"
+            elif tok.lower() in {"clip", "clipboard", "c"}:
+                target = "clip"
+        session = getattr(self.agent, "_sessions", {}).get(self.session_id)
+        messages = list(getattr(session, "messages", None) or [])
+        if session is None or not messages:
+            self.notify("Nothing to export yet", severity="warning")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        sid_short = (self.session_id or "session")[:8]
+        filename = f"glm-acp-{sid_short}-{timestamp}.{fmt}"
+
+        if fmt == "json":
+            if hasattr(session, "to_dict"):
+                data = session.to_dict()
+            else:
+                data = {"messages": list(getattr(session, "messages", None) or [])}
+            payload = json.dumps(data, indent=2, ensure_ascii=False, default=str)
+        else:
+            payload = self._render_session_markdown(session)
+
+        if target == "clip":
+            if len(payload) > MAX_CLIPBOARD_CHARS:
+                # Fall back to file when the transcript is too large for clipboard.
+                target = "file"
+            elif _write_system_clipboard(payload):
+                self.notify(
+                    f"Copied {len(payload):,} chars ({fmt}) to clipboard",
+                    severity="success",
+                )
+                return
+            else:
+                self.notify(
+                    "Clipboard unavailable (install xclip/xsel) — writing file instead",
+                    severity="warning",
+                )
+                target = "file"
+
+        if target == "file":
+            cwd = self._session_cwd()
+            filepath = os.path.join(cwd, filename)
+            try:
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                self.notify(f"Exported to {filename}", severity="success")
+            except OSError as exc:
+                self.notify(f"Export failed: {exc}", severity="error")
+
+    @staticmethod
+    def _render_session_markdown(session: Any) -> str:
+        """Render a session as a self-contained Markdown transcript."""
+        lines: list[str] = []
+        title = getattr(session, "title", "") or "GLM ACP session"
+        sid = getattr(session, "id", "") or ""
+        model = getattr(session, "model", "")
+        endpoint = getattr(session, "api_endpoint", "")
+        when = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f"# {title}")
+        lines.append("")
+        lines.append(f"- Session: `{sid}`")
+        if model:
+            lines.append(f"- Model: `{model}`")
+        if endpoint:
+            lines.append(f"- API plan: `{endpoint}`")
+        lines.append(f"- Exported: {when}")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        for msg in session.messages:
+            role = msg.get("role", "?")
+            label = {
+                "user": "## You",
+                "assistant": "## Agent",
+                "tool": "### Tool result",
+                "system": "## System",
+            }.get(role, f"## {role}")
+            lines.append(label)
+            lines.append("")
+            text = _extract_message_text(msg).strip()
+            if text:
+                lines.append(text)
+            else:
+                lines.append("_(no text content)_")
+            lines.append("")
+        return "\n".join(lines)
 
     @work(exclusive=True, group="settings")
     async def open_settings(self) -> None:

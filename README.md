@@ -82,7 +82,7 @@ All configurable from the Zed agent panel — no restart needed:
 
 ### Slash Commands
 
-Type these in the chat input:
+Type these in the chat input (TUI-only commands work in `glm-acp chat` / `native-glm-acp chat`):
 
 | Command | Description |
 |---|---|
@@ -90,9 +90,14 @@ Type these in the chat input:
 | `/clear-plan` | Clear the current task plan / todo list |
 | `/clear-history` | Wipe conversation history (keeps settings) |
 | `/diff` | Show git diff of all uncommitted changes |
-| `/export` | Export the conversation as a Markdown file |
+| `/export [md\|json] [file\|clip]` | TUI: export the full current session as Markdown or JSON to clipboard (default) or a timestamped file in the workspace |
+| `/export last` | TUI: export the last agent response to a Markdown file |
+| `/history` or **F6** | TUI: browse and resume persisted sessions for the current workspace |
+| `/search <term>` or **Ctrl-F** | TUI: grep the live conversation; selecting a match shows the full message |
 | `/status` | Show model, project facts, goal, fresh verification evidence, context usage, and cost |
 | `/memory` | Show approved durable project facts |
+
+The TUI session sidebar also shows a **live token meter** (cumulative input ↑, output ↓, and cache hit %) sourced from real GLM API `usage` deltas.
 | `/skills` | List skills learned from verified project work |
 | `/profile` | Show the active isolated profile and its approved private preferences |
 | `/curator` | Show skill usage, stale/archive candidates, and lifecycle state |
@@ -525,10 +530,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v2.1.5` before running the Unix
-installer, or pass `-Version v2.1.5` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v2.2.0` before running the Unix
+installer, or pass `-Version v2.2.0` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v2.1.5](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v2.1.5).
+[v2.2.0](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v2.2.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -695,10 +700,21 @@ session controls through the same APIs as ACP editors. `/api-plan` and
 F1 displays `/help`, F2 toggles the live reasoning view, F3 opens all session
 settings with models filtered by API plan and thinking levels filtered by model,
 **F4 cycles a four-view working-tree panel** (session changes, git status, diff,
-file browser) on the left side, and **F5 toggles push-to-talk** voice input.
+file browser) on the left side, **F5 toggles push-to-talk** voice input, and
+**F6 opens the session history browser** to resume any persisted session in the
+current workspace. **Ctrl-F greps the live in-memory conversation** — a modal
+lists every message whose text matches the query with role, ordinal, and a
+context snippet; selecting a match shows the full message. **`/export [md|json]
+[file|clip]`** writes the full current session as a self-contained Markdown
+transcript or JSON dump to clipboard (default) or a timestamped workspace file,
+with a clipboard→file fallback for transcripts over one million characters.
 Ctrl-C cancels the active turn, Ctrl-L clears only the visible transcript, and
 Ctrl-X exits; F10 and `/exit` are equivalent. Ctrl-Q remains a hidden
 compatibility binding because POSIX XON/XOFF terminals commonly swallow it.
+
+The **session sidebar** shows a **live token meter** (cumulative input ↑, output
+↓, and cache hit %) sourced from real GLM API `usage` deltas, alongside the
+compact awareness indicator and provider quota summary.
 
 The **composer stays enabled during active turns** — typing and pressing Enter
 queues prompts that auto-drain FIFO when each turn completes, with a visible
@@ -1036,7 +1052,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-2.1.5.dist-info  (and editable-install metadata)
+# expect: glm_acp-2.2.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

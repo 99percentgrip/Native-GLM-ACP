@@ -13,7 +13,7 @@ from acp.schema import AvailableCommand, PermissionOption
 from textual import events
 from textual._xterm_parser import XTermParser
 from textual.containers import VerticalScroll
-from textual.widgets import ContentSwitcher, Footer, Input, OptionList, Select, Static
+from textual.widgets import ContentSwitcher, Footer, Input, ListView, OptionList, Select, Static
 from textual.widgets._footer import FooterKey
 
 from glm_acp.cli import build_parser
@@ -21,9 +21,13 @@ from glm_acp.glm_client import PlanQuota, PlanUsage
 from glm_acp.terminal_cli import run_chat_command
 from glm_acp.tui import (
     CONFIG_COMMANDS,
+    HistoryScreen,
     NativeGlmTui,
     PermissionScreen,
+    SearchScreen,
     SettingsScreen,
+    _extract_message_text,
+    _format_session_row,
     _read_system_clipboard,
 )
 
@@ -1093,3 +1097,400 @@ def test_interactive_chat_routes_to_tui(monkeypatch, tmp_path):
 
     assert run_chat_command(args) == 17
     assert called == [args]
+
+
+# ---------------------------------------------------------------------------
+# History browser / in-conversation search / session export / token meter
+# ---------------------------------------------------------------------------
+
+
+class _StoreListAgent(FakeAgent):
+    """FakeAgent extension that exposes _store and resume_session."""
+
+    def __init__(self, sessions_list=None, cwd="/workspace"):
+        super().__init__()
+        from types import SimpleNamespace
+
+        store = SimpleNamespace(list=lambda: list(sessions_list or []))
+        self._store = store
+        self.resumed = []
+        self._fake_cwd = cwd
+
+    async def resume_session(self, cwd, session_id, **kwargs):
+        self.resumed.append(session_id)
+        return SimpleNamespace()
+
+
+def _session_with_messages(messages=None, *, tokens=True, cwd="/workspace"):
+    """Build a SimpleNamespace session with messages and token totals."""
+    ns = SimpleNamespace(
+        model="glm-5.2",
+        permission_mode="ask",
+        mode="code",
+        api_endpoint="coding",
+        thought_level="enabled",
+        generation_profile="balanced",
+        auxiliary_model="main",
+        mixture_mode="off",
+        cwd=cwd,
+        id="tui-session",
+        messages=list(messages or []),
+    )
+    if tokens:
+        ns.total_input_tokens = 1234
+        ns.total_output_tokens = 567
+        ns.total_cached_tokens = 800
+    else:
+        ns.total_input_tokens = 0
+        ns.total_output_tokens = 0
+        ns.total_cached_tokens = 0
+    return ns
+
+
+def test_extract_message_text_handles_string_and_tool_calls():
+    plain = {"role": "user", "content": "hello world"}
+    assert _extract_message_text(plain) == "hello world"
+
+    list_content = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}],
+    }
+    assert _extract_message_text(list_content) == "first\nsecond"
+
+    with_tools = {
+        "role": "assistant",
+        "content": "thinking",
+        "tool_calls": [
+            {"id": "1", "function": {"name": "read_file", "arguments": '{"path": "x"}'}}
+        ],
+    }
+    text = _extract_message_text(with_tools)
+    assert "thinking" in text
+    assert "read_file" in text
+
+
+def test_format_session_row_uses_title_timestamp_and_workspace():
+    title, second = _format_session_row(
+        {
+            "session_id": "abc-1234567890",
+            "title": "Bug hunt",
+            "updated_at": "2026-01-02T15:30:00+00:00",
+            "cwd": "/home/me/project",
+            "session_id_alt": None,
+        }
+    )
+    assert title == "Bug hunt"
+    assert "2026-01-02 15:30" in second
+    assert "abc-1234" in second
+    assert "project" in second
+
+
+def test_format_session_row_handles_missing_fields():
+    title, second = _format_session_row({})
+    assert title == "Untitled session"
+    assert "—" in second
+
+
+def test_token_summary_reports_real_totals():
+    session = _session_with_messages()
+    summary = NativeGlmTui._token_summary(session)
+    assert "↑1,234" in summary
+    assert "↓567" in summary
+    assert "cache" in summary
+
+
+def test_token_summary_waiting_when_zero():
+    session = _session_with_messages(tokens=False)
+    assert NativeGlmTui._token_summary(session) == "tokens waiting"
+
+
+@pytest.mark.asyncio
+async def test_history_screen_lists_sessions_and_returns_selected(tmp_path):
+    agent = _StoreListAgent(
+        sessions_list=[
+            {
+                "session_id": "sess-aaa",
+                "title": "First task",
+                "updated_at": "2026-01-02T15:30:00+00:00",
+                "cwd": str(tmp_path),
+            },
+            {
+                "session_id": "sess-bbb",
+                "title": "Second task",
+                "updated_at": "2026-01-01T10:00:00+00:00",
+                "cwd": str(tmp_path),
+            },
+        ],
+        cwd=str(tmp_path),
+    )
+    session = _session_with_messages([{"role": "user", "content": "x"}])
+    agent._sessions["tui-session"] = session
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    selected: dict[str, str] = {}
+
+    def on_result(value):
+        selected["v"] = value
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Two sessions in the same workspace + the live session would
+        # normally make >=3 entries; force the workspace filter to take
+        # effect by keeping only the stored entries.
+        app.push_screen(HistoryScreen(agent._store.list()[:2]), callback=on_result)
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, HistoryScreen):
+                break
+        assert isinstance(app.screen, HistoryScreen)
+        listview = app.screen.query_one("#history-list", ListView)
+        assert len(listview.children) == 2
+        listview.index = 1
+        await pilot.pause(0.05)
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if not isinstance(app.screen, HistoryScreen):
+                break
+    assert selected.get("v") == "sess-bbb"
+
+
+@pytest.mark.asyncio
+async def test_history_screen_cancel_returns_none(tmp_path):
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: FakeAgent())
+    selected: dict[str, str] = {}
+
+    def on_result(value):
+        selected["v"] = value
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen(HistoryScreen([]), callback=on_result)
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, HistoryScreen):
+                break
+        await pilot.press("escape")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if not isinstance(app.screen, HistoryScreen):
+                break
+    assert selected.get("v") is None
+
+
+@pytest.mark.asyncio
+async def test_search_screen_greps_messages_and_returns_full_text(tmp_path):
+    agent = FakeAgent()
+    session = _session_with_messages(
+        [
+            {"role": "user", "content": "how do I configure the api plan?"},
+            {"role": "assistant", "content": "use /plan coding to switch"},
+            {"role": "user", "content": "thanks"},
+        ]
+    )
+    agent._sessions["tui-session"] = session
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    selected: dict[str, object] = {}
+
+    def on_result(value):
+        selected["v"] = value
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen(SearchScreen(list(session.messages)), callback=on_result)
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SearchScreen):
+                break
+        assert isinstance(app.screen, SearchScreen)
+        search_input = app.screen.query_one("#search-input", Input)
+        search_input.value = "configure"
+        search_input.post_message(Input.Changed(search_input, "configure"))
+        for _ in range(20):
+            await pilot.pause(0.05)
+            results = app.screen.query_one("#search-results", ListView)
+            if len(results.children) >= 1:
+                break
+        results = app.screen.query_one("#search-results", ListView)
+        assert len(results.children) == 1
+        results.index = 0
+        results.focus()
+        await pilot.pause(0.05)
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if not isinstance(app.screen, SearchScreen):
+                break
+    payload = selected.get("v")
+    assert payload is not None
+    _idx, full_text = payload  # type: ignore[misc]
+    assert "configure the api plan" in full_text
+
+
+def test_render_session_markdown_includes_each_role():
+    session = SimpleNamespace(
+        id="sess-x",
+        model="glm-5.2",
+        api_endpoint="coding",
+        title="My task",
+        messages=[
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ],
+    )
+    md = NativeGlmTui._render_session_markdown(session)
+    assert "# My task" in md
+    assert "## You" in md
+    assert "hello" in md
+    assert "## Agent" in md
+    assert "hi there" in md
+    assert "glm-5.2" in md
+
+
+@pytest.mark.asyncio
+async def test_export_session_writes_file_when_no_clipboard(tmp_path, monkeypatch):
+    agent = _StoreListAgent(cwd=str(tmp_path))
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    # No clipboard helpers available — should fall back to a file.
+    monkeypatch.setattr("glm_acp.tui._write_system_clipboard", lambda text: False)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Replace AFTER init so FakeAgent.new_session doesn't clobber it.
+        agent._sessions["tui-session"] = _session_with_messages(
+            [
+                {"role": "user", "content": "say hi"},
+                {"role": "assistant", "content": "hello!"},
+            ],
+            cwd=str(tmp_path),
+        )
+        await app._export_session("md file")
+        await pilot.pause(0.1)
+
+    exported = list(tmp_path.glob("glm-acp-tui-sess-*.md"))
+    assert len(exported) == 1
+    text = exported[0].read_text(encoding="utf-8")
+    assert "## You" in text
+    assert "say hi" in text
+    assert "hello!" in text
+
+
+@pytest.mark.asyncio
+async def test_export_session_json_clipboard_uses_store(tmp_path, monkeypatch):
+    agent = _StoreListAgent(cwd=str(tmp_path))
+
+    class FakeSession:
+        def __init__(self):
+            self.id = "tui-session"
+            self.messages = [{"role": "user", "content": "ping"}]
+            self.model = "glm-5.2"
+            self.api_endpoint = "coding"
+            self.title = "T"
+            self.total_input_tokens = 5
+            self.total_output_tokens = 0
+            self.total_cached_tokens = 0
+            self.permission_mode = "ask"
+            self.mode = "code"
+            self.thought_level = "enabled"
+            self.generation_profile = "balanced"
+            self.auxiliary_model = "main"
+            self.mixture_mode = "off"
+            self.cwd = str(tmp_path)
+
+        def to_dict(self):
+            return {"id": self.id, "messages": self.messages}
+
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    captured = {}
+
+    def fake_clip(text):
+        captured["text"] = text
+        return True
+
+    monkeypatch.setattr("glm_acp.tui._write_system_clipboard", fake_clip)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Replace AFTER init so FakeAgent.new_session doesn't clobber it.
+        agent._sessions["tui-session"] = FakeSession()
+        await app._export_session("json clip")
+        await pilot.pause(0.1)
+
+    assert "text" in captured
+    import json as _json
+
+    payload = _json.loads(captured["text"])
+    assert payload["messages"][0]["content"] == "ping"
+
+
+@pytest.mark.asyncio
+async def test_refresh_session_panel_shows_live_token_totals(tmp_path):
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        session = agent._sessions["tui-session"]
+        session.total_input_tokens = 9999
+        session.total_output_tokens = 1111
+        session.total_cached_tokens = 500
+        app._refresh_session_panel("Ready")
+        rendered = str(app.query_one("#session", Static).render())
+        assert "↑9,999" in rendered
+        assert "↓1,111" in rendered
+        assert "cache" in rendered
+
+
+@pytest.mark.asyncio
+async def test_search_command_with_no_messages_informs_user(tmp_path):
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        handled = await app._handle_local_command("/search")
+        assert handled is True
+
+
+@pytest.mark.asyncio
+async def test_history_command_filters_to_workspace(tmp_path):
+    sessions = [
+        {
+            "session_id": "in-workspace",
+            "title": "Same",
+            "updated_at": "2026-01-02T15:30:00+00:00",
+            "cwd": str(tmp_path),
+        },
+        {
+            "session_id": "other-workspace",
+            "title": "Other",
+            "updated_at": "2026-01-02T15:30:00+00:00",
+            "cwd": "/somewhere/else",
+        },
+    ]
+    agent = _StoreListAgent(sessions_list=sessions, cwd=str(tmp_path))
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    captured = {}
+
+    async def fake_push(screen):
+        captured["screen"] = screen
+        # Emulate user pressing Escape.
+        return None
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Make the live session report the same cwd so the workspace filter
+        # keeps only the in-workspace entry.
+        agent._sessions["tui-session"].cwd = str(tmp_path)
+        monkey_target = app
+        monkey_target.push_screen_wait = fake_push  # type: ignore[method-assign]
+        await app.action_open_history()
+        await pilot.pause(0.05)
+
+    assert isinstance(captured.get("screen"), HistoryScreen)
+    # Workspace filter should keep only the same-workspace entry.
+    assert [s["session_id"] for s in captured["screen"].sessions] == ["in-workspace"]
