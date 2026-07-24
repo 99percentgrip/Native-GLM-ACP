@@ -1869,11 +1869,21 @@ def run_tui_command(args: argparse.Namespace) -> int:
     if not Path(args.cwd).is_dir():
         print(f"Workspace does not exist: {args.cwd}", file=__import__("sys").stderr)
         return 2
+    app = NativeGlmTui(args)
+    exit_code = 0
     try:
-        result = NativeGlmTui(args).run()
-        return int(result or 0)
+        result = app.run()
+        exit_code = int(result or 0)
     except KeyboardInterrupt:
-        return 130
+        exit_code = 130
     except Exception as error:
         print(f"Native GLM ACP TUI failed: {error}", file=__import__("sys").stderr)
-        return 1
+        exit_code = 1
+    session_id = getattr(app, "session_id", "")
+    if session_id:
+        print(
+            f"\n📋 Session saved. To resume this conversation:\n"
+            f"   glm-acp chat --resume {session_id}\n",
+            file=sys.stderr,
+        )
+    return exit_code
