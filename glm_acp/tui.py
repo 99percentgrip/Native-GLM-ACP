@@ -1246,6 +1246,16 @@ class NativeGlmTui(App[int]):
                     f"[bold]{escape(str(title))}[/bold] · {escape(str(status or 'tool'))}",
                     scroll_end=True,
                 )
+            content_items = getattr(update, "content", None)
+            if content_items:
+                for item in content_items:
+                    text = self._extract_tool_content_text(item)
+                    if text:
+                        for line in text.strip().splitlines()[:25]:
+                            self.query_one("#tools", RichLog).write(
+                                f"  [dim]{escape(line)}[/dim]",
+                                scroll_end=True,
+                            )
         elif kind == "plan":
             lines = ["Plan"]
             for entry in getattr(update, "entries", []):
@@ -1275,6 +1285,23 @@ class NativeGlmTui(App[int]):
     @staticmethod
     def _content_text(update: Any) -> str:
         return str(getattr(getattr(update, "content", None), "text", ""))
+
+    @staticmethod
+    def _extract_tool_content_text(item: Any) -> str:
+        """Extract readable text from a ToolCallContent item."""
+        inner = getattr(item, "content", None)
+        if inner is None:
+            text = getattr(item, "text", None)
+            return str(text) if text else ""
+        if isinstance(inner, str):
+            return inner
+        parts: list[str] = []
+        if isinstance(inner, (list, tuple)):
+            for block in inner:
+                text = getattr(block, "text", None)
+                if text:
+                    parts.append(str(text))
+        return "\n".join(parts)
 
     async def _append_user(self, text: str, *, history: bool = False) -> None:
         self._current_agent = None
