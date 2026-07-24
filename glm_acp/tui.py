@@ -69,6 +69,8 @@ LOCAL_COMMANDS = {
     "/reasoning-panel": "Show or hide the live reasoning panel",
     "/toggle-thinking": "Alias for /reasoning-panel",
     "/clear-view": "Clear only the visible transcript",
+    "/copy": "Copy the last response to clipboard (or /copy <N> for response N, /copy all)",
+    "/export last": "Export the last response to a Markdown file",
     "/image": "Queue an image for the next prompt",
     "/exit": "Close the terminal agent",
 }
@@ -145,6 +147,65 @@ def _read_system_clipboard() -> str:
         if result.returncode == 0 and result.stdout:
             return result.stdout[:MAX_CLIPBOARD_CHARS].rstrip("\r\n")
     return ""
+
+
+def _write_system_clipboard(text: str) -> bool:
+    """Write text to the OS clipboard without invoking a shell."""
+    if sys.platform == "darwin":
+        commands = [("pbcopy",)]
+    elif os.name == "nt":
+        commands = [
+            ("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             "$input = [Console]::In::ReadToEnd(); Set-Clipboard -Value $input"),
+            ("clip",),
+        ]
+    else:
+        commands = []
+        if os.environ.get("WAYLAND_DISPLAY"):
+            commands.append(("wl-copy",))
+        commands.extend(
+            [
+                ("xclip", "-selection", "clipboard"),
+                ("xsel", "--clipboard", "--input"),
+            ]
+        )
+    allowed_environment = {
+        name: value
+        for name in (
+            "DISPLAY",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "PATH",
+            "SystemRoot",
+            "USERPROFILE",
+            "WAYLAND_DISPLAY",
+            "WINDIR",
+            "XAUTHORITY",
+            "XDG_RUNTIME_DIR",
+        )
+        if (value := os.environ.get(name))
+    }
+    for command in commands:
+        executable = shutil.which(command[0])
+        if executable is None:
+            continue
+        try:
+            result = subprocess.run(
+                (executable, *command[1:]),
+                input=text,
+                capture_output=True,
+                check=False,
+                encoding="utf-8",
+                errors="replace",
+                env=allowed_environment,
+                timeout=1.0,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0:
+            return True
+    return False
 
 
 class CommandInput(Input):
@@ -490,6 +551,7 @@ class NativeGlmTui(App[int]):
         Binding("f3", "settings", "Settings", priority=True),
         Binding("f4", "toggle_working_tree", "Working tree", priority=True),
         Binding("f5", "toggle_voice", "Push to talk", priority=True),
+        Binding("ctrl+y", "copy_last_response", "Copy response", priority=True),
     ]
 
     CSS = """
@@ -583,6 +645,7 @@ class NativeGlmTui(App[int]):
         self._replaying = False
         self._current_agent: Static | None = None
         self._current_agent_text = ""
+        self._agent_responses: list[str] = []
         self._last_agent_render: float = 0.0
         self._thinking_text = ""
         self._pending_images = list(args.image)
@@ -762,6 +825,20 @@ class NativeGlmTui(App[int]):
         if text == "/clear-view":
             await self.action_clear_transcript()
             self.notify("Transcript view cleared", severity="information")
+            return True
+        if text == "/copy" or text == "/copy last":
+            await self._copy_response(None)
+            return True
+        if text.startswith("/copy "):
+            arg = text.partition(" ")[2].strip()
+            if arg.isdigit():
+                await self._copy_response(int(arg))
+                return True
+            if arg == "all":
+                await self._copy_all_responses()
+                return True
+        if text == "/export last":
+            await self._export_last_response()
             return True
         command, separator, argument = text.partition(" ")
         if command in CONFIG_COMMANDS:
@@ -1210,6 +1287,8 @@ class NativeGlmTui(App[int]):
     async def _append_agent(self, text: str) -> None:
         transcript = self.query_one("#transcript", VerticalScroll)
         if self._current_agent is None:
+            if self._current_agent_text:
+                self._agent_responses.append(self._current_agent_text)
             self._current_agent_text = ""
             self._current_agent = Static("", classes="agent-message", markup=False)
             await transcript.mount(self._current_agent)
@@ -1614,6 +1693,75 @@ class NativeGlmTui(App[int]):
             else:
                 self._recorder = None
                 self.notify("Microphone unavailable", severity="warning")
+
+    async def action_copy_last_response(self) -> None:
+        """Ctrl+Y: copy the last agent response to the system clipboard."""
+        await self._copy_response(None)
+
+    async def _copy_response(self, index: int | None) -> None:
+        """Copy a specific agent response to the clipboard.
+
+        index=None copies the most recent response.
+        index=1 copies the first response, index=2 the second, etc.
+        """
+        if index is None:
+            text = self._current_agent_text or (
+                self._agent_responses[-1] if self._agent_responses else ""
+            )
+        else:
+            responses = self._agent_responses[:]
+            if self._current_agent_text:
+                responses.append(self._current_agent_text)
+            if 1 <= index <= len(responses):
+                text = responses[index - 1]
+            else:
+                self.notify(
+                    f"Response {index} not found (have {len(responses)})", severity="warning"
+                )
+                return
+        if not text:
+            self.notify("No response to copy", severity="warning")
+            return
+        if _write_system_clipboard(text):
+            preview = text[:60].replace("\n", " ")
+            self.notify(f"Copied to clipboard: {preview}…", severity="success")
+        else:
+            self.notify("Clipboard unavailable (install xclip or xsel)", severity="warning")
+
+    async def _copy_all_responses(self) -> None:
+        """Copy all agent responses concatenated to the clipboard."""
+        responses = self._agent_responses[:]
+        if self._current_agent_text:
+            responses.append(self._current_agent_text)
+        if not responses:
+            self.notify("No responses to copy", severity="warning")
+            return
+        text = "\n\n---\n\n".join(responses)
+        if _write_system_clipboard(text):
+            self.notify(f"Copied {len(responses)} responses to clipboard", severity="success")
+        else:
+            self.notify("Clipboard unavailable", severity="warning")
+
+    async def _export_last_response(self) -> None:
+        """Export the last agent response to a timestamped Markdown file."""
+        text = self._current_agent_text or (
+            self._agent_responses[-1] if self._agent_responses else ""
+        )
+        if not text:
+            self.notify("No response to export", severity="warning")
+            return
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"glm-acp-export-{timestamp}.md"
+        cwd = self._session_cwd()
+        filepath = os.path.join(cwd, filename)
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(f"# GLM ACP Response\n\n{text}\n")
+            self.notify(f"Exported to {filename}", severity="success")
+        except OSError as exc:
+            self.notify(f"Export failed: {exc}", severity="error")
 
     @work(exclusive=True, group="settings")
     async def open_settings(self) -> None:
