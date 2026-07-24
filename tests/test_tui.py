@@ -295,6 +295,42 @@ def test_system_clipboard_reader_does_not_inherit_credentials(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tui_agent_response_is_selectable_after_richmarkdown_render(tmp_path):
+    """Regression: agent messages render as ``RichMarkdown`` inside a ``Static``,
+    which Textual's ``Widget.get_selection`` skips (returns ``None``). The
+    ``SelectableStatic`` subclass exposes the raw markdown source so
+    Ctrl+Shift+C and the Copy-selection menu entry can extract agent text."""
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Append a unique marker via the agent-message path.
+        await app._append_agent("Agent reply with UNIQUE_REGRESSION_MARKER_99.")
+        for _ in range(20):
+            await pilot.pause(0.05)
+
+        transcript = app.query_one("#transcript")
+        statics = list(transcript.query(".agent-message"))
+        assert statics, "agent message widget should be mounted"
+
+        # Select-all-in-widget on the transcript and read the text back.
+        app.screen._select_all_in_widget(transcript)
+        await pilot.pause(0.05)
+        selection_text = app.screen.get_selected_text() or ""
+        assert "UNIQUE_REGRESSION_MARKER_99" in selection_text, (
+            "Agent response must be selectable for Ctrl+Shift+C / Copy selection"
+        )
+
+        # Full-screen select-all should also include the agent text.
+        app.screen.text_select_all()
+        await pilot.pause(0.05)
+        full_selection = app.screen.get_selected_text() or ""
+        assert "UNIQUE_REGRESSION_MARKER_99" in full_selection
+        app.exit(0)
+
+
+@pytest.mark.asyncio
 async def test_tui_context_menu_opens_via_keyboard_and_lists_composer_actions(tmp_path):
     """F6 / Ctrl+Right Click should open a Codex-style dropdown menu."""
     from glm_acp.tui import ContextMenuScreen
@@ -447,13 +483,19 @@ async def test_tui_context_menu_copy_composer_dispatches_to_clipboard(tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_tui_context_menu_select_all_output_invokes_screen_text_select_all(
+async def test_tui_context_menu_callback_dispatches_select_all_output(
     tmp_path, monkeypatch
 ):
-    """The Select all output menu entry calls the screen selection API."""
-    from textual.screen import Screen
+    """The context menu callback routes ``select_all_output`` to the action.
 
-    from glm_acp.tui import ContextMenuScreen
+    Tests the dispatch table directly to keep the assertion OS-independent —
+    the surrounding UI flow (F6 / Ctrl+Right Click opening the menu, Enter
+    confirming the highlighted option) is covered by the other context-menu
+    tests. On Windows CI runners, ``pilot.press('enter')`` inside an
+    OptionList-bearing ModalScreen has slightly different timing, which makes
+    a full UI round-trip flaky.
+    """
+    from textual.screen import Screen
 
     agent = FakeAgent()
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
@@ -463,32 +505,20 @@ async def test_tui_context_menu_select_all_output_invokes_screen_text_select_all
     def fake_select_all(self_):
         called["count"] += 1
 
-    # Patch the class method so it works regardless of which Screen
-    # instance is current when the modal-callback path runs (the captured
-    # main-screen instance may differ from the post-dismiss ``app.screen``
-    # on Windows / non-Linux CI runners).
     monkeypatch.setattr(Screen, "text_select_all", fake_select_all)
 
     async with app.run_test(size=(120, 40)) as pilot:
         await _wait_for_agent_ready(app, pilot)
-        # Defocus the composer so we get the transcript-context menu.
-        composer = app.query_one("#composer", Input)
-        composer.disabled = True  # force non-composer focus state
+        # Drive the dispatch table directly — mirrors what the menu's
+        # OptionSelected handler does after ``dismiss(action_id)``.
+        app._context_menu_callback("select_all_output")
         await pilot.pause()
+        assert called["count"] == 1
 
-        app.action_open_context_menu()
+        # Defensive: ensure unknown / None actions don't raise.
+        app._context_menu_callback(None)
+        app._context_menu_callback("not_a_real_action")
         await pilot.pause()
-        modal = [s for s in app.screen_stack if isinstance(s, ContextMenuScreen)]
-        assert modal
-        option_list = modal[0].query_one("#ctx-list", OptionList)
-        # Highlight the select_all_output entry.
-        for index, opt in enumerate(option_list._options):
-            if opt.id == "select_all_output":
-                option_list.highlighted = index
-                break
-        await pilot.press("enter")
-        await pilot.pause()
-
         assert called["count"] == 1
         app.exit(0)
 

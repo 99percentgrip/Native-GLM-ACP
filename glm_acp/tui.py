@@ -492,6 +492,50 @@ class ContextMenuOption(Option):
         super().__init__(label, id=action_id, disabled=disabled)
 
 
+class SelectableStatic(Static):
+    """A ``Static`` whose raw text is exposed to Textual selection.
+
+    Textual's default ``Widget.get_selection`` only returns text when the
+    rendered content is a ``Text`` or ``Content`` object. When the content is
+    a Rich renderable such as ``Markdown``, ``get_selection`` returns ``None``,
+    which makes agent responses invisible to ``Ctrl+Shift+C`` and the
+    Copy-selection menu entry. This subclass stores the raw markdown source
+    alongside the rendered Rich object and returns the raw text when the
+    widget is selected.
+    """
+
+    def __init__(self, *args: Any, raw_text: str = "", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._selectable_raw_text = raw_text
+
+    def update(self, renderable: Any = None, *, raw_text: str | None = None) -> None:  # type: ignore[override]
+        """Render ``renderable`` while also remembering its raw markdown source."""
+        if raw_text is not None:
+            self._selectable_raw_text = raw_text
+        elif isinstance(renderable, str):
+            self._selectable_raw_text = renderable
+        super().update(renderable)
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        """Return the raw markdown source when this widget is selected."""
+        # Defer to the default behaviour for plain Text/Content renderables
+        # (covers user messages, system messages, file-browser entries, etc.).
+        default = super().get_selection(selection)
+        if default is not None:
+            return default
+        if not self._selectable_raw_text:
+            return None
+        # For full-widget selections (Ctrl+A / Select all output) and any
+        # partial selection on a non-Text renderable, expose the raw source.
+        text = self._selectable_raw_text
+        if selection.start is not None and selection.end is not None:
+            start_off = (selection.start.y * 1_000_000) + selection.start.x
+            end_off = (selection.end.y * 1_000_000) + selection.end.x
+            lo, hi = sorted((start_off, end_off))
+            return text[lo:hi], "\n"
+        return text, "\n"
+
+
 class ContextMenuScreen(ModalScreen[str | None]):
     """Codex-style right-click dropdown menu.
 
@@ -1474,13 +1518,19 @@ class NativeGlmTui(App[int]):
             if self._current_agent_text:
                 self._agent_responses.append(self._current_agent_text)
             self._current_agent_text = ""
-            self._current_agent = Static("", classes="agent-message", markup=False)
+            # Use SelectableStatic so Ctrl+Shift+C and the Copy-selection menu
+            # entry can extract the raw markdown source (Static.get_selection
+            # returns None for Rich renderables like Markdown).
+            self._current_agent = SelectableStatic("", classes="agent-message", markup=False)
             await transcript.mount(self._current_agent)
         self._current_agent_text += text
         now = time.monotonic()
         if now - self._last_agent_render > 0.12:
             self._last_agent_render = now
-            self._current_agent.update(RichMarkdown(self._current_agent_text))
+            self._current_agent.update(
+                RichMarkdown(self._current_agent_text),
+                raw_text=self._current_agent_text,
+            )
         transcript.scroll_end(animate=False)
 
     async def _append_system(self, text: str) -> None:
@@ -2084,9 +2134,7 @@ class NativeGlmTui(App[int]):
         """Select all text in the composer."""
         composer = self.query_one("#composer", CommandInput)
         composer.focus()
-        composer.selection = Selection.from_offsets(
-            (0, 0), (0, len(composer.value))
-        )
+        composer.select_all()
         self.notify("Selected all text in composer", severity="information")
 
     async def _export_last_response(self) -> None:
