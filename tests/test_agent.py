@@ -667,7 +667,12 @@ class TestSlashCommands:
         assert "/max-iterations <N>" in result
 
     @pytest.mark.asyncio
-    async def test_max_iterations_acp_command_sets_value(self, agent, session):
+    async def test_max_iterations_acp_command_sets_value(
+        self, agent, session, monkeypatch, tmp_path
+    ):
+        # Redirect config dir so /max-iterations 200 doesn't pollute the
+        # user's real ~/.config/glm-acp/max-iterations.json.
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
         agent._sessions[session.id] = session
         session.max_tool_iterations = 50
         result = await agent._handle_command(session, "/max-iterations 200")
@@ -682,8 +687,12 @@ class TestSlashCommands:
         assert session.max_tool_iterations == 50  # unchanged
 
     @pytest.mark.asyncio
-    async def test_max_iterations_acp_command_clamps_to_ceiling(self, agent, session):
+    async def test_max_iterations_acp_command_clamps_to_ceiling(
+        self, agent, session, monkeypatch, tmp_path
+    ):
         # 5000 exceeds the 1000 ceiling — must clamp, not raise.
+        # Redirect config dir to avoid polluting the user's saved cap.
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
         agent._sessions[session.id] = session
         result = await agent._handle_command(session, "/max-iterations 5000")
         assert session.max_tool_iterations == 1000
@@ -1155,7 +1164,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.1.3"
+        assert resp.agent_info.version == "2.1.4"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):

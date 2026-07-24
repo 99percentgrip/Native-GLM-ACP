@@ -31,9 +31,14 @@ MAX_TOOL_ITERATIONS_CEILING = 1000
 def max_tool_iterations() -> int:
     """Resolve the default per-turn tool-call iteration cap.
 
-    Honours the ``GLM_ACP_MAX_TOOL_ITERATIONS`` environment variable if set
-    to an integer within ``[MIN_TOOL_ITERATIONS, MAX_TOOL_ITERATIONS_CEILING]``;
-    otherwise falls back to the ``MAX_TOOL_ITERATIONS`` constant (50).
+    Precedence (highest to lowest):
+    1. ``GLM_ACP_MAX_TOOL_ITERATIONS`` env var (ad-hoc runs, CI, scripts).
+    2. The persistent user default in ``config_dir()/max-iterations.json``
+       — the last value set via ``/max-iterations [N]``.
+    3. The ``MAX_TOOL_ITERATIONS`` constant (50).
+
+    The env var intentionally wins so CI/scripts/one-off runs are never
+    silently overridden by a stored user preference.
     """
     raw = os.environ.get("GLM_ACP_MAX_TOOL_ITERATIONS")
     if raw:
@@ -46,7 +51,88 @@ def max_tool_iterations() -> int:
         if requested > MAX_TOOL_ITERATIONS_CEILING:
             return MAX_TOOL_ITERATIONS_CEILING
         return requested
+    persisted = _load_persisted_max_tool_iterations()
+    if persisted is not None:
+        return persisted
     return MAX_TOOL_ITERATIONS
+
+
+def max_tool_iterations_path() -> Path:
+    """Return the path to the persistent user default for the iteration cap."""
+    return config_dir() / "max-iterations.json"
+
+
+def _load_persisted_max_tool_iterations() -> int | None:
+    """Return the persisted user default, or ``None`` if unset or malformed.
+
+    The file is best-effort: a missing file, parse error, out-of-range value,
+    or wrong schema all fall back to ``None`` so the caller uses the constant.
+    """
+    try:
+        path = max_tool_iterations_path()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("value")
+    # ``bool`` is a subclass of ``int`` — exclude it explicitly.
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    if value < MIN_TOOL_ITERATIONS or value > MAX_TOOL_ITERATIONS_CEILING:
+        return None
+    return value
+
+
+def save_max_tool_iterations(value: int) -> int:
+    """Persist ``value`` as the new user default and return the clamped result.
+
+    The value is clamped to ``[MIN_TOOL_ITERATIONS, MAX_TOOL_ITERATIONS_CEILING]``
+    and written atomically so concurrent readers never see a partial file.
+    The env var ``GLM_ACP_MAX_TOOL_ITERATIONS`` always wins on read; this file
+    only affects processes that do not set the env var.
+    """
+    clamped = max(MIN_TOOL_ITERATIONS, min(MAX_TOOL_ITERATIONS_CEILING, int(value)))
+    path = max_tool_iterations_path()
+    _secure_dir(path.parent)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"schema": 1, "value": clamped},
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _secure_file(temporary)
+        os.replace(temporary, path)
+        _secure_file(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return clamped
+
+
+def _secure_dir(path: Path) -> None:
+    """Create ``path`` (and parents) with 0700 perms; never raise on chmod."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _secure_file(path: Path) -> None:
+    """Set 0600 perms on ``path``; never raise."""
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
 
 # Retry configuration for transient API errors (429, 500, 502, 503, 504)
 MAX_RETRIES = 3

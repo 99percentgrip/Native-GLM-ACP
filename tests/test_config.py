@@ -169,8 +169,10 @@ class TestMaxToolIterations:
 
         assert max_tool_iterations() == 1
 
-    def test_session_default_uses_env_var(self, monkeypatch):
+    def test_session_default_uses_env_var(self, monkeypatch, tmp_path):
         """A new Session picks up the env var at creation time."""
+        # Redirect config dir so we don't touch the real user config file.
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
         monkeypatch.setenv("GLM_ACP_MAX_TOOL_ITERATIONS", "200")
         from glm_acp.agent import Session
 
@@ -178,8 +180,11 @@ class TestMaxToolIterations:
         assert session.max_tool_iterations == 200
 
     @pytest.mark.asyncio
-    async def test_set_config_option_updates_session_cap(self, monkeypatch):
+    async def test_set_config_option_updates_session_cap(self, monkeypatch, tmp_path):
         """``/max-iterations <N>`` routes through set_config_option."""
+        # Redirect config dir so the new file-persistence side effect doesn't
+        # corrupt the user's real ~/.config/glm-acp/max-iterations.json.
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
         monkeypatch.delenv("GLM_ACP_MAX_TOOL_ITERATIONS", raising=False)
         from glm_acp.agent import GlmAcpAgent, Session
 
@@ -205,6 +210,123 @@ class TestMaxToolIterations:
         for profile in ("precise", "exploratory"):
             info = GENERATION_PROFILES[profile]
             assert sum(info[key] is not None for key in ("temperature", "top_p")) == 1
+
+    # --- Persistent user default (Fix B) -------------------------------
+    # These cover the file-backed default introduced so that ``/max-iterations``
+    # survives closing ``glm-acp chat`` and starting a fresh session.
+
+    def test_persisted_default_is_loaded_when_no_env_var(self, monkeypatch, tmp_path):
+        """Save 200, then max_tool_iterations() returns 200 (no env var)."""
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("GLM_ACP_MAX_TOOL_ITERATIONS", raising=False)
+        from glm_acp.config import max_tool_iterations, save_max_tool_iterations
+
+        assert max_tool_iterations() == 50
+        save_max_tool_iterations(200)
+        assert max_tool_iterations() == 200
+
+    def test_env_var_wins_over_persisted_default(self, monkeypatch, tmp_path):
+        """Env var precedence: file says 200, env says 75 → returns 75."""
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+        monkeypatch.setenv("GLM_ACP_MAX_TOOL_ITERATIONS", "75")
+        from glm_acp.config import max_tool_iterations, save_max_tool_iterations
+
+        save_max_tool_iterations(200)
+        assert max_tool_iterations() == 75
+
+    def test_save_clamps_value_before_writing(self, monkeypatch, tmp_path):
+        """Out-of-range saves are clamped to [1, 1000] inside the file."""
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+        import json
+
+        from glm_acp.config import (
+            MAX_TOOL_ITERATIONS_CEILING,
+            MIN_TOOL_ITERATIONS,
+            max_tool_iterations_path,
+            save_max_tool_iterations,
+        )
+
+        assert save_max_tool_iterations(5000) == MAX_TOOL_ITERATIONS_CEILING
+        assert save_max_tool_iterations(0) == MIN_TOOL_ITERATIONS
+
+        save_max_tool_iterations(5000)
+        payload = json.loads(max_tool_iterations_path().read_text())
+        assert payload["value"] == 1000
+
+    def test_malformed_file_falls_back_to_constant(self, monkeypatch, tmp_path):
+        """Garbage JSON in the file → default 50, never raise."""
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("GLM_ACP_MAX_TOOL_ITERATIONS", raising=False)
+        from glm_acp.config import max_tool_iterations, max_tool_iterations_path
+
+        max_tool_iterations_path().write_text("not json at all {")
+        assert max_tool_iterations() == 50
+
+    def test_out_of_range_file_value_falls_back_to_constant(
+        self, monkeypatch, tmp_path
+    ):
+        """A persisted value outside [1, 1000] is rejected, not clamped-on-read."""
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("GLM_ACP_MAX_TOOL_ITERATIONS", raising=False)
+        import json
+
+        from glm_acp.config import max_tool_iterations, max_tool_iterations_path
+
+        max_tool_iterations_path().write_text(json.dumps({"schema": 1, "value": 99999}))
+        assert max_tool_iterations() == 50
+
+    def test_wrong_schema_file_falls_back_to_constant(self, monkeypatch, tmp_path):
+        """A file missing the ``value`` field falls back to the constant."""
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("GLM_ACP_MAX_TOOL_ITERATIONS", raising=False)
+        import json
+
+        from glm_acp.config import max_tool_iterations, max_tool_iterations_path
+
+        max_tool_iterations_path().write_text(json.dumps({"schema": 1}))
+        assert max_tool_iterations() == 50
+
+    def test_saved_file_is_user_read_write_only(self, monkeypatch, tmp_path):
+        """The persisted file is created with 0600 perms (credential-safety parity)."""
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+
+        from glm_acp.config import max_tool_iterations_path, save_max_tool_iterations
+
+        save_max_tool_iterations(100)
+        mode = max_tool_iterations_path().stat().st_mode & 0o777
+        assert mode == 0o600
+
+    @pytest.mark.asyncio
+    async def test_set_config_option_persists_to_file(self, monkeypatch, tmp_path):
+        """``/max-iterations 200`` writes the file so the next launch reads it."""
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("GLM_ACP_MAX_TOOL_ITERATIONS", raising=False)
+        import json
+
+        from glm_acp.agent import GlmAcpAgent, Session
+        from glm_acp.config import max_tool_iterations_path
+
+        agent = GlmAcpAgent()
+        session = Session("test-persist", cwd=".")
+        agent._sessions["test-persist"] = session
+
+        await agent.set_config_option("max_tool_iterations", "test-persist", "200")
+
+        path = max_tool_iterations_path()
+        assert path.exists()
+        payload = json.loads(path.read_text())
+        assert payload == {"schema": 1, "value": 200}
+
+    def test_new_session_reads_persisted_default(self, monkeypatch, tmp_path):
+        """A brand-new Session (no env var) picks up the saved file value."""
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("GLM_ACP_MAX_TOOL_ITERATIONS", raising=False)
+        from glm_acp.agent import Session
+        from glm_acp.config import save_max_tool_iterations
+
+        save_max_tool_iterations(123)
+        fresh_session = Session("test-fresh", cwd=".")
+        assert fresh_session.max_tool_iterations == 123
 
 
 class TestApiKey:

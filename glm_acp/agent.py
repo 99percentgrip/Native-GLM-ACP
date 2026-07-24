@@ -88,6 +88,7 @@ from .config import (
     max_tool_iterations,
     models_for_plan,
     persist_reasoning,
+    save_max_tool_iterations,
     thought_levels_for_model,
 )
 from .deliberation import (
@@ -1816,6 +1817,15 @@ class GlmAcpAgent(acp.Agent):
                 MIN_TOOL_ITERATIONS,
                 min(MAX_TOOL_ITERATIONS_CEILING, requested),
             )
+            # Persist as the user default so a fresh ``glm-acp chat`` launch
+            # (or a new editor session) starts with the saved cap. Failures
+            # are logged but never break the slash command.
+            try:
+                await asyncio.to_thread(
+                    save_max_tool_iterations, session.max_tool_iterations
+                )
+            except OSError as error:
+                logger.warning("Could not persist max_tool_iterations: %s", error)
 
         if (
             session.auxiliary_model != DEFAULT_AUXILIARY_MODEL
