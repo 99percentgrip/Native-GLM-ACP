@@ -807,6 +807,66 @@ class GlmAcpAgent(acp.Agent):
             logger.warning("Auxiliary title generation failed; using local fallback", exc_info=True)
             return fallback
 
+    async def generate_recap(self, session_id: str) -> str:
+        """Return a one-line summary of the session so far.
+
+        Uses the configured auxiliary GLM when available; falls back to a
+        local heuristic (truncated first user turn) when the auxiliary model
+        is the default, the session is empty, or the auxiliary call fails.
+        The transcript passed to the auxiliary model is wrapped with
+        :func:`wrap_untrusted_output` so recalled/session content cannot
+        issue promptware against the summarizer.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            return ""
+
+        parts: list[str] = []
+        for message in session.messages:
+            role = str(message.get("role", ""))
+            if role not in {"user", "assistant"}:
+                continue
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(block.get("text", ""))
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            elif not isinstance(content, str):
+                content = str(content)
+            text = content.strip()
+            if not text:
+                continue
+            prefix = "user" if role == "user" else "assistant"
+            parts.append(f"{prefix}: {text}")
+
+        if not parts:
+            return "Empty session."
+
+        fallback = (parts[0][:80].strip().splitlines()[0] + " …") if parts[0] else "New session"
+
+        if session.auxiliary_model == DEFAULT_AUXILIARY_MODEL:
+            return fallback
+
+        transcript_tail = "\n".join(parts)[-4000:]
+        client = self._aux_client_for_session(session)
+        try:
+            client.begin_turn()
+            result = await client.complete_auxiliary(
+                "Summarize this coding session in a single concise line: "
+                "what the user asked for and the current state of progress. "
+                "Return only the summary line, no quotes or punctuation wrapper.",
+                wrap_untrusted_output(transcript_tail, "recap-source"),
+                max_tokens=80,
+            )
+            self._record_auxiliary_usage(session, result.usage)
+            recap = " ".join(result.content.split()).strip("'\"`# ")
+            return recap[:200] or fallback
+        except Exception:
+            logger.warning("Auxiliary recap generation failed; using local fallback", exc_info=True)
+            return fallback
+
     async def _rank_recall_results(
         self,
         session: Session,

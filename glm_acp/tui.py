@@ -81,6 +81,8 @@ LOCAL_COMMANDS = {
     "/toggle-thinking": "Alias for /reasoning-panel",
     "/clear-view": "Clear only the visible transcript",
     "/max-iterations": "Show or set the per-turn tool-call iteration cap (default 50, max 1000)",
+    "/recap": "Show a one-line summary of the session so far",
+    "/blocks": "Pick a code block from recent responses to copy or save (Enter copy, w write)",
     "/copy": "Copy the last response to clipboard (or /copy <N> for response N, /copy all)",
     "/history": "Browse and resume past sessions (or press F6)",
     "/search": "Grep the current conversation (or press Ctrl-F)",
@@ -849,6 +851,80 @@ class JourneyScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class CodeBlockPickerScreen(ModalScreen[tuple[str, str] | None]):
+    """Pick a code block from recent agent responses to copy or save.
+
+    Returns ``(action, code)`` where ``action`` is ``"copy"`` or
+    ``"write"``; returns ``None`` on cancel. Used by ``/blocks``.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("w", "write_selected", "Write to file", priority=True),
+    ]
+
+    CSS = """
+    CodeBlockPickerScreen { align: center middle; background: $background 70%; }
+    #blocks-dialog {
+        width: 96; max-width: 96%; height: 84%;
+        border: thick $accent; background: $surface; padding: 1 2;
+    }
+    #blocks-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    #blocks-list { height: 1fr; border: solid $panel; }
+    #blocks-hint { color: $text-muted; height: 1; margin-top: 1; }
+    """
+
+    def __init__(self, blocks: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self._blocks = blocks
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="blocks-dialog"):
+            yield Label(
+                f"Code blocks in recent responses ({len(self._blocks)})",
+                id="blocks-title",
+            )
+            yield ListView(id="blocks-list")
+            yield Static(
+                "↑↓ navigate  ·  Enter copy to clipboard  ·  w write to file  ·  Esc cancel",
+                id="blocks-hint",
+                markup=False,
+            )
+
+    def on_mount(self) -> None:
+        listview = self.query_one("#blocks-list", ListView)
+        for index, (lang, code) in enumerate(self._blocks):
+            first_line = code.splitlines()[0][:64] if code else ""
+            line_count = code.count("\n") + 1
+            listview.append(
+                ListItem(
+                    Static(
+                        f"[bold]#{index + 1} [{escape(lang) or 'text'}] "
+                        f"({line_count} line{'s' if line_count != 1 else ''})[/bold]  "
+                        f"{escape(first_line)}",
+                        markup=True,
+                    )
+                )
+            )
+
+    @on(ListView.Selected, "#blocks-list")
+    def block_selected(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is not None and 0 <= idx < len(self._blocks):
+            _, code = self._blocks[idx]
+            self.dismiss(("copy", code))
+
+    def action_write_selected(self) -> None:
+        listview = self.query_one("#blocks-list", ListView)
+        idx = listview.index
+        if idx is not None and 0 <= idx < len(self._blocks):
+            _, code = self._blocks[idx]
+            self.dismiss(("write", code))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 def _extract_message_text(msg: dict[str, Any]) -> str:
     """Best-effort plain-text extraction from a session message dict."""
     parts: list[str] = []
@@ -1453,6 +1529,14 @@ class NativeGlmTui(App[int]):
         if text == "/clear-view":
             await self.action_clear_transcript()
             self.notify("Transcript view cleared", severity="information")
+            return True
+        if text == "/recap":
+            recap = await self.agent.generate_recap(self.session_id)
+            await self._append_system(f"Recap: {recap}")
+            self.notify(recap, title="Session recap", severity="information")
+            return True
+        if text == "/blocks":
+            await self.action_open_blocks_picker()
             return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)
@@ -2305,6 +2389,55 @@ class NativeGlmTui(App[int]):
             f"Search match · full message:\n\n{full_text[:4000]}"
             + (" …[truncated]" if len(full_text) > 4000 else "")
         )
+
+    def _extract_code_blocks(self) -> list[tuple[str, str]]:
+        """Extract ``(language, code)`` tuples from recent agent responses.
+
+        Scans the last ~20 streamed responses (plus any in-flight text) for
+        fenced code blocks. Used by ``/blocks`` and the picker modal.
+        """
+        responses = list(self._agent_responses)
+        if self._current_agent_text:
+            responses.append(self._current_agent_text)
+        blocks: list[tuple[str, str]] = []
+        pattern = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
+        for response in responses[-20:]:
+            for match in pattern.finditer(response):
+                lang = (match.group(1) or "text").strip()[:16]
+                code = match.group(2).strip()
+                if code:
+                    blocks.append((lang, code))
+        return blocks
+
+    async def action_open_blocks_picker(self) -> None:
+        """``/blocks``: pick a code block from recent responses to copy or save."""
+        blocks = self._extract_code_blocks()
+        if not blocks:
+            self.notify("No code blocks in recent responses", severity="information")
+            return
+        result = await self.push_screen_wait(CodeBlockPickerScreen(blocks))
+        if result is None:
+            return
+        action, code = result
+        if action == "copy":
+            if _write_system_clipboard(code):
+                preview = code.splitlines()[0][:60] if code else ""
+                self.notify(
+                    f"Copied {len(code)} chars: {preview}…", severity="success"
+                )
+            else:
+                self.notify(
+                    "Clipboard unavailable (install xclip or xsel)", severity="warning"
+                )
+        elif action == "write":
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            target = Path(self._session_cwd()) / f"glm-block-{timestamp}.txt"
+            try:
+                target.write_text(code, encoding="utf-8")
+                await self._append_system(f"Wrote code block to {target}")
+                self.notify(f"Wrote {len(code)} chars to {target.name}", severity="success")
+            except OSError as error:
+                self.notify(f"Write failed: {error}", severity="error")
 
     async def _resume_session(self, session_id: str) -> None:
         """Resume a persisted session through the shared agent runtime."""

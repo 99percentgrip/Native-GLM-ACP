@@ -13,6 +13,7 @@ os.environ.setdefault("ZAI_API_KEY", "test-key")
 from glm_acp.agent import GlmAcpAgent, Session, build_system_prompt
 from glm_acp.config import (
     CONTEXT_WINDOW_TOKENS,
+    DEFAULT_AUXILIARY_MODEL,
     MOA_PICKER_VALUE,
 )
 from glm_acp.glm_client import PlanQuota, PlanUsage
@@ -1121,6 +1122,104 @@ class TestAuxiliaryRouting:
         assert "candidate_report" in client.complete_auxiliary.call_args.args[1]
 
 
+class TestSessionRecap:
+    """Tier 1.4: ``/recap`` one-line session summary."""
+
+    @pytest.mark.asyncio
+    async def test_empty_session_returns_marker(self, agent, session):
+        agent._sessions[session.id] = session
+        recap = await agent.generate_recap(session.id)
+        assert recap == "Empty session."
+
+    @pytest.mark.asyncio
+    async def test_default_auxiliary_model_returns_local_fallback(self, agent, session):
+        # Default auxiliary model → no API call, local heuristic from first user turn.
+        session.auxiliary_model = DEFAULT_AUXILIARY_MODEL
+        session.messages = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "Help me fix the authentication bug in login.py"},
+            {"role": "assistant", "content": "I'll start by reading the file."},
+        ]
+        agent._sessions[session.id] = session
+
+        recap = await agent.generate_recap(session.id)
+
+        # Local fallback is the first user turn, truncated to 80 chars, with ellipsis.
+        assert recap.startswith("user: Help me fix the authentication bug")
+        assert recap.endswith("…")
+
+    @pytest.mark.asyncio
+    async def test_non_default_auxiliary_model_calls_aux_and_records_usage(
+        self, agent, session, monkeypatch
+    ):
+        client = MagicMock()
+        client.begin_turn = MagicMock()
+        client.complete_auxiliary = AsyncMock(
+            return_value=SimpleNamespace(
+                content="User is fixing the login.py auth bug; read phase complete.",
+                usage={"input_tokens": 60, "output_tokens": 12},
+            )
+        )
+        session.auxiliary_model = "glm-5-turbo"
+        session.messages = [
+            {"role": "user", "content": "Fix the auth bug in login.py"},
+            {"role": "assistant", "content": "Reading login.py now."},
+        ]
+        agent._sessions[session.id] = session
+        monkeypatch.setattr(agent, "_aux_client_for_session", lambda _session: client)
+
+        recap = await agent.generate_recap(session.id)
+
+        assert recap == "User is fixing the login.py auth bug; read phase complete."
+        # Usage recorded on the session.
+        assert session.total_input_tokens == 60
+        assert session.total_output_tokens == 12
+        # Auxiliary was actually called.
+        client.complete_auxiliary.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_auxiliary_failure_falls_back_gracefully(self, agent, session, monkeypatch):
+        client = MagicMock()
+        client.begin_turn = MagicMock()
+        client.complete_auxiliary = AsyncMock(side_effect=RuntimeError("network down"))
+        session.auxiliary_model = "glm-5-turbo"
+        session.messages = [
+            {"role": "user", "content": "Fix the auth bug in login.py"},
+        ]
+        agent._sessions[session.id] = session
+        monkeypatch.setattr(agent, "_aux_client_for_session", lambda _session: client)
+
+        recap = await agent.generate_recap(session.id)
+
+        # Falls back to the local heuristic instead of raising.
+        assert recap.startswith("user: Fix the auth bug")
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_id_returns_empty(self, agent):
+        recap = await agent.generate_recap("nonexistent-session-id")
+        assert recap == ""
+
+    @pytest.mark.asyncio
+    async def test_multiblock_content_is_extracted_as_text(self, agent, session):
+        # Vision-model-style content (list of blocks) should be flattened to text only.
+        session.auxiliary_model = DEFAULT_AUXILIARY_MODEL
+        session.messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image", "source": {"data": "base64..."}},
+                ],
+            },
+        ]
+        agent._sessions[session.id] = session
+
+        recap = await agent.generate_recap(session.id)
+
+        assert "What is in this image?" in recap
+        assert "base64" not in recap
+
+
 class TestSetSessionMode:
     @pytest.mark.asyncio
     async def test_valid_mode(self, agent, session):
@@ -1770,7 +1869,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.7.1"
+        assert resp.agent_info.version == "2.7.2"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):

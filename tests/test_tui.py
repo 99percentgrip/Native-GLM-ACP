@@ -22,6 +22,7 @@ from glm_acp.glm_client import PlanQuota, PlanUsage
 from glm_acp.terminal_cli import run_chat_command
 from glm_acp.tui import (
     CONFIG_COMMANDS,
+    CodeBlockPickerScreen,
     HistoryScreen,
     JourneyScreen,
     NativeGlmTui,
@@ -1390,6 +1391,98 @@ async def test_search_screen_greps_messages_and_returns_full_text(tmp_path):
     assert payload is not None
     _idx, full_text = payload  # type: ignore[misc]
     assert "configure the api plan" in full_text
+
+
+@pytest.mark.asyncio
+async def test_tui_blocks_picker_extracts_code_blocks_and_lists_them(tmp_path):
+    """Tier 1.3: ``/blocks`` extracts fenced code blocks from recent responses
+    and lists them in the picker modal."""
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+
+        # Seed two responses with three fenced blocks across them.
+        app._agent_responses = [
+            "Here is a Python helper:\n```python\nprint('hi')\n```\n",
+            "And a bash snippet:\n```bash\necho hello\n```\n"
+            "Plus an untagged block:\n```\nplain code\n```\n",
+        ]
+        app._current_agent_text = ""
+
+        blocks = app._extract_code_blocks()
+        # Three blocks, languages preserved.
+        assert len(blocks) == 3
+        langs = [lang for lang, _ in blocks]
+        assert langs == ["python", "bash", "text"]
+        assert "print('hi')" in blocks[0][1]
+        assert "echo hello" in blocks[1][1]
+        assert "plain code" in blocks[2][1]
+
+        # Mount the picker with these blocks and confirm it renders one row each.
+        app.push_screen(CodeBlockPickerScreen(blocks))
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, CodeBlockPickerScreen):
+                break
+        assert isinstance(app.screen, CodeBlockPickerScreen)
+        title = app.screen.query_one("#blocks-title", Static)
+        assert "3" in str(title.render())
+        listview = app.screen.query_one("#blocks-list", ListView)
+        assert len(listview.children) == 3
+
+        # Selecting the first row dismisses with ("copy", code).
+        listview.index = 0
+        listview.focus()
+        await pilot.pause(0.05)
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if not isinstance(app.screen, CodeBlockPickerScreen):
+                break
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_blocks_picker_no_blocks_returns_quickly(tmp_path):
+    """``/blocks`` with no code blocks in history just notifies and returns."""
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app._agent_responses = ["just text, no code blocks here"]
+        app._current_agent_text = ""
+
+        blocks = app._extract_code_blocks()
+        assert blocks == []
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_blocks_command_routes_to_picker(tmp_path):
+    """Typing ``/blocks`` in the composer opens the picker (or notifies if empty)."""
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    picker_opened = {"yes": False}
+
+    async def fake_push(screen):
+        picker_opened["yes"] = isinstance(screen, CodeBlockPickerScreen)
+        return None
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen_wait = fake_push  # type: ignore[method-assign]
+        # Seed a response so the picker has something to show.
+        app._agent_responses = ["```python\nx = 1\n```\n"]
+        app._current_agent_text = ""
+
+        handled = await app._handle_local_command("/blocks")
+        assert handled is True
+        assert picker_opened["yes"] is True
+        app.exit(0)
 
 
 def test_render_session_markdown_includes_each_role():

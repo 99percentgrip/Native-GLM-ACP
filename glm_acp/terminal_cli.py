@@ -280,9 +280,19 @@ async def _handle_plain_command(
             "  /max-iterations [N]   Show or set the per-turn tool-call cap\n"
             "                        (default 50, max 1000; e.g. /max-iterations 200)\n"
             "  /planmode <PRD>       Activate read-only Plan Mode\n"
+            "  /recap                Show a one-line summary of the session so far\n"
             "  Anything else is sent to the model as a prompt.",
             file=sys.stderr,
         )
+        return "skip"
+    if stripped == "/recap":
+        try:
+            recap = await agent.generate_recap(session_id)
+        except Exception as error:  # noqa: BLE001 — surface any auxiliary failure plainly
+            print(f"Recap failed: {error}", file=sys.stderr)
+            return "skip"
+        print(f"Recap: {recap}", file=sys.stderr)
+        return "skip"
         return "skip"
     if stripped == "/max-iterations" or text.startswith("/max-iterations "):
         arg = text.partition(" ")[2].strip()
@@ -330,6 +340,7 @@ _PLAIN_COMMAND_NAMES = (
     "/help",
     "/max-iterations",
     "/planmode",
+    "/recap",
 )
 
 
