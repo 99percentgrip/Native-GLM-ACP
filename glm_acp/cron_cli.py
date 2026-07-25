@@ -7,19 +7,6 @@ import asyncio
 import json
 from typing import Any
 
-from .cron import (
-    CronError,
-    create_job,
-    get_job,
-    list_jobs,
-    pause_job,
-    remove_job,
-    resume_job,
-    status,
-    update_job,
-)
-from .cron_scheduler import daemon, tick
-
 
 def add_cron_parser(subparsers: Any) -> None:
     cron = subparsers.add_parser("cron", help="manage persistent scheduled tasks")
@@ -75,6 +62,19 @@ def _display(job: dict[str, Any]) -> str:
 
 
 def run_cron_command(args: argparse.Namespace) -> int:
+    from .cron import (
+        CronError,
+        create_job,
+        get_job,
+        list_jobs,
+        pause_job,
+        remove_job,
+        resume_job,
+        status,
+        update_job,
+    )
+    from .cron_scheduler import daemon, tick
+
     try:
         command = args.cron_command
         if command == "list":

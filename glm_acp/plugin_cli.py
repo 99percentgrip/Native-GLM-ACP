@@ -6,14 +6,6 @@ import argparse
 import json
 from pathlib import Path
 
-from .plugins import (
-    PluginError,
-    PluginRegistry,
-    generate_signing_key,
-    read_public_key,
-    sign_plugin_manifest,
-)
-
 
 def add_plugin_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser("plugin", help="sign plugins and manage trusted publishers")
@@ -33,6 +25,14 @@ def add_plugin_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
 
 
 def run_plugin_command(args: argparse.Namespace) -> int:
+    from .plugins import (
+        PluginError,
+        PluginRegistry,
+        generate_signing_key,
+        read_public_key,
+        sign_plugin_manifest,
+    )
+
     try:
         if args.plugin_action == "keygen":
             value = generate_signing_key(args.private_key, args.public_key, args.publisher)

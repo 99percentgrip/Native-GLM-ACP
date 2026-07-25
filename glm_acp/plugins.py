@@ -11,10 +11,11 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-
+# NOTE: cryptography imports are deferred into the functions that use them
+# (keygen/sign/trust actions only). Most plugin_cli invocations — including
+# `--version`, `chat`, `cron`, `plugin list`, and `plugin verify` without
+# signature checks — never need Ed25519/SSH serialization. Deferring shaves
+# ~14ms off cold start (Hermes v0.19 perf-wave parity).
 from .config import config_dir
 
 MAX_PLUGIN_FILES = 32
@@ -31,6 +32,9 @@ class PluginError(RuntimeError):
 
 def generate_signing_key(private_path: Path, public_path: Path, publisher: str) -> dict[str, str]:
     """Create one Ed25519 publisher keypair without overwriting existing files."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     if not _PUBLISHER.fullmatch(publisher):
         raise PluginError("Publisher identity is invalid")
     if private_path.exists() or public_path.exists():
@@ -78,6 +82,8 @@ def generate_signing_key(private_path: Path, public_path: Path, publisher: str) 
 
 def sign_plugin_manifest(manifest_path: Path, private_path: Path) -> dict[str, str]:
     """Sign the canonical manifest payload; private key bytes never enter the manifest."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     if manifest_path.is_symlink() or private_path.is_symlink():
         raise PluginError("Plugin manifest and signing key must not be symlinks")
     try:
@@ -209,6 +215,8 @@ class PluginRegistry:
             temporary.unlink(missing_ok=True)
 
     def trust_publisher(self, publisher: str, public_key: bytes) -> dict[str, str]:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
         if not _PUBLISHER.fullmatch(publisher):
             raise PluginError("Publisher identity is invalid")
         if len(public_key) != 32:
@@ -243,6 +251,9 @@ class PluginRegistry:
         ]
 
     def _signature_status(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
         signature = manifest.get("signature")
         require_signed = os.environ.get(REQUIRE_SIGNED_ENV, "0").strip().lower() in {
             "1",

@@ -76,3 +76,46 @@ def test_cli_actions_are_mutually_exclusive():
     with pytest.raises(SystemExit) as error:
         main(["--setup", "--uninstall"])
     assert error.value.code == 2
+
+
+def test_cli_module_does_not_eagerly_import_heavy_dependencies():
+    """Importing ``glm_acp.cli`` must stay cheap.
+
+    Heavy chains (``acp``/``acp.schema``, ``httpx``, ``croniter``,
+    ``cryptography``, ``rich``, ``glm_acp.agent``, ``glm_acp.cron``,
+    ``glm_acp.plugins``) are deferred to the code paths that actually need
+    them so ``--version``, ``--setup``, ``--check-auth``, ``--uninstall``,
+    and the ``cron``/``plugin``/``observe``/``harden``/``meta-*`` commands
+    do not pay their startup cost. This guards against regressions that
+    reintroduce top-level imports.
+    """
+    import subprocess
+    import sys
+
+    heavy = (
+        "acp",
+        "acp.schema",
+        "httpx",
+        "croniter",
+        "cryptography",
+        "rich.console",
+        "glm_acp.agent",
+        "glm_acp.cron",
+        "glm_acp.plugins",
+    )
+    snippet = (
+        "import sys\n"
+        "import glm_acp.cli\n"
+        f"heavy = {heavy!r}\n"
+        "loaded = sorted(m for m in heavy if m in sys.modules)\n"
+        "print(','.join(loaded))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", snippet],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    loaded = [name for name in result.stdout.strip().split(",") if name]
+    assert loaded == [], f"glm_acp.cli eagerly imported heavy modules: {loaded}"

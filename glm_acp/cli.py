@@ -11,7 +11,6 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from . import __version__
-from .agent import run
 from .config import get_api_key, store_api_key
 from .cron_cli import add_cron_parser, run_cron_command
 from .plugin_cli import add_plugin_parser, run_plugin_command
@@ -179,5 +178,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("Stored credentials were preserved. Use --uninstall --purge to remove them.")
         print("Restart Zed to finish.")
         return 0
+    from .agent import run
+
     asyncio.run(run())
     return 0

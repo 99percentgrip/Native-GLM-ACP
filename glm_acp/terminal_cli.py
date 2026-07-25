@@ -12,14 +12,15 @@ import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-import acp
-from acp.schema import AllowedOutcome, DeniedOutcome, RequestPermissionResponse
-
-from .agent import GlmAcpAgent
 from .config import API_ENDPOINTS, GENERATION_PROFILES, MODELS, THOUGHT_LEVELS
+
+if TYPE_CHECKING:
+    from acp.schema import RequestPermissionResponse
+
+    from .agent import GlmAcpAgent
 
 
 def add_chat_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -141,6 +142,8 @@ class TerminalClient:
     async def request_permission(
         self, options: list[Any], session_id: str, tool_call: Any, **kwargs: Any
     ) -> RequestPermissionResponse:
+        from acp.schema import AllowedOutcome, DeniedOutcome, RequestPermissionResponse
+
         tool_call_id = str(getattr(tool_call, "tool_call_id", ""))
         title = (
             getattr(tool_call, "title", None)
@@ -211,6 +214,8 @@ class TerminalClient:
 
 
 def _prompt_blocks(text: str, image_paths: list[str]) -> list[Any]:
+    import acp
+
     blocks: list[Any] = []
     if text:
         blocks.append(acp.text_block(text))
@@ -371,6 +376,8 @@ async def run_chat(args: argparse.Namespace) -> int:
         show_thinking=not args.no_thinking,
         interactive=interactive,
     )
+    from .agent import GlmAcpAgent
+
     agent = GlmAcpAgent()
     agent.on_connect(client)
     try:
