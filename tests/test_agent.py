@@ -1293,6 +1293,75 @@ class TestContextBreakdown:
         assert user_seg["count"] == 2
 
 
+class TestBtwSideQuestion:
+    """Tier 2.5: ``/btw`` side question without polluting the conversation."""
+
+    @pytest.mark.asyncio
+    async def test_empty_question_returns_usage_hint(self, agent, session):
+        agent._sessions[session.id] = session
+        answer = await agent.ask_btw(session.id, "")
+        assert "Ask a side question" in answer
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_returns_not_ready(self, agent):
+        answer = await agent.ask_btw("nonexistent-session-id", "what is async?")
+        assert "not ready" in answer.lower()
+
+    @pytest.mark.asyncio
+    async def test_default_auxiliary_model_returns_setup_hint(self, agent, session):
+        session.auxiliary_model = DEFAULT_AUXILIARY_MODEL
+        session.messages = [{"role": "user", "content": "fix the bug"}]
+        agent._sessions[session.id] = session
+
+        answer = await agent.ask_btw(session.id, "what does this codebase do?")
+
+        assert "auxiliary model" in answer.lower()
+        assert len(session.messages) == 1  # /btw never mutates session.messages
+
+    @pytest.mark.asyncio
+    async def test_non_default_auxiliary_calls_aux_and_returns_answer(
+        self, agent, session, monkeypatch
+    ):
+        client = MagicMock()
+        client.begin_turn = MagicMock()
+        client.complete_auxiliary = AsyncMock(
+            return_value=SimpleNamespace(
+                content="It is a Python ACP coding agent runtime.",
+                usage={"input_tokens": 80, "output_tokens": 20},
+            )
+        )
+        session.auxiliary_model = "glm-5-turbo"
+        session.messages = [
+            {"role": "user", "content": "what is this project?"},
+            {"role": "assistant", "content": "Native GLM ACP."},
+        ]
+        agent._sessions[session.id] = session
+        monkeypatch.setattr(agent, "_aux_client_for_session", lambda _session: client)
+
+        answer = await agent.ask_btw(session.id, "what language is it written in?")
+
+        assert answer == "It is a Python ACP coding agent runtime."
+        assert session.total_input_tokens == 80
+        assert session.total_output_tokens == 20
+        assert len(session.messages) == 2  # session.messages untouched
+        client.complete_auxiliary.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_auxiliary_failure_returns_graceful_message(self, agent, session, monkeypatch):
+        client = MagicMock()
+        client.begin_turn = MagicMock()
+        client.complete_auxiliary = AsyncMock(side_effect=RuntimeError("network down"))
+        session.auxiliary_model = "glm-5-turbo"
+        session.messages = [{"role": "user", "content": "hi"}]
+        agent._sessions[session.id] = session
+        monkeypatch.setattr(agent, "_aux_client_for_session", lambda _session: client)
+
+        answer = await agent.ask_btw(session.id, "what time is it?")
+
+        assert "failed" in answer.lower()
+        assert len(session.messages) == 1
+
+
 class TestSetSessionMode:
     @pytest.mark.asyncio
     async def test_valid_mode(self, agent, session):
@@ -1942,7 +2011,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.7.5"
+        assert resp.agent_info.version == "2.7.6"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):

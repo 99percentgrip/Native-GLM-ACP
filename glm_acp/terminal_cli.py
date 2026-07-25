@@ -281,6 +281,7 @@ async def _handle_plain_command(
             "                        (default 50, max 1000; e.g. /max-iterations 200)\n"
             "  /planmode <PRD>       Activate read-only Plan Mode\n"
             "  /recap                Show a one-line summary of the session so far\n"
+            "  /btw <question>       Ask a side question without polluting the conversation\n"
             "  Anything else is sent to the model as a prompt.",
             file=sys.stderr,
         )
@@ -292,6 +293,19 @@ async def _handle_plain_command(
             print(f"Recap failed: {error}", file=sys.stderr)
             return "skip"
         print(f"Recap: {recap}", file=sys.stderr)
+        return "skip"
+    if stripped == "/btw" or text.startswith("/btw "):
+        question = text.partition(" ")[2].strip()
+        if not question:
+            print("Usage: /btw <your side question>", file=sys.stderr)
+            return "skip"
+        print("⏳ Asking the auxiliary model…", file=sys.stderr)
+        try:
+            answer = await agent.ask_btw(session_id, question)
+        except Exception as error:  # noqa: BLE001 — surface any auxiliary failure plainly
+            print(f"Side question failed: {error}", file=sys.stderr)
+            return "skip"
+        print(f"BTW: {answer}", file=sys.stderr)
         return "skip"
         return "skip"
     if stripped == "/max-iterations" or text.startswith("/max-iterations "):
@@ -341,6 +355,7 @@ _PLAIN_COMMAND_NAMES = (
     "/max-iterations",
     "/planmode",
     "/recap",
+    "/btw",
 )
 
 

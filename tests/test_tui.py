@@ -1578,6 +1578,53 @@ async def test_tui_context_command_routes_to_breakdown_screen(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tui_btw_command_routes_to_overlay_screen(tmp_path):
+    """Tier 2.5: ``/btw`` opens the BtwOverlayScreen; ``/btw <q>`` pre-fills."""
+    from glm_acp.tui import BtwOverlayScreen
+
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    captured: dict[str, object] = {}
+
+    async def fake_push(screen):
+        captured["screen"] = screen
+        return None
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen = fake_push  # type: ignore[method-assign]
+
+        # /btw with no argument opens an empty overlay.
+        handled = await app._handle_local_command("/btw")
+        assert handled is True
+        screen = captured.get("screen")
+        assert isinstance(screen, BtwOverlayScreen)
+        assert screen._prefill == ""
+        app.exit(0)
+
+    # Reset and verify /btw <question> pre-fills the overlay.
+    captured.clear()
+    agent2 = FakeAgent()
+    app2 = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent2)
+
+    async def fake_push2(screen):
+        captured["screen"] = screen
+        return None
+
+    async with app2.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app2, pilot)
+        app2.push_screen = fake_push2  # type: ignore[method-assign]
+
+        handled = await app2._handle_local_command("/btw what does async mean?")
+        assert handled is True
+        screen = captured.get("screen")
+        assert isinstance(screen, BtwOverlayScreen)
+        assert screen._prefill == "what does async mean?"
+        app2.exit(0)
+
+
+@pytest.mark.asyncio
 async def test_tui_refresh_session_panel_hides_disabled_segments(tmp_path, monkeypatch):
     """When segments are toggled off, ``_refresh_session_panel`` omits them."""
     monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))

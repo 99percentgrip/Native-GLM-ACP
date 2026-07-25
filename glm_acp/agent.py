@@ -927,6 +927,73 @@ class GlmAcpAgent(acp.Agent):
             logger.warning("Auxiliary recap generation failed; using local fallback", exc_info=True)
             return fallback
 
+    async def ask_btw(self, session_id: str, question: str) -> str:
+        """Answer a quick side question without polluting the main conversation.
+
+        Uses the configured auxiliary GLM with a short recent-conversation
+        context to answer ``question`` briefly. The answer is NOT added to
+        ``session.messages`` — the caller decides where to display it (TUI
+        overlay, plain-REPL stderr, etc.). Falls back to a clear message
+        when no auxiliary model is configured, the session is empty, or
+        the auxiliary call fails. Transcript input is wrapped with
+        :func:`wrap_untrusted_output` so recalled/session content cannot
+        issue promptware against the side-question exchange.
+        """
+        question = (question or "").strip()
+        if not question:
+            return "Ask a side question with /btw <your question>."
+
+        session = self._sessions.get(session_id)
+        if session is None:
+            return "Session not ready."
+
+        if session.auxiliary_model == DEFAULT_AUXILIARY_MODEL:
+            return (
+                "Set an auxiliary model (e.g. /auxiliary glm-5-turbo) "
+                "to ask side questions without entering the main conversation."
+            )
+
+        # Build a short recent-conversation context (last ~2000 chars of
+        # user+assistant text), same extraction logic as generate_recap.
+        parts: list[str] = []
+        for message in session.messages:
+            role = str(message.get("role", ""))
+            if role not in {"user", "assistant"}:
+                continue
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(block.get("text", ""))
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            elif not isinstance(content, str):
+                content = str(content)
+            text = content.strip()
+            if text:
+                prefix = "user" if role == "user" else "assistant"
+                parts.append(f"{prefix}: {text}")
+        context_tail = "\n".join(parts)[-2000:] or "(no prior conversation)"
+
+        client = self._aux_client_for_session(session)
+        try:
+            client.begin_turn()
+            result = await client.complete_auxiliary(
+                "Answer this side question briefly and helpfully. "
+                "Do NOT mention that you are an assistant or that this is a "
+                "side question — just answer directly in 1-3 sentences.\n\n"
+                f"Question: {question[:500]}\n\n"
+                f"Recent conversation for context:\n"
+                f"{wrap_untrusted_output(context_tail, 'btw-context')}",
+                max_tokens=300,
+            )
+            self._record_auxiliary_usage(session, result.usage)
+            answer = " ".join(result.content.split()).strip()
+            return answer[:1000] or "(no answer returned)"
+        except Exception:
+            logger.warning("Auxiliary /btw failed", exc_info=True)
+            return "Side question failed — check your auxiliary model and try again."
+
     async def _rank_recall_results(
         self,
         session: Session,

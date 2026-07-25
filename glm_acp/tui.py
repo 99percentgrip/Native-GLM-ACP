@@ -88,6 +88,7 @@ LOCAL_COMMANDS = {
     "/blocks": "Pick a code block from recent responses to copy or save (Enter copy, w write)",
     "/statusline": "Choose which sidebar segments are visible (state, model, tokens, quota, …)",
     "/context": "Visualize context-window usage by segment (system, user, assistant, tool)",
+    "/btw": "Ask a side question without polluting the conversation (/btw <question>)",
     # Agent-side commands (implemented in the shared runtime; listed here so
     # they appear in the /-menu and the Ctrl+P command palette for discovery).
     "/status": "Show session, model, permissions, context, and live evidence",
@@ -1122,6 +1123,86 @@ class ContextBudgetScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class BtwOverlayScreen(ModalScreen[None]):
+    """Ask a quick side question without polluting the main conversation.
+
+    A small overlay with an Input for the question and a Static for the
+    answer. The question is sent to the auxiliary GLM via
+    ``GlmAcpAgent.ask_btw``; the answer is shown in the overlay but is
+    NOT added to ``session.messages``. Used by ``/btw``.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Close", priority=True)]
+
+    CSS = """
+    BtwOverlayScreen { align: center middle; background: $background 70%; }
+    #btw-dialog {
+        width: 80; max-width: 96%; height: auto; min-height: 12;
+        border: thick $accent; background: $surface; padding: 1 2;
+    }
+    #btw-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    #btw-input { margin-bottom: 1; }
+    #btw-answer {
+        height: auto; min-height: 3; max-height: 16;
+        color: $text; border-top: solid $panel; padding-top: 1;
+    }
+    #btw-hint { color: $text-muted; margin-top: 1; }
+    """
+
+    def __init__(self, prefill_question: str = "") -> None:
+        super().__init__()
+        self._prefill = prefill_question
+        self._querying = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="btw-dialog"):
+            yield Label("Side question (not added to the conversation)", id="btw-title")
+            yield Input(
+                placeholder="Ask a quick question…",
+                id="btw-input",
+                value=self._prefill,
+            )
+            yield Static(
+                "(type a question and press Enter — the answer stays in this overlay)",
+                id="btw-answer",
+                markup=False,
+            )
+            yield Label("Enter ask  ·  Esc close", id="btw-hint", markup=False)
+
+    def on_mount(self) -> None:
+        input_widget = self.query_one("#btw-input", Input)
+        input_widget.focus()
+        # If the caller pre-filled a question (via `/btw <question>`), fire
+        # the query immediately on mount.
+        if self._prefill.strip():
+            self.call_later(self._run_query, self._prefill.strip())
+
+    @on(Input.Submitted, "#btw-input")
+    async def question_submitted(self, event: Input.Submitted) -> None:
+        question = event.value.strip()
+        if not question or self._querying:
+            return
+        await self._run_query(question)
+
+    async def _run_query(self, question: str) -> None:
+        app = self.app
+        if not isinstance(app, NativeGlmTui):
+            return
+        self._querying = True
+        answer_widget = self.query_one("#btw-answer", Static)
+        answer_widget.update("⏳ Asking the auxiliary model…")
+        try:
+            answer = await app.agent.ask_btw(app.session_id, question)
+        except Exception as error:  # noqa: BLE001 — surface any failure in-overlay
+            answer = f"Side question failed: {error}"
+        finally:
+            self._querying = False
+        answer_widget.update(answer)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 def _extract_message_text(msg: dict[str, Any]) -> str:
     """Best-effort plain-text extraction from a session message dict."""
     parts: list[str] = []
@@ -1745,6 +1826,10 @@ class NativeGlmTui(App[int]):
             return True
         if text == "/context":
             await self.action_open_context()
+            return True
+        if text == "/btw" or text.startswith("/btw "):
+            question = text.partition(" ")[2].strip()
+            await self.action_open_btw(question)
             return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)
@@ -2704,6 +2789,17 @@ class NativeGlmTui(App[int]):
             self.notify("Session not ready — try again in a moment", severity="information")
             return
         await self.push_screen(ContextBudgetScreen(breakdown))
+
+    async def action_open_btw(self, prefill_question: str = "") -> None:
+        """``/btw [question]``: ask a side question in an overlay.
+
+        The question goes to the auxiliary GLM and the answer stays in the
+        overlay — it is NOT added to ``session.messages``, so the main
+        conversation thread stays clean. If a question is passed (via
+        ``/btw <question>``), the overlay fires the query immediately on
+        mount; otherwise the user types and presses Enter.
+        """
+        await self.push_screen(BtwOverlayScreen(prefill_question))
 
     async def run_compact_from_context_view(self) -> None:
         """Run ``/compact`` after the context-view modal signals it (press ``c``).
