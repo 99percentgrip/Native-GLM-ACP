@@ -27,6 +27,79 @@ from glm_acp.config import (
 )
 
 
+class TestStatuslineConfig:
+    """Tier 1.6: persistent statusline segment toggles."""
+
+    def test_default_is_all_segments_when_file_missing(self, monkeypatch, tmp_path):
+        from glm_acp.config import (
+            STATUSLINE_SEGMENT_IDS,
+            load_statusline_config,
+        )
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        assert load_statusline_config() == set(STATUSLINE_SEGMENT_IDS)
+
+    def test_save_then_load_round_trip(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_statusline_config, save_statusline_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        chosen = {"state", "model", "tokens"}
+        saved = save_statusline_config(chosen)
+        assert saved == chosen
+        # Round-trip via the file.
+        assert load_statusline_config() == chosen
+
+    def test_unknown_segment_ids_are_dropped_on_save(self, monkeypatch, tmp_path):
+        from glm_acp.config import (
+            load_statusline_config,
+            save_statusline_config,
+        )
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        saved = save_statusline_config({"state", "bogus", "fake-segment"})
+        assert "bogus" not in saved
+        assert "fake-segment" not in saved
+        assert saved == {"state"}
+        assert load_statusline_config() == {"state"}
+
+    def test_empty_set_falls_back_to_all_visible(self, monkeypatch, tmp_path):
+        from glm_acp.config import (
+            STATUSLINE_SEGMENT_IDS,
+            load_statusline_config,
+            save_statusline_config,
+        )
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        # Empty selection would blank the sidebar; we explicitly fall back
+        # to "all visible" rather than render an empty panel.
+        saved = save_statusline_config(set())
+        assert saved == set(STATUSLINE_SEGMENT_IDS)
+        assert load_statusline_config() == set(STATUSLINE_SEGMENT_IDS)
+
+    def test_corrupt_file_falls_back_to_all_visible(self, monkeypatch, tmp_path):
+        from glm_acp.config import (
+            STATUSLINE_SEGMENT_IDS,
+            load_statusline_config,
+            statusline_path,
+        )
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        statusline_path().write_text("not json {{{", encoding="utf-8")
+        assert load_statusline_config() == set(STATUSLINE_SEGMENT_IDS)
+
+    def test_wrong_schema_falls_back_to_all_visible(self, monkeypatch, tmp_path):
+        from glm_acp.config import (
+            STATUSLINE_SEGMENT_IDS,
+            load_statusline_config,
+            statusline_path,
+        )
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        # Valid JSON but wrong shape — must not crash, must fall back.
+        statusline_path().write_text('{"wrong": "shape"}', encoding="utf-8")
+        assert load_statusline_config() == set(STATUSLINE_SEGMENT_IDS)
+
+
 class TestModelRegistry:
     def test_all_models_have_context_window(self):
         for model_id in MODELS:

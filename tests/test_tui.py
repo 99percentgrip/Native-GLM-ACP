@@ -796,32 +796,32 @@ async def test_slash_menu_filters_live_agent_commands_and_supports_tab_escape(tm
         assert "/model" in app._command_values
         assert app._command_values[:3] == ["/plan", "/thinking", "/model"]
 
-        composer.value = "/sta"
+        composer.value = "/check"
         await pilot.pause()
-        assert app._command_values == ["/status"]
+        assert app._command_values == ["/checkpoint"]
         await pilot.press("tab")
         await pilot.pause()
-        assert composer.value == "/status"
+        assert composer.value == "/checkpoint"
         assert agent.prompts == []
 
         await pilot.press("ctrl+u")
         await pilot.pause()
         assert composer.value == ""
 
-        composer.value = "/sta"
+        composer.value = "/check"
         await pilot.press("escape")
         await pilot.pause()
         assert not menu.has_class("visible")
 
         composer.value = ""
-        composer.value = "/sta"
+        composer.value = "/check"
         await pilot.pause()
         await pilot.press("enter")
         for _ in range(20):
             await pilot.pause(0.05)
-            if app._current_agent_text == "Handled /status":
+            if app._current_agent_text == "Handled /checkpoint":
                 break
-        assert app._current_agent_text == "Handled /status"
+        assert app._current_agent_text == "Handled /checkpoint"
         app.exit(0)
 
 
@@ -1482,6 +1482,72 @@ async def test_tui_blocks_command_routes_to_picker(tmp_path):
         handled = await app._handle_local_command("/blocks")
         assert handled is True
         assert picker_opened["yes"] is True
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_statusline_command_opens_modal_and_persists(tmp_path, monkeypatch):
+    """Tier 1.6: ``/statusline`` opens the toggle modal and Save persists the
+    selected segment set, which then drives ``_refresh_session_panel``."""
+    from glm_acp.config import (
+        STATUSLINE_SEGMENT_IDS,
+        load_statusline_config,
+    )
+    from glm_acp.tui import StatusLineScreen
+
+    # Use an isolated config dir so the test does not touch the user's real file.
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    # The picker returns a reduced set (only state + tokens).  We capture it
+    # by short-circuiting push_screen_wait.
+    chosen: set[str] = {"state", "tokens"}
+
+    async def fake_push(screen):
+        assert isinstance(screen, StatusLineScreen)
+        # Initial enabled set must be the full set on first run.
+        assert screen._enabled == set(STATUSLINE_SEGMENT_IDS)
+        return set(chosen)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen_wait = fake_push  # type: ignore[method-assign]
+        before = set(app._statusline_segments)
+        assert before == set(STATUSLINE_SEGMENT_IDS)  # all visible initially
+
+        handled = await app._handle_local_command("/statusline")
+        assert handled is True
+
+        # The chosen subset is now active both in-memory and on disk.
+        assert app._statusline_segments == chosen
+        reloaded = load_statusline_config()
+        assert reloaded == chosen
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_refresh_session_panel_hides_disabled_segments(tmp_path, monkeypatch):
+    """When segments are toggled off, ``_refresh_session_panel`` omits them."""
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+    from textual.widgets import Static
+
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Disable every segment except state.
+        app._statusline_segments = {"state"}
+        app._refresh_session_panel("Ready", used=100, size=1000)
+        await pilot.pause(0.05)
+        rendered = str(app.query_one("#session", Static).render())
+        assert "● Ready" in rendered
+        # Tokens, quota, model, etc. should NOT be rendered.
+        assert "tokens" not in rendered
+        assert "quota" not in rendered
+        assert "glm-" not in rendered
         app.exit(0)
 
 

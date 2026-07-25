@@ -56,8 +56,11 @@ from .config import (
     GENERATION_PROFILES,
     MOA_PICKER_VALUE,
     MODELS,
+    STATUSLINE_SEGMENTS,
     THOUGHT_LEVELS,
     VISION_MODELS,
+    load_statusline_config,
+    save_statusline_config,
     thought_levels_for_model,
 )
 from .glm_client import PlanUsage
@@ -83,6 +86,7 @@ LOCAL_COMMANDS = {
     "/max-iterations": "Show or set the per-turn tool-call iteration cap (default 50, max 1000)",
     "/recap": "Show a one-line summary of the session so far",
     "/blocks": "Pick a code block from recent responses to copy or save (Enter copy, w write)",
+    "/statusline": "Choose which sidebar segments are visible (state, model, tokens, quota, …)",
     "/copy": "Copy the last response to clipboard (or /copy <N> for response N, /copy all)",
     "/history": "Browse and resume past sessions (or press F6)",
     "/search": "Grep the current conversation (or press Ctrl-F)",
@@ -925,6 +929,86 @@ class CodeBlockPickerScreen(ModalScreen[tuple[str, str] | None]):
         self.dismiss(None)
 
 
+class StatusLineScreen(ModalScreen[set[str] | None]):
+    """Toggle which segments of the sidebar session panel are visible.
+
+    Returns the new enabled-set on Save, or ``None`` on cancel. Used by
+    ``/statusline``. Persistence is handled by the caller via
+    :func:`glm_acp.config.save_statusline_config`.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    CSS = """
+    StatusLineScreen { align: center middle; background: $background 70%; }
+    #statusline-dialog {
+        width: 78; max-width: 96%; height: auto; max-height: 90%;
+        border: thick $accent; background: $surface; padding: 1 2;
+    }
+    #statusline-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    #statusline-toggles { height: auto; }
+    .statusline-toggle {
+        width: 100%; height: 1; margin-bottom: 0;
+        background: $surface; color: $text; text-align: left;
+    }
+    .statusline-toggle.on { background: $accent 30%; color: $text; }
+    #statusline-buttons { height: 3; align-horizontal: right; margin-top: 1; }
+    #statusline-buttons Button { margin-left: 1; }
+    #statusline-hint { color: $text-muted; margin-top: 1; }
+    """
+
+    def __init__(self, enabled: set[str]) -> None:
+        super().__init__()
+        # Per-session working copy; the caller's set is not mutated.
+        self._enabled: set[str] = set(enabled)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="statusline-dialog"):
+            yield Label("Sidebar segments", id="statusline-title")
+            with Vertical(id="statusline-toggles"):
+                for sid, label in STATUSLINE_SEGMENTS:
+                    btn = Button(
+                        f"{'[✓]' if sid in self._enabled else '[ ]'} {label}",
+                        id=f"toggle-{sid}",
+                        classes="statusline-toggle" + (" on" if sid in self._enabled else ""),
+                    )
+                    btn.variant = "success" if sid in self._enabled else "default"
+                    yield btn
+            yield Label(
+                "Click to toggle  ·  Save persists to ~/.config/glm-acp/statusline.json",
+                id="statusline-hint",
+                markup=False,
+            )
+            with Horizontal(id="statusline-buttons"):
+                yield Button("Save", id="statusline-save", variant="primary")
+                yield Button("Cancel", id="statusline-cancel")
+
+    @on(Button.Pressed)
+    def toggle_pressed(self, event: Button.Pressed) -> None:
+        # Toggle buttons share the ``toggle-<sid>`` id prefix.
+        if event.button.id and event.button.id.startswith("toggle-"):
+            sid = event.button.id.removeprefix("toggle-")
+            if sid in self._enabled:
+                self._enabled.discard(sid)
+            else:
+                self._enabled.add(sid)
+            event.button.label = (
+                f"{'[✓]' if sid in self._enabled else '[ ]'} "
+                f"{dict(STATUSLINE_SEGMENTS)[sid]}"
+            )
+            event.button.set_classes(
+                "statusline-toggle" + (" on" if sid in self._enabled else "")
+            )
+            event.button.variant = "success" if sid in self._enabled else "default"
+        elif event.button.id == "statusline-save":
+            self.dismiss(self._enabled)
+        elif event.button.id == "statusline-cancel":
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 def _extract_message_text(msg: dict[str, Any]) -> str:
     """Best-effort plain-text extraction from a session message dict."""
     parts: list[str] = []
@@ -1308,6 +1392,11 @@ class NativeGlmTui(App[int]):
         # back to the terminal emulator so the terminal's own right-click
         # context menu and click-drag text selection work natively.
         self._native_mouse_mode = False
+        # Statusline segments enabled by the user (loaded from
+        # ``config_dir()/statusline.json``). ``_refresh_session_panel``
+        # only renders segments whose IDs are in this set; defaults to
+        # all visible on first run.
+        self._statusline_segments: set[str] = load_statusline_config()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1537,6 +1626,9 @@ class NativeGlmTui(App[int]):
             return True
         if text == "/blocks":
             await self.action_open_blocks_picker()
+            return True
+        if text == "/statusline":
+            await self.action_open_statusline()
             return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)
@@ -2109,17 +2201,36 @@ class NativeGlmTui(App[int]):
         quota = self._quota_summary()
         awareness = self._awareness_summary()
         tokens = self._token_summary(session)
-        self.query_one("#session", Static).update(
-            f"● {state}\n"
-            f"{(self.session_id[:8] + '…') if self.session_id else 'starting'}\n\n"
-            f"{model} · {reasoning_name}\n"
-            f"{endpoint_name}\n"
-            f"{mode} · {permission}\n"
-            f"context {context}\n"
-            f"{tokens}\n"
-            f"{awareness}\n"
-            f"{quota}"
-        )
+        enabled = self._statusline_segments
+        # Build each segment conditionally so /statusline toggles take effect
+        # on the very next refresh. State and session ID stay pinned at the top.
+        lines: list[str] = []
+        if "state" in enabled:
+            lines.append(f"● {state}")
+        if "session_id" in enabled:
+            sid = (self.session_id[:8] + "…") if self.session_id else "starting"
+            lines.append(sid)
+        if lines:
+            lines.append("")  # blank separator after the header block
+        if "model" in enabled:
+            lines.append(f"{model} · {reasoning_name}")
+        if "endpoint" in enabled:
+            lines.append(endpoint_name)
+        if "mode" in enabled:
+            lines.append(f"{mode} · {permission}")
+        if "context" in enabled:
+            lines.append(f"context {context}")
+        if "tokens" in enabled:
+            lines.append(tokens)
+        if "awareness" in enabled:
+            lines.append(awareness)
+        if "quota" in enabled:
+            lines.append(quota)
+        # Always render at least the state line so the panel is never blank
+        # (e.g., if a user disables everything but state).
+        if not lines:
+            lines.append(f"● {state}")
+        self.query_one("#session", Static).update("\n".join(lines))
 
     @staticmethod
     def _token_summary(session: Any) -> str:
@@ -2438,6 +2549,33 @@ class NativeGlmTui(App[int]):
                 self.notify(f"Wrote {len(code)} chars to {target.name}", severity="success")
             except OSError as error:
                 self.notify(f"Write failed: {error}", severity="error")
+
+    async def action_open_statusline(self) -> None:
+        """``/statusline``: toggle which sidebar session-panel segments are visible.
+
+        Persists the user's choices to ``config_dir()/statusline.json`` so
+        the selection survives restarts. The panel re-renders immediately
+        on save so the change is visible without a refresh.
+        """
+        result = await self.push_screen_wait(StatusLineScreen(self._statusline_segments))
+        if result is None:
+            return
+        try:
+            self._statusline_segments = save_statusline_config(result)
+        except OSError as error:
+            self.notify(f"Could not save statusline config: {error}", severity="warning")
+            self._statusline_segments = set(result)
+        # Force an immediate re-render with the new segment set.
+        self._refresh_session_panel(
+            "Running" if self._prompt_worker is not None else "Ready"
+        )
+        enabled_count = len(self._statusline_segments)
+        total = len(STATUSLINE_SEGMENTS)
+        self.notify(
+            f"{enabled_count}/{total} sidebar segments visible",
+            title="Statusline updated",
+            severity="success",
+        )
 
     async def _resume_session(self, session_id: str) -> None:
         """Resume a persisted session through the shared agent runtime."""

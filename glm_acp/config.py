@@ -134,6 +134,77 @@ def save_max_tool_iterations(value: int) -> int:
     return clamped
 
 
+# Toggleable sidebar segments surfaced by the TUI ``/statusline`` command.
+# Each entry is ``(segment_id, human_label)``; the order here is the order
+# shown in the picker. ``load_statusline_config`` returns the full set on
+# first run so the default UI matches the pre-feature behavior.
+STATUSLINE_SEGMENTS: tuple[tuple[str, str], ...] = (
+    ("state", "State (● Ready / Running)"),
+    ("session_id", "Session ID preview"),
+    ("model", "Model · reasoning"),
+    ("endpoint", "API plan"),
+    ("mode", "Mode · permissions"),
+    ("context", "Context used/size"),
+    ("tokens", "Token totals"),
+    ("awareness", "Awareness indicator"),
+    ("quota", "Quota windows"),
+)
+STATUSLINE_SEGMENT_IDS = frozenset(sid for sid, _ in STATUSLINE_SEGMENTS)
+
+
+def statusline_path() -> Path:
+    """Return the path to the persistent user default for statusline segments."""
+    return config_dir() / "statusline.json"
+
+
+def load_statusline_config() -> set[str]:
+    """Return the set of enabled statusline segment IDs.
+
+    Falls back to ``STATUSLINE_SEGMENT_IDS`` (everything enabled) when the
+    file is missing, malformed, or contains unknown segments — so the
+    default UI matches the pre-feature behavior and a corrupt config can
+    never wipe the sidebar.
+    """
+    try:
+        payload = json.loads(statusline_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return set(STATUSLINE_SEGMENT_IDS)
+    if not isinstance(payload, dict):
+        return set(STATUSLINE_SEGMENT_IDS)
+    raw = payload.get("segments")
+    if not isinstance(raw, list):
+        return set(STATUSLINE_SEGMENT_IDS)
+    enabled = {sid for sid in raw if isinstance(sid, str) and sid in STATUSLINE_SEGMENT_IDS}
+    # Unknown/empty sets fall back to "all visible" rather than blank.
+    return enabled or set(STATUSLINE_SEGMENT_IDS)
+
+
+def save_statusline_config(segments: set[str]) -> set[str]:
+    """Persist ``segments`` as the new user default and return the cleaned set.
+
+    Unknown segment IDs are dropped. The file is written atomically so
+    concurrent readers never see a partial file.
+    """
+    cleaned = {sid for sid in segments if sid in STATUSLINE_SEGMENT_IDS}
+    enabled = cleaned or set(STATUSLINE_SEGMENT_IDS)
+    payload = {"segments": sorted(enabled)}
+    path = statusline_path()
+    _secure_dir(path.parent)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _secure_file(temporary)
+        os.replace(temporary, path)
+        _secure_file(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return enabled
+
+
 def _secure_dir(path: Path) -> None:
     """Create ``path`` (and parents) with 0700 perms; never raise on chmod."""
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
