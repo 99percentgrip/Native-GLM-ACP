@@ -98,6 +98,7 @@ LOCAL_COMMANDS = {
     "/loop": "Run a prompt repeatedly at an interval (/loop 5m check CI status, /loop stop)",
     "/security-review": "Scan the working-tree diff for security vulnerabilities",
     "/rewind": "Alias for /rollback — rewind conversation to a prior checkpoint",
+    "/smart": "Expand a smart-prompt template with git context (/smart pr, review, commit, fix-ci)",
     # Agent-side commands (implemented in the shared runtime; listed here so
     # they appear in the /-menu and the Ctrl+P command palette for discovery).
     "/status": "Show session, model, permissions, context, and live evidence",
@@ -138,6 +139,33 @@ LOCAL_COMMANDS = {
     "/export last": "Export the last response to a Markdown file",
     "/image": "Queue an image for the next prompt",
     "/exit": "Close the terminal agent",
+}
+
+# Smart prompt templates: one-click actions with auto-resolved git context.
+# Variables: {branch}, {diff}, {commit_log}, {cwd}.
+# /smart (bare) lists these; /smart <name> resolves and inserts into the
+# composer for review before sending.
+SMART_PROMPTS: dict[str, tuple[str, str]] = {
+    "pr": (
+        "Create a PR",
+        "Create a GitHub pull request for the current branch {branch}. "
+        "Generate a descriptive title and body based on the commits:\n"
+        "{commit_log}\nUse `gh pr create`.",
+    ),
+    "review": (
+        "Review changes",
+        "Review the uncommitted changes in the working tree for correctness, "
+        "style, and potential bugs. Here is the diff:\n\n{diff}",
+    ),
+    "commit": (
+        "Write commit message",
+        "Write a clear conventional commit message for these changes:\n\n{diff}",
+    ),
+    "fix-ci": (
+        "Fix CI failures",
+        "The CI may be failing on branch {branch}. "
+        "Run the CI checks locally, identify the failures, and fix them.",
+    ),
 }
 
 CONFIG_COMMANDS = {
@@ -1983,6 +2011,10 @@ class NativeGlmTui(App[int]):
             cmd = f"/rollback {arg}" if arg else "/rollback"
             self.insert_command(cmd)
             return True
+        if text == "/smart" or text.startswith("/smart "):
+            name = text.partition(" ")[2].strip()
+            await self.action_smart(name)
+            return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)
             return True
@@ -2981,6 +3013,73 @@ class NativeGlmTui(App[int]):
     async def action_open_tasks(self) -> None:
         """``/tasks``: show the session dashboard (turn state, queue, stats)."""
         await self.push_screen(TasksScreen(self._tasks_snapshot()))
+
+    async def action_smart(self, name: str) -> None:
+        """``/smart [name]``: expand a smart-prompt template with git context.
+
+        Bare ``/smart`` lists available templates. ``/smart <name>`` resolves
+        the template's ``{branch}``, ``{diff}``, ``{commit_log}``, ``{cwd}``
+        variables from the workspace's git state and inserts the expanded
+        prompt into the composer for review before sending.
+        """
+        if not name:
+            lines = ["**Smart prompts** — use `/smart <name>`:"]
+            for key, (label, _template) in SMART_PROMPTS.items():
+                lines.append(f"  `/smart {key}` — {label}")
+            await self._append_system("\n".join(lines))
+            return
+
+        if name not in SMART_PROMPTS:
+            available = ", ".join(sorted(SMART_PROMPTS))
+            self.notify(
+                f"Unknown template: {name!r}. Available: {available}",
+                severity="warning",
+            )
+            return
+
+        _label, template = SMART_PROMPTS[name]
+        expanded = self._resolve_smart_prompt(template)
+        # Insert into the composer for review (the user can edit before Enter).
+        try:
+            composer = self.query_one("#composer", CommandInput)
+            composer.value = expanded
+            composer.focus()
+            composer.cursor_position = len(expanded)
+        except Exception:
+            pass
+
+    def _resolve_smart_prompt(self, template: str) -> str:
+        """Resolve ``{branch}``, ``{diff}``, ``{commit_log}``, ``{cwd}`` in a template."""
+        import subprocess as _sp
+
+        cwd = self._session_cwd()
+
+        def _git(args: list[str], fallback: str = "") -> str:
+            try:
+                result = _sp.run(
+                    ["git", *args],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    cwd=cwd,
+                )
+                return result.stdout.strip() if result.returncode == 0 else fallback
+            except Exception:
+                return fallback
+
+        branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], "(unknown branch)")
+        diff = _git(["diff"], "(no changes)")[:2000]
+        commit_log = _git(
+            ["log", "--oneline", "-10"],
+            "(no commits)",
+        )
+
+        return template.format(
+            branch=branch,
+            diff=diff,
+            commit_log=commit_log,
+            cwd=cwd,
+        )
 
     @staticmethod
     def _parse_loop_interval(arg: str) -> float | None:

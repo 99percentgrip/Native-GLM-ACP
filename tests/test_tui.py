@@ -1800,6 +1800,60 @@ async def test_tui_loop_command_rejects_invalid_interval(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tui_smart_lists_templates_when_bare(tmp_path):
+    """Tier 4: ``/smart`` (bare) lists available templates in the transcript."""
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        handled = await app._handle_local_command("/smart")
+        assert handled is True
+        await pilot.pause(0.05)
+        children = list(app.query("#transcript > *"))
+        assert len(children) > 0
+        last_text = str(children[-1].render())
+        assert "/smart pr" in last_text
+        assert "/smart review" in last_text
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_smart_resolves_template_into_composer(tmp_path):
+    """Tier 4: ``/smart review`` expands the template with git context and
+    inserts it into the composer for review."""
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        handled = await app._handle_local_command("/smart review")
+        assert handled is True
+        await pilot.pause(0.05)
+        composer = app.query_one("#composer", Input)
+        # The template contains "Review the uncommitted changes" and
+        # variable fallbacks for non-git directories.
+        assert "Review the uncommitted changes" in composer.value
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_smart_unknown_template_notifies(tmp_path):
+    """Tier 4: ``/smart bogus`` notifies the user about available templates."""
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        handled = await app._handle_local_command("/smart bogus")
+        assert handled is True
+        # Composer should NOT have been modified.
+        composer = app.query_one("#composer", Input)
+        assert composer.value == ""
+        app.exit(0)
+
+
+@pytest.mark.asyncio
 async def test_tui_refresh_session_panel_hides_disabled_segments(tmp_path, monkeypatch):
     """When segments are toggled off, ``_refresh_session_panel`` omits them."""
     monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
