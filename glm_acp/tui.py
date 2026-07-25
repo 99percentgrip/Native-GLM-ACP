@@ -92,6 +92,7 @@ LOCAL_COMMANDS = {
     "/context": "Visualize context-window usage by segment (system, user, assistant, tool)",
     "/btw": "Ask a side question without polluting the conversation (/btw <question>)",
     "/theme": "Switch the visual theme (textual-dark, textual-light, ansi, dracula, nord, …)",
+    "/tasks": "Show the session dashboard (turn state, queue, tokens, model, context)",
     # Agent-side commands (implemented in the shared runtime; listed here so
     # they appear in the /-menu and the Ctrl+P command palette for discovery).
     "/status": "Show session, model, permissions, context, and live evidence",
@@ -1206,6 +1207,91 @@ class BtwOverlayScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class TasksScreen(ModalScreen[None]):
+    """Consolidated session dashboard: turn state, queue, and session stats.
+
+    A read-only modal that surfaces what the TUI is currently doing — the
+    active turn state + elapsed time, the FIFO prompt queue with previews,
+    and the session's model/mode/token stats — in one view. Used by
+    ``/tasks``. Press Esc to close.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Close", priority=True)]
+
+    CSS = """
+    TasksScreen { align: center middle; background: $background 70%; }
+    #tasks-dialog {
+        width: 82; max-width: 96%; height: auto; max-height: 90%;
+        border: thick $accent; background: $surface; padding: 1 2;
+    }
+    #tasks-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    .tasks-section-label {
+        text-style: bold; color: $text; margin-top: 1; margin-bottom: 0;
+    }
+    .tasks-section-body { color: $text-muted; height: auto; margin-bottom: 0; }
+    #tasks-hint { color: $text-muted; margin-top: 1; }
+    """
+
+    def __init__(self, snapshot: dict[str, Any]) -> None:
+        super().__init__()
+        self._snapshot = snapshot
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="tasks-dialog"):
+            yield Label("Session dashboard", id="tasks-title")
+            yield Label("Current turn", classes="tasks-section-label")
+            yield Label(self._turn_line(), classes="tasks-section-body", markup=False)
+            yield Label("Queue", classes="tasks-section-label")
+            yield Label(self._queue_line(), classes="tasks-section-body", markup=False)
+            yield Label("Session", classes="tasks-section-label")
+            yield Label(self._session_line(), classes="tasks-section-body", markup=False)
+            yield Label("Esc close", id="tasks-hint", markup=False)
+
+    def _turn_line(self) -> str:
+        state = str(self._snapshot.get("turn_state", "Idle"))
+        elapsed = float(self._snapshot.get("turn_elapsed", 0.0))
+        activity = str(self._snapshot.get("activity", ""))
+        if state == "Running":
+            mins, secs = divmod(int(elapsed), 60)
+            line = f"● Running ({mins}:{secs:02d})"
+            if activity:
+                line += f"  ·  {activity}"
+            return line
+        return f"● {state}"
+
+    def _queue_line(self) -> str:
+        queue = self._snapshot.get("queue", [])
+        if not queue:
+            return "(empty)"
+        lines = [f"{len(queue)} queued prompt{'s' if len(queue) != 1 else ''}:"]
+        for index, item in enumerate(queue[:5]):
+            preview = str(item)[:60].replace("\n", " ")
+            lines.append(f"  [{index + 1}] {preview}")
+        if len(queue) > 5:
+            lines.append(f"  (+{len(queue) - 5} more)")
+        return "\n".join(lines)
+
+    def _session_line(self) -> str:
+        s = self._snapshot.get("session", {})
+        model = str(s.get("model", "?"))
+        mode = str(s.get("mode", "?"))
+        perm = str(s.get("permission", "?"))
+        inp = int(s.get("input_tokens", 0))
+        out = int(s.get("output_tokens", 0))
+        cached = int(s.get("cached_tokens", 0))
+        context_pct = float(s.get("context_percent", 0.0))
+        cap = int(s.get("max_iterations", 50))
+        cache_str = f" · cache {cached:,}" if cached else ""
+        return (
+            f"{model} · {mode} · {perm}\n"
+            f"tokens ↑{inp:,} ↓{out:,}{cache_str}\n"
+            f"context {context_pct:g}% · iteration cap {cap}"
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 def _extract_message_text(msg: dict[str, Any]) -> str:
     """Best-effort plain-text extraction from a session message dict."""
     parts: list[str] = []
@@ -1862,6 +1948,9 @@ class NativeGlmTui(App[int]):
             return True
         if text == "/theme":
             self.action_change_theme()
+            return True
+        if text == "/tasks":
+            await self.action_open_tasks()
             return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)
@@ -2832,6 +2921,35 @@ class NativeGlmTui(App[int]):
         mount; otherwise the user types and presses Enter.
         """
         await self.push_screen(BtwOverlayScreen(prefill_question))
+
+    def _tasks_snapshot(self) -> dict[str, Any]:
+        """Build a read-only snapshot of the current TUI + session state."""
+        session = getattr(self.agent, "_sessions", {}).get(self.session_id)
+        elapsed = time.monotonic() - self._turn_start_time if self._prompt_worker else 0.0
+        context_size = int(getattr(session, "context_size", 0)) or 1
+        estimated = int(getattr(session, "estimated_tokens", 0))
+        return {
+            "turn_state": "Running" if self._prompt_worker is not None else "Idle",
+            "turn_elapsed": elapsed,
+            "activity": self._activity_label,
+            "queue": list(self._prompt_queue),
+            "session": {
+                "model": getattr(session, "model", self.args.model or "?"),
+                "mode": getattr(session, "mode", self.args.mode or "?"),
+                "permission": getattr(
+                    session, "permission_mode", self.args.permission or "?"
+                ),
+                "input_tokens": int(getattr(session, "total_input_tokens", 0)),
+                "output_tokens": int(getattr(session, "total_output_tokens", 0)),
+                "cached_tokens": int(getattr(session, "total_cached_tokens", 0)),
+                "context_percent": round(estimated * 100.0 / context_size, 2),
+                "max_iterations": int(getattr(session, "max_tool_iterations", 50)),
+            },
+        }
+
+    async def action_open_tasks(self) -> None:
+        """``/tasks``: show the session dashboard (turn state, queue, stats)."""
+        await self.push_screen(TasksScreen(self._tasks_snapshot()))
 
     async def run_compact_from_context_view(self) -> None:
         """Run ``/compact`` after the context-view modal signals it (press ``c``).

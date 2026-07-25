@@ -1658,6 +1658,53 @@ async def test_tui_theme_command_opens_picker_and_persists(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_tui_tasks_command_opens_dashboard_with_session_state(tmp_path):
+    """Tier 2.7: ``/tasks`` opens the TasksScreen with a live snapshot of
+    the current turn state, queue, and session stats."""
+    from glm_acp.tui import TasksScreen
+
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    captured: dict[str, object] = {}
+
+    async def fake_push(screen):
+        captured["screen"] = screen
+        return None
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen = fake_push  # type: ignore[method-assign]
+
+        # Seed a queue and turn state so the snapshot has interesting data.
+        app._prompt_queue = ["next question about auth", "another queued prompt"]
+        app._activity_label = "Thinking"
+        session = agent._sessions[app.session_id]
+        session.total_input_tokens = 5000
+        session.total_output_tokens = 1200
+        session.total_cached_tokens = 3000
+        session.context_size = 1_000_000
+        session.estimated_tokens = 8000
+        session.max_tool_iterations = 100
+
+        handled = await app._handle_local_command("/tasks")
+        assert handled is True
+        screen = captured.get("screen")
+        assert isinstance(screen, TasksScreen)
+        snap = screen._snapshot  # type: ignore[attr-defined]
+        assert snap["turn_state"] == "Idle"  # no prompt running
+        assert snap["activity"] == "Thinking"
+        assert len(snap["queue"]) == 2
+        assert snap["queue"][0] == "next question about auth"
+        sess = snap["session"]
+        assert sess["input_tokens"] == 5000
+        assert sess["output_tokens"] == 1200
+        assert sess["cached_tokens"] == 3000
+        assert sess["max_iterations"] == 100
+        app.exit(0)
+
+
+@pytest.mark.asyncio
 async def test_tui_refresh_session_panel_hides_disabled_segments(tmp_path, monkeypatch):
     """When segments are toggled off, ``_refresh_session_panel`` omits them."""
     monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
