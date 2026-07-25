@@ -994,6 +994,75 @@ class GlmAcpAgent(acp.Agent):
             logger.warning("Auxiliary /btw failed", exc_info=True)
             return "Side question failed — check your auxiliary model and try again."
 
+    async def generate_insights(self, session_id: str) -> str:
+        """Analyze the session for friction points and improvement opportunities.
+
+        Deeper than :meth:`generate_recap`: instead of a one-line summary,
+        produces 2-4 bullet points identifying what worked well, what friction
+        occurred, and what could be improved next time. Uses the configured
+        auxiliary GLM with a longer context window (~6000 chars). Falls back
+        to a local heuristic when the auxiliary model is the default, the
+        session is empty, or the auxiliary call fails. Transcript input is
+        wrapped with :func:`wrap_untrusted_output`.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            return "Session not ready."
+
+        parts: list[str] = []
+        for message in session.messages:
+            role = str(message.get("role", ""))
+            if role not in {"user", "assistant"}:
+                continue
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(block.get("text", ""))
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            elif not isinstance(content, str):
+                content = str(content)
+            text = content.strip()
+            if text:
+                prefix = "user" if role == "user" else "assistant"
+                parts.append(f"{prefix}: {text}")
+
+        if not parts:
+            return "Empty session — nothing to analyze yet."
+
+        # Local fallback: a brief heuristic based on message count and ratio.
+        user_count = sum(1 for p in parts if p.startswith("user:"))
+        assistant_count = sum(1 for p in parts if p.startswith("assistant:"))
+        fallback = (
+            f"Session had {user_count} user turn(s) and {assistant_count} assistant "
+            f"response(s). Set an auxiliary model (e.g. /auxiliary glm-5-turbo) "
+            f"to get AI-powered friction analysis."
+        )
+
+        if session.auxiliary_model == DEFAULT_AUXILIARY_MODEL:
+            return fallback
+
+        transcript_tail = "\n".join(parts)[-6000:]
+        client = self._aux_client_for_session(session)
+        try:
+            client.begin_turn()
+            result = await client.complete_auxiliary(
+                "Analyze this coding session briefly. Identify 2-4 concrete "
+                "insights about: what worked well, what friction or blockers "
+                "occurred, and what could be improved next time. Return only "
+                "the bullet points (one per line, starting with '-'), no "
+                "preamble or wrapper.",
+                wrap_untrusted_output(transcript_tail, "insights-source"),
+                max_tokens=300,
+            )
+            self._record_auxiliary_usage(session, result.usage)
+            insights = result.content.strip()
+            return insights[:1200] or fallback
+        except Exception:
+            logger.warning("Auxiliary insights generation failed", exc_info=True)
+            return fallback
+
     async def _rank_recall_results(
         self,
         session: Session,

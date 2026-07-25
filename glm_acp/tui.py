@@ -93,6 +93,8 @@ LOCAL_COMMANDS = {
     "/btw": "Ask a side question without polluting the conversation (/btw <question>)",
     "/theme": "Switch the visual theme (textual-dark, textual-light, ansi, dracula, nord, …)",
     "/tasks": "Show the session dashboard (turn state, queue, tokens, model, context)",
+    "/release": "Cut a release from the workspace (/release [patch|minor|major])",
+    "/insights": "Analyze the session for friction points and improvement opportunities",
     # Agent-side commands (implemented in the shared runtime; listed here so
     # they appear in the /-menu and the Ctrl+P command palette for discovery).
     "/status": "Show session, model, permissions, context, and live evidence",
@@ -1951,6 +1953,11 @@ class NativeGlmTui(App[int]):
             return True
         if text == "/tasks":
             await self.action_open_tasks()
+            return True
+        if text == "/insights":
+            insights = await self.agent.generate_insights(self.session_id)
+            await self._append_system(f"Insights:\n{insights}")
+            self.notify("Insights generated — see transcript", severity="information")
             return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)

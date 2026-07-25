@@ -282,6 +282,7 @@ async def _handle_plain_command(
             "  /planmode <PRD>       Activate read-only Plan Mode\n"
             "  /recap                Show a one-line summary of the session so far\n"
             "  /btw <question>       Ask a side question without polluting the conversation\n"
+            "  /insights             Analyze the session for friction and improvements\n"
             "  Anything else is sent to the model as a prompt.",
             file=sys.stderr,
         )
@@ -306,6 +307,14 @@ async def _handle_plain_command(
             print(f"Side question failed: {error}", file=sys.stderr)
             return "skip"
         print(f"BTW: {answer}", file=sys.stderr)
+        return "skip"
+    if stripped == "/insights":
+        try:
+            insights = await agent.generate_insights(session_id)
+        except Exception as error:  # noqa: BLE001 — surface any auxiliary failure plainly
+            print(f"Insights failed: {error}", file=sys.stderr)
+            return "skip"
+        print(f"Insights:\n{insights}", file=sys.stderr)
         return "skip"
         return "skip"
     if stripped == "/max-iterations" or text.startswith("/max-iterations "):
@@ -356,6 +365,7 @@ _PLAIN_COMMAND_NAMES = (
     "/planmode",
     "/recap",
     "/btw",
+    "/insights",
 )
 
 

@@ -102,6 +102,14 @@ class FakeAgent:
         agent._sessions = self._sessions
         return agent.context_breakdown(session_id)
 
+    async def generate_insights(self, session_id):
+        """Tier 4 test double — delegate to the real GlmAcpAgent method."""
+        from glm_acp.agent import GlmAcpAgent
+
+        agent = GlmAcpAgent.__new__(GlmAcpAgent)
+        agent._sessions = self._sessions
+        return await agent.generate_insights(session_id)
+
     async def query_provider_usage(self, session_id):
         self.usage_calls += 1
         return PlanUsage(
@@ -1701,6 +1709,33 @@ async def test_tui_tasks_command_opens_dashboard_with_session_state(tmp_path):
         assert sess["output_tokens"] == 1200
         assert sess["cached_tokens"] == 3000
         assert sess["max_iterations"] == 100
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_insights_command_appends_to_transcript(tmp_path):
+    """Tier 4: ``/insights`` generates session analysis and appends it to the transcript."""
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Seed messages so generate_insights has something to analyze.
+        session = agent._sessions[app.session_id]
+        session.messages = [
+            {"role": "user", "content": "fix the auth bug"},
+            {"role": "assistant", "content": "reading login.py"},
+        ]
+
+        handled = await app._handle_local_command("/insights")
+        assert handled is True
+        await pilot.pause(0.05)
+        # The insights text should appear as a new child widget in the transcript.
+        children = list(app.query("#transcript > *"))
+        assert len(children) > 0
+        # The last child should contain the insights text.
+        last_child_text = str(children[-1].render())
+        assert "Insights:" in last_child_text or "user turn" in last_child_text
         app.exit(0)
 
 

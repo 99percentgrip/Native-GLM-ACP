@@ -1362,6 +1362,86 @@ class TestBtwSideQuestion:
         assert len(session.messages) == 1
 
 
+class TestSessionInsights:
+    """Tier 4: ``/insights`` session friction analysis."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_returns_not_ready(self, agent):
+        insights = await agent.generate_insights("nonexistent-session-id")
+        assert "not ready" in insights.lower()
+
+    @pytest.mark.asyncio
+    async def test_empty_session_returns_marker(self, agent, session):
+        agent._sessions[session.id] = session
+        insights = await agent.generate_insights(session.id)
+        assert "empty" in insights.lower() or "nothing" in insights.lower()
+
+    @pytest.mark.asyncio
+    async def test_default_auxiliary_returns_heuristic_fallback(self, agent, session):
+        session.auxiliary_model = DEFAULT_AUXILIARY_MODEL
+        session.messages = [
+            {"role": "user", "content": "fix the bug"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "also add tests"},
+            {"role": "assistant", "content": "added tests"},
+        ]
+        agent._sessions[session.id] = session
+
+        insights = await agent.generate_insights(session.id)
+
+        # Fallback mentions the turn count and suggests setting an aux model.
+        assert "2 user turn" in insights.lower()
+        assert "auxiliary" in insights.lower()
+
+    @pytest.mark.asyncio
+    async def test_non_default_auxiliary_calls_aux_and_returns_bullets(
+        self, agent, session, monkeypatch
+    ):
+        client = MagicMock()
+        client.begin_turn = MagicMock()
+        client.complete_auxiliary = AsyncMock(
+            return_value=SimpleNamespace(
+                content=(
+                    "- Good: tests were added proactively\n"
+                    "- Friction: the auth bug required two iterations\n"
+                    "- Improve: add integration tests earlier"
+                ),
+                usage={"input_tokens": 200, "output_tokens": 60},
+            )
+        )
+        session.auxiliary_model = "glm-5-turbo"
+        session.messages = [
+            {"role": "user", "content": "fix the auth bug"},
+            {"role": "assistant", "content": "reading login.py"},
+            {"role": "user", "content": "still broken"},
+            {"role": "assistant", "content": "fixed token refresh"},
+        ]
+        agent._sessions[session.id] = session
+        monkeypatch.setattr(agent, "_aux_client_for_session", lambda _session: client)
+
+        insights = await agent.generate_insights(session.id)
+
+        assert "Good: tests" in insights
+        assert "Friction:" in insights
+        assert session.total_input_tokens == 200
+        assert session.total_output_tokens == 60
+
+    @pytest.mark.asyncio
+    async def test_auxiliary_failure_falls_back_gracefully(self, agent, session, monkeypatch):
+        client = MagicMock()
+        client.begin_turn = MagicMock()
+        client.complete_auxiliary = AsyncMock(side_effect=RuntimeError("timeout"))
+        session.auxiliary_model = "glm-5-turbo"
+        session.messages = [{"role": "user", "content": "hi"}]
+        agent._sessions[session.id] = session
+        monkeypatch.setattr(agent, "_aux_client_for_session", lambda _session: client)
+
+        insights = await agent.generate_insights(session.id)
+
+        # Falls back to the local heuristic (mentions turn count).
+        assert "1 user turn" in insights.lower()
+
+
 class TestSetSessionMode:
     @pytest.mark.asyncio
     async def test_valid_mode(self, agent, session):
@@ -2011,7 +2091,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.7.8"
+        assert resp.agent_info.version == "2.7.9"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):
