@@ -804,6 +804,59 @@ class TestSlashCommands:
         assert "cleared" in result.lower()
 
     @pytest.mark.asyncio
+    async def test_undo_pops_user_turns_and_returns_prefill(self, agent, session):
+        session.messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "ok 1"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "ok 2"},
+        ]
+        result = await agent._handle_command(session, "/undo 1")
+        assert "Undid 1 turn" in result
+        assert "---PROMPT---" in result
+        assert "second" in result
+        # Last user turn + its assistant reply removed.
+        contents = [m["content"] for m in session.messages]
+        assert "second" not in contents
+        assert "ok 2" not in contents
+        assert "first" in contents  # earlier turn preserved
+
+    @pytest.mark.asyncio
+    async def test_undo_default_n_is_one(self, agent, session):
+        session.messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "only turn"},
+        ]
+        result = await agent._handle_command(session, "/undo")
+        assert "Undid 1 turn" in result
+        assert len(session.messages) == 1
+
+    @pytest.mark.asyncio
+    async def test_undo_with_no_user_turns_returns_message(self, agent, session):
+        session.messages = [{"role": "system", "content": "system"}]
+        result = await agent._handle_command(session, "/undo 3")
+        assert "Nothing to undo" in result
+
+    @pytest.mark.asyncio
+    async def test_undo_rejects_non_integer(self, agent, session):
+        result = await agent._handle_command(session, "/undo banana")
+        assert "must be a positive integer" in result
+
+    @pytest.mark.asyncio
+    async def test_undo_advertised_in_acp_command_catalog(self, agent, session):
+        captured: dict[str, object] = {}
+
+        async def fake_send(*args, **kwargs):
+            captured.update(kwargs)
+
+        agent._conn.session_update = fake_send
+        await agent._send_available_commands(session)
+        sent_str = str(captured)
+        assert "undo" in sent_str
+        assert "Take back" in sent_str
+
+    @pytest.mark.asyncio
     async def test_unknown_command(self, agent, session):
         result = await agent._handle_command(session, "/foobar")
         assert "Unknown" in result
@@ -1169,7 +1222,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.2.1"
+        assert resp.agent_info.version == "2.3.0"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):

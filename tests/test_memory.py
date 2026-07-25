@@ -7,6 +7,7 @@ import pytest
 from glm_acp.memory import (
     append_memory,
     append_user_profile,
+    apply_memory_batch,
     curate_learned_skills,
     draft_skill_evolution,
     forget_learned_skill,
@@ -561,3 +562,87 @@ def test_curator_detects_manual_drift_and_description_overlap(tmp_path):
     assert status["overlap_candidates"][0]["skills"] == ["deploy-api", "release-api"]
     curated = curate_learned_skills(str(tmp_path))
     assert curated["review"] == ["deploy-api"]
+
+
+# ---------------------------------------------------------------------------
+# Atomic memory batch operations (Hermes v0.17 parity)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_memory_batch_adds_multiple_entries_atomically(tmp_path):
+    summary = apply_memory_batch(
+        str(tmp_path),
+        [
+            {"op": "add", "entry": "First fact"},
+            {"op": "add", "entry": "Second fact"},
+            {"op": "add", "entry": "Third fact"},
+        ],
+    )
+    assert summary["added"] == 3
+    assert summary["removed"] == 0
+    assert summary["final_entry_count"] == 3
+    text = read_memory(str(tmp_path))
+    assert "First fact" in text
+    assert "Third fact" in text
+
+
+def test_apply_memory_batch_remove_frees_space_for_add(tmp_path):
+    # Pre-populate near the budget so a naive add would overflow.
+    big = "X" * 1000
+    for i in range(20):
+        append_memory(str(tmp_path), f"filler {i} {big}")
+
+    # Adding a new entry would overflow — but the batch removes one first
+    # so the net fits within the budget.
+    summary = apply_memory_batch(
+        str(tmp_path),
+        [
+            {"op": "remove", "entry": f"filler 0 {big}"},
+            {"op": "add", "entry": "fresh fact that fits now"},
+        ],
+    )
+    assert summary["added"] == 1
+    assert summary["removed"] == 1
+    text = read_memory(str(tmp_path))
+    assert "fresh fact that fits now" in text
+
+
+def test_apply_memory_batch_rejects_invalid_op(tmp_path):
+    with pytest.raises(ValueError, match="op must be"):
+        apply_memory_batch(
+            str(tmp_path),
+            [{"op": "rename", "entry": "nope"}],
+        )
+
+
+def test_apply_memory_batch_rejects_credential_in_add(tmp_path):
+    with pytest.raises(ValueError, match="credential"):
+        apply_memory_batch(
+            str(tmp_path),
+            [{"op": "add", "entry": "api_key=sk-1234567890abcdef"}],
+        )
+
+
+def test_apply_memory_batch_rejects_too_many_ops(tmp_path):
+    ops = [{"op": "add", "entry": f"fact {i}"} for i in range(51)]
+    with pytest.raises(ValueError, match="At most 50"):
+        apply_memory_batch(str(tmp_path), ops)
+
+
+def test_apply_memory_batch_skips_duplicate_adds(tmp_path):
+    append_memory(str(tmp_path), "Already here")
+    summary = apply_memory_batch(
+        str(tmp_path),
+        [{"op": "add", "entry": "Already here"}],
+    )
+    assert summary["added"] == 0  # duplicate skipped
+
+
+def test_apply_memory_batch_remove_missing_entry_is_noop(tmp_path):
+    append_memory(str(tmp_path), "Real entry")
+    summary = apply_memory_batch(
+        str(tmp_path),
+        [{"op": "remove", "entry": "Not present"}],
+    )
+    assert summary["removed"] == 0
+    assert summary["final_entry_count"] == 1

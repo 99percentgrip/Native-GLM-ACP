@@ -330,6 +330,83 @@ def forget_memory(cwd: str, entry: str) -> Path:
     return safe
 
 
+def apply_memory_batch(
+    cwd: str, operations: list[dict[str, str]]
+) -> dict[str, Any]:
+    """Apply add/remove/replace operations atomically against the budget.
+
+    ``operations`` is an ordered list of ``{"op": "add"|"remove", "entry": str}``
+    items. Adds and removes are evaluated against the *final* character budget,
+    so a remove can free space for a subsequent add that would otherwise
+    overflow. Validation (empty, length, credential patterns) runs for every
+    add BEFORE any write, so a bad operation aborts the whole batch.
+
+    Returns a summary dict: ``added``, ``removed``, ``final_chars``, ``budget``.
+    """
+    if not isinstance(operations, list):
+        raise ValueError("operations must be a list")
+    if len(operations) > 50:
+        raise ValueError("At most 50 memory operations per batch")
+    path = memory_path(cwd)
+    safe = _safe_path(Path(cwd), path)
+    if safe is None:
+        raise ValueError("Project memory path escapes the workspace")
+    # Validate every operation up front.
+    normalized_ops: list[tuple[str, str]] = []
+    for raw in operations:
+        if not isinstance(raw, dict):
+            raise ValueError("Each operation must be an object")
+        op = str(raw.get("op", "")).strip().lower()
+        entry = str(raw.get("entry", "")).strip()
+        if op not in {"add", "remove"}:
+            raise ValueError("op must be 'add' or 'remove'")
+        normalized = " ".join(entry.split())
+        if not normalized:
+            raise ValueError("entry cannot be empty")
+        if op == "add":
+            # Reuse the same length + credential checks as append_memory.
+            _validate_learning_text(normalized, "Memory entry", 2000)
+        normalized_ops.append((op, normalized))
+
+    # Read current entries (skip the file-missing case as empty).
+    existing_lines = _bounded_read(safe, MAX_MEMORY_CHARS).splitlines() if safe.exists() else []
+    existing_entries = [
+        line[len("- "):].strip() for line in existing_lines
+        if line.startswith("- ")
+    ]
+
+    # Apply operations against an in-memory list. Replaces are remove-then-add.
+    working = list(existing_entries)
+    added = 0
+    removed = 0
+    for op, entry in normalized_ops:
+        if op == "remove":
+            if entry in working:
+                working.remove(entry)
+                removed += 1
+        else:  # add — skip duplicates, like append_memory does.
+            if entry not in working:
+                working.append(entry)
+                added += 1
+
+    new_text = "\n".join(f"- {entry}" for entry in working).rstrip()
+    if len(new_text) > MAX_MEMORY_CHARS:
+        raise ValueError(
+            f"Batch result would exceed the {MAX_MEMORY_CHARS:,}-character budget "
+            f"({len(new_text):,} chars); remove more entries or shorten the adds"
+        )
+    if working:
+        new_text += "\n"
+    _atomic_write(safe, new_text)
+    return {
+        "added": added,
+        "removed": removed,
+        "final_chars": len(new_text),
+        "budget": MAX_MEMORY_CHARS,
+        "final_entry_count": len(working),
+    }
+
+
 def _validate_learning_text(value: str, label: str, limit: int) -> str:
     text = value.strip()
     if not text:

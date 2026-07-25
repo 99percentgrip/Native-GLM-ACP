@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from types import SimpleNamespace
 
@@ -22,12 +23,15 @@ from glm_acp.terminal_cli import run_chat_command
 from glm_acp.tui import (
     CONFIG_COMMANDS,
     HistoryScreen,
+    JourneyScreen,
     NativeGlmTui,
     PermissionScreen,
     SearchScreen,
     SettingsScreen,
     _extract_message_text,
     _format_session_row,
+    _journey_extract_memory_lines,
+    _journey_extract_profile_lines,
     _read_system_clipboard,
 )
 
@@ -1494,3 +1498,235 @@ async def test_history_command_filters_to_workspace(tmp_path):
     assert isinstance(captured.get("screen"), HistoryScreen)
     # Workspace filter should keep only the same-workspace entry.
     assert [s["session_id"] for s in captured["screen"].sessions] == ["in-workspace"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 features (Hermes-parity): /undo, /prompt, atomic memory batch, /journey
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_undo_command_is_routed_locally(tmp_path):
+    """`/undo` is intercepted by _handle_local_command (not forwarded to the model)."""
+    agent = FakeAgent()
+    forwarded: list[str] = []
+    orig_prompt = agent.prompt
+
+    async def capturing_prompt(*args, **kwargs):
+        forwarded.append("yes")
+        return await orig_prompt(*args, **kwargs)
+
+    agent.prompt = capturing_prompt  # type: ignore[method-assign]
+
+    async def fake_handle(sess, text):
+        return "Nothing to undo"
+
+    agent._handle_command = fake_handle  # type: ignore[method-assign]
+
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Drive the slash command via the composer (the canonical path).
+        composer = app.query_one("#composer", Input)
+        composer.value = "/undo"
+        await composer.action_submit()
+        for _ in range(15):
+            await pilot.pause(0.05)
+
+    # The command was handled locally — never forwarded to the model.
+    assert forwarded == []
+
+
+def test_undo_marker_parsing_extracts_prefill():
+    """The TUI's marker contract with the agent's /undo handler."""
+    response = (
+        "↩️ Undid 1 turn. Last message prefilled for editing:\n\n"
+        "---PROMPT---\nsecond user turn"
+    )
+    marker = "\n---PROMPT---\n"
+    assert marker in response
+    head, prefill = response.split(marker, 1)
+    assert "Undid" in head
+    assert prefill == "second user turn"
+
+
+def test_undo_marker_parsing_handles_truncation_preview():
+    """Long prefills stay within the agent's preview cap before the marker."""
+    long_msg = "x" * 500
+    response = (
+        f"↩️ Undid 1 turn. Last message prefilled for editing:\n\n---PROMPT---\n{long_msg[:397]}…"
+    )
+    marker = "\n---PROMPT---\n"
+    _, prefill = response.split(marker, 1)
+    assert prefill.endswith("…")
+    assert len(prefill) <= 400
+
+
+@pytest.mark.asyncio
+async def test_prompt_command_queues_edited_text(tmp_path):
+    """`/prompt` runs $EDITOR on a tempfile and returns the cleaned prompt.
+
+    Uses a tiny Python fake-editor script so the test runs identically on
+    Linux, macOS, and Windows. Passes the argv list directly to bypass
+    shell-parsing differences across platforms.
+    """
+    # Cross-platform Python fake editor that overwrites the temp file.
+    fake_editor = tmp_path / "fake_editor.py"
+    fake_editor.write_text(
+        "import sys\n"
+        "path = sys.argv[1]\n"
+        "with open(path, 'w', encoding='utf-8') as fh:\n"
+        "    fh.write('# comment line - must be stripped\\n')\n"
+        "    fh.write('Build the feature.\\n')\n"
+        "    fh.write('Then verify with pytest.\\n')\n"
+    )
+    # Pass argv directly so no shell parsing is needed; works on every OS
+    # even when sys.executable or the temp path contains spaces.
+    prompt = await NativeGlmTui._compose_prompt_in_editor([sys.executable, str(fake_editor)])
+    assert "Build the feature" in prompt
+    assert "verify with pytest" in prompt
+    # Comment line was stripped.
+    assert "comment line" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_prompt_command_returns_empty_when_editor_missing(monkeypatch):
+    """Missing editor binary returns empty string (no exception)."""
+    monkeypatch.setenv("VISUAL", "/nonexistent/editor-binary-xyz-abc")
+    monkeypatch.setenv("EDITOR", "")
+    prompt = await NativeGlmTui._compose_prompt_in_editor()
+    assert prompt == ""
+
+
+@pytest.mark.asyncio
+async def test_prompt_command_env_var_parsing_handles_multiword(monkeypatch):
+    """``$VISUAL`` with a quoted multi-word value parses to an argv list."""
+    monkeypatch.setenv("VISUAL", "/usr/bin/env python3 -B")
+    monkeypatch.setenv("EDITOR", "")
+    # We can't actually run python3 -B without a script, so just verify
+    # the parsing path doesn't crash. The helper returns "" because the
+    # bogus argv can't write the temp file.
+    prompt = await NativeGlmTui._compose_prompt_in_editor()
+    assert prompt == ""
+
+
+def test_journey_extract_memory_lines_strips_leading_marker(tmp_path, monkeypatch):
+    mem_file = tmp_path / ".glm-acp" / "memory.md"
+    mem_file.parent.mkdir(parents=True)
+    mem_file.write_text(
+        "- First fact\n"
+        "- Second fact with detail\n"
+        "## Section\n"
+        "free text without marker\n"
+    )
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "cfg"))
+    lines = _journey_extract_memory_lines(str(tmp_path))
+    assert lines == ["First fact", "Second fact with detail"]
+
+
+def test_journey_extract_memory_lines_empty_when_no_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "cfg"))
+    assert _journey_extract_memory_lines(str(tmp_path)) == []
+
+
+def test_journey_extract_profile_lines_strips_category_marker(tmp_path, monkeypatch):
+    profile_dir = tmp_path / "cfg"
+    profile_dir.mkdir()
+    profile_file = profile_dir / "user_profile.md"
+    profile_file.write_text(
+        "- [preference] Always run tests after edits\n"
+        "- [workflow] Use uv\n"
+        "## Unrelated section\n"
+        "free text\n"
+    )
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(profile_dir))
+    monkeypatch.setattr("glm_acp.memory._safe_user_profile_path", lambda: profile_file)
+    monkeypatch.setattr("glm_acp.tui.read_user_profile", lambda: profile_file.read_text())
+    lines = _journey_extract_profile_lines()
+    assert "Always run tests after edits" in lines
+    assert "Use uv" in lines
+
+
+@pytest.mark.asyncio
+async def test_journey_modal_lists_skills_memories_and_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "cfg"))
+
+    skills = [
+        {
+            "name": "release-pipeline",
+            "description": "Ship a release through version → CI → binary",
+            "created_at": "2026-07-20T10:00:00+00:00",
+            "use_count": 5,
+            "state": "active",
+            "pinned": False,
+        },
+        {
+            "name": "old-archived",
+            "description": "Legacy",
+            "created_at": "2026-05-01T08:00:00+00:00",
+            "use_count": 0,
+            "state": "archived",
+            "pinned": False,
+        },
+    ]
+    memories = ["Project uses uv", "Tests in tests/"]
+    profile = ["Always bump versions in 5 files"]
+
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: FakeAgent())
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Use push_screen + callback (not push_screen_wait, which needs a worker).
+        app.push_screen(JourneyScreen(memories, skills, profile))
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, JourneyScreen):
+                break
+        assert isinstance(app.screen, JourneyScreen)
+        # Give the deferred _populate a chance to run.
+        for _ in range(20):
+            await pilot.pause(0.05)
+            listview = app.screen.query_one("#journey-list", ListView)
+            if len(listview.children) > 0:
+                break
+        listview = app.screen.query_one("#journey-list", ListView)
+        # 2 skills + 2 memories + 1 profile = 5 entries
+        assert len(listview.children) == 5
+        # Most recent skill (2026-07-20) should be first. Inspect the Static
+        # widget inside the first ListItem (the list row itself renders as
+        # a Blank, not the row text).
+        first_statics = listview.children[0].query(Static)
+        first_text = " ".join(str(s.render()) for s in first_statics)
+        assert "2026-07-20" in first_text
+        assert "release-pipeline" in first_text
+        await pilot.press("escape")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if not isinstance(app.screen, JourneyScreen):
+                break
+
+
+@pytest.mark.asyncio
+async def test_journey_command_routes_to_modal(tmp_path, monkeypatch):
+    """`/journey` slash command opens the modal without raising."""
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "cfg"))
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    # Stub push_screen_wait so _handle_journey doesn't need a worker context.
+    pushed: list[JourneyScreen] = []
+
+    async def fake_push_wait(screen):
+        pushed.append(screen)
+        return None
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen_wait = fake_push_wait  # type: ignore[method-assign]
+        composer = app.query_one("#composer", Input)
+        composer.value = "/journey"
+        await composer.action_submit()
+        for _ in range(10):
+            await pilot.pause(0.05)
+
+    assert len(pushed) == 1
+    assert isinstance(pushed[0], JourneyScreen)

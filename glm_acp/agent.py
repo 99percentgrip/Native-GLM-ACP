@@ -3193,6 +3193,7 @@ class GlmAcpAgent(acp.Agent):
                         "store_memory",
                         "store_user_profile",
                         "forget_memory",
+                        "update_memory",
                         "learn_skill",
                         "forget_skill",
                         "manage_skill",
@@ -4177,6 +4178,13 @@ class GlmAcpAgent(acp.Agent):
                 description="Export the conversation as a Markdown file",
             ),
             AvailableCommand(
+                name="undo",
+                description=(
+                    "Take back the last N user turns (default 1) and prefill "
+                    "the composer with the most recent removed user message"
+                ),
+            ),
+            AvailableCommand(
                 name="status",
                 description=(
                     "Show current model, plan, API endpoint, permission mode, and context usage"
@@ -4859,6 +4867,59 @@ class GlmAcpAgent(acp.Agent):
             await self._report_usage(session)
             await self._save_session(session)
             return "🧹 Conversation history cleared."
+
+        elif command.startswith("/undo"):
+            arg = command[len("/undo") :].strip()
+            try:
+                n = max(1, min(int(arg), 50)) if arg else 1
+            except ValueError:
+                return "Usage: /undo [N] — N must be a positive integer (max 50)"
+            messages = session.messages
+            # Preserve the leading system message.
+            system_msg = (
+                messages[0]
+                if messages and messages[0].get("role") == "system"
+                else None
+            )
+            body = messages[1:] if system_msg else list(messages)
+            # Walk from the end, removing user turns (each user message plus
+            # any trailing assistant/tool messages up to the previous user msg).
+            removed_user_msgs: list[str] = []
+            while body and len(removed_user_msgs) < n:
+                # Strip trailing non-user messages that belong to the turn
+                # being undone (assistant replies, tool results, etc.).
+                while body and body[-1].get("role") != "user":
+                    body.pop()
+                if not body:
+                    break
+                popped = body.pop()
+                text = popped.get("content")
+                if isinstance(text, str) and text.strip():
+                    removed_user_msgs.append(text.strip())
+            new_messages: list[dict[str, Any]] = (
+                [system_msg] if system_msg else []
+            ) + body
+            removed_count = len(removed_user_msgs)
+            if removed_count == 0:
+                return "Nothing to undo — no prior user turns in this session."
+            session.messages = new_messages
+            session.estimated_tokens = self._estimate_tokens(session.messages)
+            session.last_reported_tokens = -1
+            session.refresh_system_prompt()
+            await self._report_usage(session)
+            await self._save_session(session)
+            # The most recently removed user message goes back into the
+            # composer so the user can edit and resend it. ACP editors see
+            # this as the trailing line of the response; the TUI extracts it.
+            last_user_msg = removed_user_msgs[0]
+            preview = last_user_msg if len(last_user_msg) <= 400 else (
+                last_user_msg[:397] + "…"
+            )
+            return (
+                f"↩️ Undid {removed_count} turn"
+                f"{'s' if removed_count != 1 else ''}. "
+                f"Last message prefilled for editing:\n\n---PROMPT---\n{preview}"
+            )
 
         elif command == "/diff":
             try:
@@ -5975,6 +6036,7 @@ class GlmAcpAgent(acp.Agent):
             "failure_corpus": "Managing failure-driven evaluations",
             "recall_memory": "Reading project memory",
             "store_memory": "Updating project memory",
+            "update_memory": "Batch-updating project memory",
             "recall_user_profile": "Reading user profile",
             "store_user_profile": "Updating user profile",
             "forget_memory": "Forgetting durable memory",

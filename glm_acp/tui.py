@@ -59,6 +59,7 @@ from .config import (
     thought_levels_for_model,
 )
 from .glm_client import PlanUsage
+from .memory import list_learned_skills, read_memory, read_user_profile
 
 LOCAL_COMMANDS = {
     "/plan": "Switch between Coding Plan, Standard API, and BigModel (CN)",
@@ -82,6 +83,9 @@ LOCAL_COMMANDS = {
     "/history": "Browse and resume past sessions (or press F6)",
     "/search": "Grep the current conversation (or press Ctrl-F)",
     "/export": "Export current session: /export [md|json] [file|clip] (default md clip)",
+    "/undo": "Take back the last N user turns (default 1); prefills the composer",
+    "/prompt": "Compose your next prompt in $EDITOR (multi-line markdown)",
+    "/journey": "Show the timeline of memories + skills + profile learned over time",
     "/native-mouse": "Toggle native terminal mouse mode (release TUI mouse capture)",
     "/planmode": "Activate Plan Mode with a PRD: /planmode <your requirements>",
     "/export last": "Export the last response to a Markdown file",
@@ -497,6 +501,40 @@ class SettingsScreen(ModalScreen[dict[str, str] | None]):
         thought_select.value = current if current in levels else "enabled"
 
 
+def _journey_extract_memory_lines(cwd: str) -> list[str]:
+    """Pull plain-text memory entries (strip the leading '- ' marker)."""
+    try:
+        text = read_memory(cwd)
+    except Exception:
+        return []
+    if not text or text.startswith("No durable project memory"):
+        return []
+    lines: list[str] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("- "):
+            lines.append(stripped[2:].strip())
+    return lines
+
+
+def _journey_extract_profile_lines() -> list[str]:
+    """Pull plain-text user-profile entries (strip the '- [category] ' marker)."""
+    try:
+        text = read_user_profile()
+    except Exception:
+        return []
+    if not text or text.startswith("No private"):
+        return []
+    lines: list[str] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        # Profile entries look like '- [preference] the fact'
+        match = re.match(r"^- \[[a-z-]+\] (.+)$", stripped)
+        if match:
+            lines.append(match.group(1).strip())
+    return lines
+
+
 def _format_session_row(meta: dict[str, Any]) -> tuple[str, str]:
     """Format a SessionStore.list() row into (first_line, second_line)."""
     title = meta.get("title") or "Untitled session"
@@ -682,6 +720,128 @@ class SearchScreen(ModalScreen[tuple[int, str] | None]):
             return
         _ordinal, _role, _snippet, full_text = self._matches[idx]
         self.dismiss((idx, full_text))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class JourneyScreen(ModalScreen[None]):
+    """`/journey` — chronological timeline of memories + skills + profile.
+
+    Pure presentation: pulls from the existing durable storage helpers
+    (read_memory, list_learned_skills, read_user_profile). No new
+    persistence. Cancel-only modal (Esc or q).
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("q", "cancel", "Cancel", priority=True),
+    ]
+
+    CSS = """
+    JourneyScreen { align: center middle; background: $background 70%; }
+    #journey-dialog {
+        width: 92; max-width: 96%; height: 86%;
+        border: thick $accent; background: $surface; padding: 1 2;
+    }
+    #journey-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    #journey-list { height: 1fr; border: solid $panel; }
+    #journey-hint { color: $text-muted; height: 1; margin-top: 1; }
+    """
+
+    def __init__(
+        self,
+        memories: list[str],
+        skills: list[dict[str, Any]],
+        profile: list[str],
+    ) -> None:
+        super().__init__()
+        self.memories = memories
+        self.skills = skills
+        self.profile = profile
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="journey-dialog"):
+            yield Label("Learning journey", id="journey-title")
+            yield ListView(id="journey-list")
+            yield Static(
+                "↑↓ scroll  ·  Esc / q close",
+                id="journey-hint",
+                markup=False,
+            )
+
+    def on_mount(self) -> None:
+        # Defer population until the ListView is fully mounted.
+        self.call_after_refresh(self._populate)
+
+    def _populate(self) -> None:
+        from datetime import datetime as _dt
+
+        entries: list[tuple[str, str | None, str, str]] = []
+        # Skills — most rich data, have timestamps.
+        for skill in self.skills:
+            created = skill.get("created_at")
+            when: str | None
+            if isinstance(created, str) and created:
+                try:
+                    when = _dt.fromisoformat(created.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+                except ValueError:
+                    when = created[:10]
+            else:
+                when = None
+            uses = int(skill.get("use_count", 0) or 0)
+            state_marker = "📌 " if skill.get("pinned") else (
+                "📦 " if skill.get("state") == "archived" else "✓ "
+            )
+            summary = f"{skill.get('description', '') or '(no description)'}"
+            if uses:
+                summary += f"  · {uses} use{'s' if uses != 1 else ''}"
+            entries.append((
+                when or "—",
+                when,
+                f"{state_marker}skill · {escape(str(skill.get('name', '')))}",
+                escape(summary),
+            ))
+        # Project memory — no timestamps; show file order as "memory".
+        for entry in self.memories:
+            entries.append((
+                "—",
+                None,
+                "✓ memory",
+                escape(entry),
+            ))
+        # User profile — no timestamps either.
+        for entry in self.profile:
+            entries.append((
+                "—",
+                None,
+                "✓ profile",
+                escape(entry),
+            ))
+        # Sort by date desc (skills with timestamps first), then alphabetic.
+        entries.sort(key=lambda e: (e[1] or "", e[0]), reverse=True)
+        listview = self.query_one("#journey-list", ListView)
+        if not entries:
+            listview.append(
+                ListItem(
+                    Static(
+                        "[dim]Nothing learned yet. The agent stores memories and "
+                        "skills after verified tasks.[/dim]",
+                        markup=True,
+                    )
+                )
+            )
+            return
+        for when, _sortable, kind, summary in entries:
+            listview.append(
+                ListItem(
+                    Static(
+                        f"[bold]{escape(when)}[/bold]  [dim]{kind}[/dim]",
+                        markup=True,
+                    ),
+                    Static(f"  {summary}", markup=True),
+                )
+            )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1242,6 +1402,15 @@ class NativeGlmTui(App[int]):
             return True
         if text == "/search":
             await self.action_open_search()
+            return True
+        if text == "/undo" or text.startswith("/undo "):
+            await self._handle_undo(text)
+            return True
+        if text == "/prompt":
+            await self._handle_prompt_editor()
+            return True
+        if text == "/journey":
+            await self._handle_journey()
             return True
         if text == "/export":
             await self._export_session("")
@@ -2084,9 +2253,120 @@ class NativeGlmTui(App[int]):
         )
         await refreshers[view]()
 
+    async def _handle_journey(self) -> None:
+        """`/journey` — show memories + skills + profile as a timeline."""
+        cwd = self._session_cwd()
+        try:
+            memories = await asyncio.to_thread(_journey_extract_memory_lines, cwd)
+            skills = await asyncio.to_thread(list_learned_skills, cwd)
+            profile = await asyncio.to_thread(_journey_extract_profile_lines)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.notify(f"Journey failed: {exc}", severity="error")
+            return
+        await self.push_screen_wait(
+            JourneyScreen(memories=memories, skills=skills, profile=profile)
+        )
+
     def _session_cwd(self) -> str:
         session = getattr(self.agent, "_sessions", {}).get(self.session_id)
         return str(getattr(session, "cwd", os.getcwd()))
+
+    async def _handle_undo(self, text: str) -> None:
+        """`/undo [N]` — pop N user turns via the shared agent, prefill composer."""
+        session = getattr(self.agent, "_sessions", {}).get(self.session_id)
+        if session is None:
+            self.notify("Session not ready", severity="warning")
+            return
+        if self._prompt_worker is not None:
+            self.notify("Finish the current turn before undoing", severity="warning")
+            return
+        try:
+            response = await self.agent._handle_command(session, text)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.notify(f"Undo failed: {exc}", severity="error")
+            return
+        # The agent returns the response with an optional "---PROMPT---"
+        # marker carrying the most recent removed user message.
+        marker = "\n---PROMPT---\n"
+        if marker in response:
+            head, prefill = response.split(marker, 1)
+            await self._append_system(head.strip())
+            composer = self.query_one("#composer", Input)
+            composer.value = prefill
+            composer.cursor_position = len(composer.value)
+            composer.focus()
+            self.notify("Last message prefilled — edit and resend", severity="information")
+        else:
+            await self._append_system(response)
+            self.query_one("#composer", Input).focus()
+
+    async def _handle_prompt_editor(self) -> None:
+        """`/prompt` — open $EDITOR on a tempfile and queue the result."""
+        if self._prompt_worker is not None:
+            self.notify("Finish the current turn first", severity="warning")
+            return
+        prompt = await self._compose_prompt_in_editor()
+        if not prompt:
+            return
+        # Inject the prompt into the composer and submit so it routes through
+        # the normal queueing path (which respects in-flight turns).
+        composer = self.query_one("#composer", CommandInput)
+        composer.value = prompt.replace("\n", " ").strip()
+        await composer.action_submit()
+
+    @staticmethod
+    async def _compose_prompt_in_editor(editor_argv: list[str] | None = None) -> str:
+        """Run $VISUAL/$EDITOR on a tempfile and return the cleaned prompt.
+
+        If ``editor_argv`` is provided (e.g. by tests), it bypasses env-var
+        parsing entirely — callers supply the ready argv list. Otherwise the
+        ``$VISUAL``/``$EDITOR`` env var is shell-parsed (POSIX-aware).
+        Returns an empty string if the user saved an empty file or the
+        editor was unavailable. Comment lines starting with '#' are stripped.
+        """
+        import shlex
+        import tempfile
+
+        if editor_argv is None:
+            editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+            try:
+                editor_argv = shlex.split(editor, posix=(os.name != "nt"))
+            except ValueError:
+                editor_argv = editor.split()
+        if not editor_argv:
+            return ""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", delete=False, encoding="utf-8"
+        ) as fh:
+            fh.write(
+                "# Compose your prompt below this line.\n"
+                "# Lines starting with '#' are stripped. Save and quit to send.\n\n"
+            )
+            temp_path = fh.name
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *editor_argv, temp_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+        except (FileNotFoundError, OSError):
+            return ""
+        except Exception:  # pragma: no cover - defensive
+            return ""
+        try:
+            with open(temp_path, encoding="utf-8") as fh:
+                raw = fh.read()
+        finally:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        cleaned_lines = [
+            line for line in raw.splitlines()
+            if not line.lstrip().startswith("#")
+        ]
+        return "\n".join(cleaned_lines).strip()
 
     async def _refresh_wt_changes(self) -> None:
         widget = self.query_one("#wt-changes", VerticalScroll)

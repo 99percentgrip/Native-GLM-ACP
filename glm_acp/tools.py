@@ -23,6 +23,7 @@ from .diagnostics import syntax_diagnostics
 from .memory import (
     append_memory,
     append_user_profile,
+    apply_memory_batch,
     curate_learned_skills,
     discard_skill_evolution,
     draft_skill_evolution,
@@ -571,6 +572,36 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "update_memory",
+            "description": (
+                "Atomically apply a batch of add/remove project-memory operations against "
+                "the final character budget. Removes are evaluated before adds, so a "
+                "remove can free space for a subsequent add. Use this when you need to "
+                "consolidate multiple facts in one call instead of fighting the budget "
+                "across several turns. Each operation is {op: 'add'|'remove', entry: str}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": {"type": "string", "enum": ["add", "remove"]},
+                                "entry": {"type": "string"},
+                            },
+                            "required": ["op", "entry"],
+                        },
+                    }
+                },
+                "required": ["operations"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "session_search",
             "description": (
                 "Search prior conversations when the user refers to earlier work. With no "
@@ -1061,6 +1092,7 @@ TOOL_KINDS: dict[str, str] = {
     "update_deliberation": "other",
     "recall_memory": "read",
     "store_memory": "edit",
+    "update_memory": "edit",
     "recall_user_profile": "read",
     "store_user_profile": "edit",
     "forget_memory": "edit",
@@ -1214,6 +1246,23 @@ async def execute_tool(
             else:
                 raise ToolError("Memory scope must be project or user")
             return ToolResult(output=f"Forgot {scope} memory entry from {path}")
+        elif name == "update_memory":
+            sandbox.resolve(str(memory_path(str(sandbox.roots[0]))))
+            operations = arguments.get("operations") or []
+            if not isinstance(operations, list):
+                raise ToolError("operations must be a list of {op, entry} objects")
+            summary = await asyncio.to_thread(
+                apply_memory_batch, str(sandbox.roots[0]), operations
+            )
+            return ToolResult(
+                output=(
+                    f"Memory batch applied: +{summary['added']} added, "
+                    f"-{summary['removed']} removed, "
+                    f"{summary['final_entry_count']} entries, "
+                    f"{summary['final_chars']:,}/{summary['budget']:,} chars used"
+                ),
+                file_path=str(memory_path(str(sandbox.roots[0]))),
+            )
         elif name == "list_skills":
             skills = await asyncio.to_thread(list_learned_skills, str(sandbox.roots[0]))
             if not skills:
