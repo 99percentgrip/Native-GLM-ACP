@@ -96,6 +96,8 @@ LOCAL_COMMANDS = {
     "/release": "Cut a release from the workspace (/release [patch|minor|major])",
     "/insights": "Analyze the session for friction points and improvement opportunities",
     "/loop": "Run a prompt repeatedly at an interval (/loop 5m check CI status, /loop stop)",
+    "/security-review": "Scan the working-tree diff for security vulnerabilities",
+    "/rewind": "Alias for /rollback — rewind conversation to a prior checkpoint",
     # Agent-side commands (implemented in the shared runtime; listed here so
     # they appear in the /-menu and the Ctrl+P command palette for discovery).
     "/status": "Show session, model, permissions, context, and live evidence",
@@ -1969,6 +1971,17 @@ class NativeGlmTui(App[int]):
         if text == "/loop" or text.startswith("/loop "):
             arg = text.partition(" ")[2].strip()
             await self.action_loop(arg)
+            return True
+        if text == "/security-review":
+            review = await self.agent.security_review(self.session_id)
+            await self._append_system(review)
+            self.notify("Security review complete — see transcript", severity="information")
+            return True
+        if text == "/rewind" or text.startswith("/rewind "):
+            # Alias for /rollback — insert into composer for review.
+            arg = text.partition(" ")[2].strip()
+            cmd = f"/rollback {arg}" if arg else "/rollback"
+            self.insert_command(cmd)
             return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)

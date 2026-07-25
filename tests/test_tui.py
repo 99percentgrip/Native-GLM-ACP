@@ -110,6 +110,14 @@ class FakeAgent:
         agent._sessions = self._sessions
         return await agent.generate_insights(session_id)
 
+    async def security_review(self, session_id):
+        """Tier 4 test double — delegate to the real GlmAcpAgent method."""
+        from glm_acp.agent import GlmAcpAgent
+
+        agent = GlmAcpAgent.__new__(GlmAcpAgent)
+        agent._sessions = self._sessions
+        return await agent.security_review(session_id)
+
     async def query_provider_usage(self, session_id):
         self.usage_calls += 1
         return PlanUsage(

@@ -1063,6 +1063,157 @@ class GlmAcpAgent(acp.Agent):
             logger.warning("Auxiliary insights generation failed", exc_info=True)
             return fallback
 
+    async def security_review(self, session_id: str) -> str:
+        """Review the working-tree diff for security vulnerabilities.
+
+        Gets the git diff from the session's workspace, then either:
+        - Uses the auxiliary GLM for an LLM-based security review, or
+        - Falls back to a local regex heuristic that flags hardcoded
+          secrets, SQL/command injection patterns, and disabled security
+          checks.
+
+        The diff content is wrapped with :func:`wrap_untrusted_output`
+        so repository content cannot issue promptware against the
+        auxiliary reviewer.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            return "Session not ready."
+
+        # Get the working-tree diff.
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "diff",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=session.cwd,
+            )
+            stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            diff_text = stdout_b.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return "❌ Could not read git diff (not a git repo or git error)."
+
+        if not diff_text:
+            return "✅ No uncommitted changes to review."
+
+        # Truncate to keep the auxiliary call bounded.
+        diff_for_review = diff_text[:6000]
+
+        # Local heuristic: always run this (it catches things the LLM might miss).
+        local_findings = self._local_security_scan(diff_for_review)
+
+        if session.auxiliary_model == DEFAULT_AUXILIARY_MODEL:
+            if local_findings:
+                return (
+                    "🔍 **Security review (local heuristic)**\n\n"
+                    + "\n".join(f"- {f}" for f in local_findings)
+                    + "\n\n_Set an auxiliary model for AI-powered deeper review._"
+                )
+            return (
+                "✅ No obvious security issues detected by the local heuristic. "
+                "Set an auxiliary model (e.g. /auxiliary glm-5-turbo) for a deeper AI review."
+            )
+
+        # Auxiliary GLM review.
+        client = self._aux_client_for_session(session)
+        try:
+            client.begin_turn()
+            result = await client.complete_auxiliary(
+                "Review this git diff for security vulnerabilities. Check for: "
+                "hardcoded secrets/credentials, SQL injection, command injection, "
+                "path traversal, insecure deserialization, disabled authentication/"
+                "authorization, and exposed sensitive data. Return 0-4 bullet points "
+                "starting with '-', or 'No security issues found' if clean. "
+                "Do NOT mention that you are reviewing a diff.",
+                wrap_untrusted_output(diff_for_review, "security-diff"),
+                max_tokens=300,
+            )
+            self._record_auxiliary_usage(session, result.usage)
+            ai_findings = result.content.strip()
+            # Combine AI findings with local heuristic if both have results.
+            if local_findings and "no security issues" not in ai_findings.lower():
+                return (
+                    f"🔍 **Security review**\n\n"
+                    f"**AI review:**\n{ai_findings}\n\n"
+                    f"**Local heuristic also flagged:**\n"
+                    + "\n".join(f"- {f}" for f in local_findings)
+                )
+            return f"🔍 **Security review**\n\n{ai_findings}"
+        except Exception:
+            logger.warning("Auxiliary security review failed", exc_info=True)
+            if local_findings:
+                return (
+                    "🔍 **Security review (local heuristic — AI review failed)**\n\n"
+                    + "\n".join(f"- {f}" for f in local_findings)
+                )
+            return "❌ Security review failed — check your auxiliary model."
+
+    @staticmethod
+    def _local_security_scan(diff_text: str) -> list[str]:
+        """Flag obvious security issues in a diff using regex heuristics."""
+        import re
+
+        findings: list[str] = []
+        # Only look at added lines (starting with '+' but not '+++').
+        added_lines = [
+            line[1:] for line in diff_text.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ]
+        added_text = "\n".join(added_lines)
+
+        # Hardcoded API keys / tokens (common patterns).
+        secret_patterns = [
+            (
+                r"(?:api[_-]?key|secret|token|password|passwd|credential)"
+                r"\s*[:=]\s*['\"]?[A-Za-z0-9/_\-+=]{20,}['\"]?",
+                "hardcoded secret/credential",
+            ),
+            (r"AKIA[0-9A-Z]{16}", "AWS access key ID"),
+            (r"sk-[A-Za-z0-9]{20,}", "API key (sk- prefix)"),
+            (
+                r"Bearer\s+[A-Za-z0-9._~+/=-]{20,}",
+                "hardcoded Bearer token",
+            ),
+            (
+                r"-----BEGIN (?:RSA |EC |)PRIVATE KEY-----",
+                "private key material",
+            ),
+        ]
+        for pattern, label in secret_patterns:
+            if re.search(pattern, added_text, re.IGNORECASE):
+                findings.append(f"Possible {label} in added lines")
+
+        # SQL injection (string-formatted queries).
+        sql_pat = (
+            r"(?:SELECT|INSERT|UPDATE|DELETE|DROP).*%s"
+            r".*(?:execute|cursor)"
+        )
+        if re.search(sql_pat, added_text, re.IGNORECASE):
+            findings.append("Possible SQL injection (string-formatted query)")
+
+        # Command injection (shell=True with f-strings).
+        has_shell = "shell=True" in added_text
+        has_format = (
+            'f"' in added_text
+            or "f'" in added_text
+            or ".format(" in added_text
+        )
+        if has_shell and has_format:
+            findings.append(
+                "Possible command injection (shell=True with formatted string)"
+            )
+
+        # Disabled TLS verification.
+        if "verify=False" in added_text or "ssl._create_unverified_context" in added_text:
+            findings.append("TLS verification disabled")
+
+        # eval/exec with user input.
+        if re.search(r"\b(?:eval|exec)\s*\(", added_text):
+            findings.append("Use of eval/exec (code injection risk)")
+
+        return findings
+
     async def _rank_recall_results(
         self,
         session: Session,

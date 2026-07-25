@@ -316,6 +316,14 @@ async def _handle_plain_command(
             return "skip"
         print(f"Insights:\n{insights}", file=sys.stderr)
         return "skip"
+    if stripped == "/security-review":
+        try:
+            review = await agent.security_review(session_id)
+        except Exception as error:  # noqa: BLE001 — surface any failure plainly
+            print(f"Security review failed: {error}", file=sys.stderr)
+            return "skip"
+        print(review, file=sys.stderr)
+        return "skip"
         return "skip"
     if stripped == "/max-iterations" or text.startswith("/max-iterations "):
         arg = text.partition(" ")[2].strip()

@@ -1442,6 +1442,43 @@ class TestSessionInsights:
         assert "1 user turn" in insights.lower()
 
 
+class TestSecurityReview:
+    """Tier 4: ``/security-review`` working-tree diff vulnerability scan."""
+
+    def test_local_scan_detects_hardcoded_secrets(self):
+        diff = '+api_key = "sk-abcdefghij1234567890abcdefgh"\n'
+        findings = GlmAcpAgent._local_security_scan(diff)
+        assert any("secret" in f.lower() or "api key" in f.lower() for f in findings)
+
+    def test_local_scan_detects_eval(self):
+        diff = '+result = eval(user_input)\n'
+        findings = GlmAcpAgent._local_security_scan(diff)
+        assert any("eval" in f.lower() for f in findings)
+
+    def test_local_scan_detects_tls_disabled(self):
+        diff = '+requests.get(url, verify=False)\n'
+        findings = GlmAcpAgent._local_security_scan(diff)
+        assert any("tls" in f.lower() for f in findings)
+
+    def test_local_scan_clean_diff_returns_empty(self):
+        diff = '+x = 1\n+y = 2\n'
+        findings = GlmAcpAgent._local_security_scan(diff)
+        assert findings == []
+
+    def test_local_scan_ignores_removed_lines(self):
+        # Only added lines (starting with +) should be scanned.
+        diff = '-api_key = "sk-oldkey1234567890abcdef"\n+api_key = os.environ["KEY"]\n'
+        findings = GlmAcpAgent._local_security_scan(diff)
+        # The removed line has the secret but should NOT be flagged;
+        # the added line is clean.
+        assert findings == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_returns_not_ready(self, agent):
+        review = await agent.security_review("nonexistent-session-id")
+        assert "not ready" in review.lower()
+
+
 class TestSetSessionMode:
     @pytest.mark.asyncio
     async def test_valid_mode(self, agent, session):
@@ -2091,7 +2128,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.7.10"
+        assert resp.agent_info.version == "2.7.11"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):
