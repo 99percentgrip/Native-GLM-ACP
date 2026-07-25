@@ -1136,8 +1136,9 @@ async def test_tui_composer_stays_enabled_and_queues_prompts_during_turn(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_tui_working_tree_panel_toggles_and_cycles_four_views(tmp_path):
-    """F4 opens the working-tree panel; repeated F4 cycles through all 4 views then closes."""
+async def test_tui_working_tree_panel_toggles_and_cycles_five_views(tmp_path):
+    """F4 opens the working-tree panel; repeated F4 cycles through all 5 views
+    (Changes → Git → Diff → Files → GitHub) then closes."""
     (tmp_path / "hello.py").write_text("print('hi')")
     agent = FakeAgent()
     app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
@@ -1169,6 +1170,14 @@ async def test_tui_working_tree_panel_toggles_and_cycles_four_views(tmp_path):
 
         files_widget = app.query_one("#wt-files", VerticalScroll)
         assert len(list(files_widget.children)) > 0
+
+        await pilot.press("f4")
+        await pilot.pause(0.15)
+        assert switcher.current == "wt-github"
+
+        # GitHub view should have at least the branch-name line.
+        gh_widget = app.query_one("#wt-github", VerticalScroll)
+        assert len(list(gh_widget.children)) > 0
 
         await pilot.press("f4")
         await pilot.pause(0.1)

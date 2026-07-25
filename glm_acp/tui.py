@@ -1735,10 +1735,15 @@ class NativeGlmTui(App[int]):
                     VerticalScroll(id="wt-git"),
                     VerticalScroll(id="wt-diff"),
                     VerticalScroll(id="wt-files"),
+                    VerticalScroll(id="wt-github"),
                     initial="wt-changes",
                     id="wt-switcher",
                 )
-                yield Static("[1]Changes [2]Git [3]Diff [4]Files  (F4)", id="wt-tabs", markup=False)
+                yield Static(
+                    "[1]Changes [2]Git [3]Diff [4]Files [5]GitHub  (F4)",
+                    id="wt-tabs",
+                    markup=False,
+                )
             with Vertical(id="conversation"):
                 yield VerticalScroll(id="transcript")
                 yield RichLog(
@@ -3244,15 +3249,15 @@ class NativeGlmTui(App[int]):
             await self._switch_wt_view(0)
             return
         self._wt_view += 1
-        if self._wt_view >= 4:
+        if self._wt_view >= 5:
             self._wt_visible = False
             panel.add_class("hidden")
             self.notify("Working tree panel closed", severity="information")
         else:
             await self._switch_wt_view(self._wt_view)
 
-    _WT_VIEW_IDS = ("wt-changes", "wt-git", "wt-diff", "wt-files")
-    _WT_VIEW_LABELS = ("Changes", "Git", "Diff", "Files")
+    _WT_VIEW_IDS = ("wt-changes", "wt-git", "wt-diff", "wt-files", "wt-github")
+    _WT_VIEW_LABELS = ("Changes", "Git", "Diff", "Files", "GitHub")
 
     async def _switch_wt_view(self, view: int) -> None:
         switcher = self.query_one("#wt-switcher", ContentSwitcher)
@@ -3270,6 +3275,7 @@ class NativeGlmTui(App[int]):
             self._refresh_wt_git,
             self._refresh_wt_diff,
             self._refresh_wt_files,
+            self._refresh_wt_github,
         )
         await refreshers[view]()
 
@@ -3444,6 +3450,81 @@ class NativeGlmTui(App[int]):
             if shown >= 200:
                 await widget.mount(Static(f"… ({len(entries) - shown} more)", markup=False))
                 break
+
+    async def _refresh_wt_github(self) -> None:
+        """Populate the GitHub view: PR for current branch + assigned issues."""
+        widget = self.query_one("#wt-github", VerticalScroll)
+        await widget.remove_children()
+        cwd = self._session_cwd()
+
+        # Get current branch.
+        branch = self._run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+        branch = branch.strip() if branch else "(unknown)"
+        await widget.mount(Static(f"Branch: {branch}", markup=False))
+
+        # Try gh CLI for PR + issues.
+        async def _gh(args: list[str]) -> str | None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "gh", *args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd,
+                )
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                return out.decode() if proc.returncode == 0 else None
+            except Exception:
+                return None
+
+        # PRs for this branch.
+        pr_json = await _gh([
+            "pr", "list", "--head", branch,
+            "--json", "number,title,state,isDraft,reviewDecision",
+            "--limit", "5",
+        ])
+        if pr_json is not None:
+            try:
+                prs = json.loads(pr_json)
+            except json.JSONDecodeError:
+                prs = []
+            await widget.mount(Static("", markup=False))  # spacer
+            if prs:
+                await widget.mount(Static("Pull Requests", markup=False))
+                for pr in prs:
+                    marker = "🔵" if pr.get("isDraft") else "🟢"
+                    review = pr.get("reviewDecision", "")
+                    review_str = f"  review:{review}" if review else ""
+                    await widget.mount(Static(
+                        f"  {marker} #{pr['number']} {pr['title']}{review_str}",
+                        markup=False,
+                    ))
+            else:
+                await widget.mount(Static("No open PRs for this branch.", markup=False))
+        else:
+            await widget.mount(Static("", markup=False))
+            await widget.mount(Static("(gh not available or not authenticated)", markup=False))
+
+        # Assigned issues.
+        issue_json = await _gh([
+            "issue", "list", "--assignee", "@me",
+            "--json", "number,title,state",
+            "--limit", "5",
+        ])
+        if issue_json is not None:
+            try:
+                issues = json.loads(issue_json)
+            except json.JSONDecodeError:
+                issues = []
+            await widget.mount(Static("", markup=False))
+            if issues:
+                await widget.mount(Static("Assigned Issues", markup=False))
+                for issue in issues:
+                    await widget.mount(Static(
+                        f"  #{issue['number']} {issue['title']}",
+                        markup=False,
+                    ))
+            else:
+                await widget.mount(Static("No issues assigned to you.", markup=False))
 
     @staticmethod
     def _run_git(cwd: str, *args: str) -> str | None:
