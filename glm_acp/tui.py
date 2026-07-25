@@ -95,6 +95,7 @@ LOCAL_COMMANDS = {
     "/tasks": "Show the session dashboard (turn state, queue, tokens, model, context)",
     "/release": "Cut a release from the workspace (/release [patch|minor|major])",
     "/insights": "Analyze the session for friction points and improvement opportunities",
+    "/loop": "Run a prompt repeatedly at an interval (/loop 5m check CI status, /loop stop)",
     # Agent-side commands (implemented in the shared runtime; listed here so
     # they appear in the /-menu and the Ctrl+P command palette for discovery).
     "/status": "Show session, model, permissions, context, and live evidence",
@@ -1687,6 +1688,12 @@ class NativeGlmTui(App[int]):
         # via ``/theme`` are persisted by ``watch_theme``.
         self._saved_theme: str | None = load_theme_config()
         self._theme_persist_scheduled = False
+        # /loop state: an in-session ad-hoc prompt iterator (distinct from
+        # the persistent cron subsystem). When active, _loop_timer fires
+        # every _loop_interval_seconds and submits _loop_prompt.
+        self._loop_timer: Timer | None = None
+        self._loop_prompt: str = ""
+        self._loop_interval_seconds: float = 0.0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1958,6 +1965,10 @@ class NativeGlmTui(App[int]):
             insights = await self.agent.generate_insights(self.session_id)
             await self._append_system(f"Insights:\n{insights}")
             self.notify("Insights generated — see transcript", severity="information")
+            return True
+        if text == "/loop" or text.startswith("/loop "):
+            arg = text.partition(" ")[2].strip()
+            await self.action_loop(arg)
             return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)
@@ -2957,6 +2968,108 @@ class NativeGlmTui(App[int]):
     async def action_open_tasks(self) -> None:
         """``/tasks``: show the session dashboard (turn state, queue, stats)."""
         await self.push_screen(TasksScreen(self._tasks_snapshot()))
+
+    @staticmethod
+    def _parse_loop_interval(arg: str) -> float | None:
+        """Parse ``30s``, ``5m``, ``1h``, or a bare number into seconds."""
+        arg = arg.strip().lower()
+        if not arg:
+            return None
+        multipliers = {"s": 1.0, "m": 60.0, "h": 3600.0}
+        if arg[-1] in multipliers:
+            try:
+                return float(arg[:-1]) * multipliers[arg[-1]]
+            except ValueError:
+                return None
+        try:
+            return float(arg)
+        except ValueError:
+            return None
+
+    async def action_loop(self, arg: str) -> None:
+        """``/loop [interval] [prompt]``: run a prompt repeatedly at an interval.
+
+        In-session ad-hoc iteration (distinct from the persistent cron
+        subsystem). Examples::
+
+            /loop 5m check if the deploy finished
+            /loop 30s re-run the tests
+            /loop stop
+
+        The loop fires immediately on start and then every ``interval``.
+        Prompts that fire while a turn is running are queued in the FIFO.
+        """
+        stripped = arg.strip()
+        # /loop stop / /loop (bare) → cancel
+        if not stripped or stripped.lower() in {"stop", "cancel", "off", "clear"}:
+            if self._loop_timer is not None:
+                self._loop_timer.stop()
+                self._loop_timer = None
+                self._loop_prompt = ""
+                self._loop_interval_seconds = 0.0
+                self.notify("Loop stopped", severity="information")
+            else:
+                self.notify("No active loop", severity="information")
+            return
+
+        parts = stripped.split(None, 1)
+        if len(parts) < 2:
+            self.notify(
+                "Usage: /loop <interval> <prompt>  (e.g. /loop 5m check CI status)",
+                severity="warning",
+            )
+            return
+
+        interval_str, prompt = parts
+        interval = self._parse_loop_interval(interval_str)
+        if interval is None or interval < 5:
+            self.notify(
+                f"Invalid interval: {interval_str!r} — use e.g. 30s, 5m, 1h (min 5s)",
+                severity="error",
+            )
+            return
+
+        # Stop any existing loop first.
+        if self._loop_timer is not None:
+            self._loop_timer.stop()
+
+        self._loop_prompt = prompt
+        self._loop_interval_seconds = interval
+        self._loop_timer = self.set_interval(
+            interval,
+            self._loop_tick,
+            name=f"loop-{interval_str}",
+        )
+        # Fire immediately on start.
+        self.call_later(self._loop_tick)
+        mins, secs = divmod(int(interval), 60)
+        time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
+        preview = prompt[:60].replace("\n", " ")
+        self.notify(f"Loop every {time_str}: {preview}…", severity="success")
+
+    def _loop_tick(self) -> None:
+        """Submit the loop prompt (queued if a turn is running)."""
+        if not self._loop_prompt or not self._agent_ready:
+            return
+        text = self._loop_prompt
+        if self._prompt_worker is not None:
+            # Queue with a loop marker so the user can distinguish it.
+            self._prompt_queue.append(f"🔄 {text}")
+            self._refresh_queue_display()
+            return
+        # Submit directly — schedule the async submit on the event loop.
+        self.call_later(self._submit_loop_prompt, text)
+
+    async def _submit_loop_prompt(self, text: str) -> None:
+        """Append + submit a loop prompt (mirrors submit_input's core path)."""
+        await self._append_user(f"🔄 Loop: {text}")
+        self._current_agent = None
+        self._current_agent_text = ""
+        self._thinking_text = ""
+        self.query_one("#thinking", RichLog).clear()
+        self._refresh_session_panel("Running")
+        self._set_activity("Thinking", active=True)
+        self._prompt_worker = self.run_prompt(text, [])
 
     async def run_compact_from_context_view(self) -> None:
         """Run ``/compact`` after the context-view modal signals it (press ``c``).

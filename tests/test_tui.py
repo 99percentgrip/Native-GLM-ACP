@@ -1739,6 +1739,58 @@ async def test_tui_insights_command_appends_to_transcript(tmp_path):
         app.exit(0)
 
 
+def test_tui_loop_interval_parser_handles_units():
+    """Tier 4: ``_parse_loop_interval`` handles s/m/h suffixes and bare numbers."""
+    assert NativeGlmTui._parse_loop_interval("30s") == 30.0
+    assert NativeGlmTui._parse_loop_interval("5m") == 300.0
+    assert NativeGlmTui._parse_loop_interval("1h") == 3600.0
+    assert NativeGlmTui._parse_loop_interval("120") == 120.0
+    assert NativeGlmTui._parse_loop_interval("2.5m") == 150.0
+    assert NativeGlmTui._parse_loop_interval("abc") is None
+    assert NativeGlmTui._parse_loop_interval("") is None
+
+
+@pytest.mark.asyncio
+async def test_tui_loop_command_starts_and_stops(tmp_path):
+    """Tier 4: ``/loop 5s test prompt`` starts a timer; ``/loop stop`` cancels."""
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+
+        # Start a loop with a 999s interval (won't actually fire during the test).
+        handled = await app._handle_local_command("/loop 999s check CI status")
+        assert handled is True
+        assert app._loop_timer is not None
+        assert app._loop_prompt == "check CI status"
+        assert app._loop_interval_seconds == 999.0
+
+        # Stop the loop.
+        handled = await app._handle_local_command("/loop stop")
+        assert handled is True
+        assert app._loop_timer is None
+        assert app._loop_prompt == ""
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_loop_command_rejects_invalid_interval(tmp_path):
+    """Tier 4: ``/loop abc <prompt>`` notifies error and does not start."""
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+
+        handled = await app._handle_local_command("/loop abc check CI status")
+        assert handled is True
+        # No timer should have been created.
+        assert app._loop_timer is None
+        assert app._loop_prompt == ""
+        app.exit(0)
+
+
 @pytest.mark.asyncio
 async def test_tui_refresh_session_panel_hides_disabled_segments(tmp_path, monkeypatch):
     """When segments are toggled off, ``_refresh_session_panel`` omits them."""
