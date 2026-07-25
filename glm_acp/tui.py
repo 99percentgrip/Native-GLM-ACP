@@ -99,6 +99,7 @@ LOCAL_COMMANDS = {
     "/security-review": "Scan the working-tree diff for security vulnerabilities",
     "/rewind": "Alias for /rollback — rewind conversation to a prior checkpoint",
     "/smart": "Expand a smart-prompt template with git context (/smart pr, review, commit, fix-ci)",
+    "/sound": "Toggle notification sounds on/off for this session",
     # Agent-side commands (implemented in the shared runtime; listed here so
     # they appear in the /-menu and the Ctrl+P command palette for discovery).
     "/status": "Show session, model, permissions, context, and live evidence",
@@ -2014,6 +2015,17 @@ class NativeGlmTui(App[int]):
         if text == "/smart" or text.startswith("/smart "):
             name = text.partition(" ")[2].strip()
             await self.action_smart(name)
+            return True
+        if text == "/sound":
+            from .voice import is_sound_enabled, set_sound_enabled
+
+            new_state = set_sound_enabled(not is_sound_enabled())
+            state_str = "on" if new_state else "off"
+            self.notify(
+                f"Notification sounds: {state_str}",
+                title="Sound toggle",
+                severity="success" if new_state else "information",
+            )
             return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)

@@ -191,6 +191,21 @@ def play_sound(tone: str = "success") -> None:
         pass
 
 
+def set_sound_enabled(enabled: bool) -> bool:
+    """Toggle sound on/off at runtime (for the ``/sound`` TUI command).
+
+    Returns the new state so the caller can report it to the user.
+    """
+    global _SOUND_ENABLED
+    _SOUND_ENABLED = bool(enabled)
+    return _SOUND_ENABLED
+
+
+def is_sound_enabled() -> bool:
+    """Return whether sound is currently enabled."""
+    return _SOUND_ENABLED
+
+
 def suppress_sound_during_recording() -> None:
     """Reset the sound cooldown so the next eligible sound fires immediately after recording."""
     global _last_sound

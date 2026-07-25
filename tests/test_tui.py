@@ -1854,6 +1854,32 @@ async def test_tui_smart_unknown_template_notifies(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tui_sound_command_toggles_notification_sounds(tmp_path):
+    """Tier 4: ``/sound`` toggles notification sounds on/off at runtime."""
+    from glm_acp.voice import is_sound_enabled, set_sound_enabled
+
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Ensure known starting state.
+        set_sound_enabled(False)
+        assert is_sound_enabled() is False
+
+        # Toggle on.
+        handled = await app._handle_local_command("/sound")
+        assert handled is True
+        assert is_sound_enabled() is True
+
+        # Toggle off.
+        handled = await app._handle_local_command("/sound")
+        assert handled is True
+        assert is_sound_enabled() is False
+        app.exit(0)
+
+
+@pytest.mark.asyncio
 async def test_tui_refresh_session_panel_hides_disabled_segments(tmp_path, monkeypatch):
     """When segments are toggled off, ``_refresh_session_panel`` omits them."""
     monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
