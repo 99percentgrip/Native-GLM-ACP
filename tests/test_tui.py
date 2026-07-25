@@ -236,6 +236,66 @@ async def test_tui_mounts_full_screen_panels_and_toggles_thinking(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tui_command_palette_is_enabled_and_provider_surfaces_all_commands(tmp_path):
+    """Tier 1.1: Ctrl+P command palette is enabled and includes our /-commands
+    and F-key actions via GlmCommandProvider."""
+    from glm_acp.tui import LOCAL_COMMANDS, GlmCommandProvider
+
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    # Class-level wiring: palette enabled and provider registered.
+    assert NativeGlmTui.ENABLE_COMMAND_PALETTE is True
+    assert GlmCommandProvider in NativeGlmTui.COMMANDS
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+
+        # Build entries from the live app — this exercises both
+        # make_insert_command_callback (for /-commands) and make_action_callback
+        # (for F-key actions) without depending on Textual palette internals.
+        provider = GlmCommandProvider(app.screen)
+        entries = provider._build_entries()
+        names = [name for name, _, _ in entries]
+
+        # Every registered slash command is present.
+        for cmd in LOCAL_COMMANDS:
+            assert cmd in names, f"missing slash command from palette: {cmd}"
+
+        # F-key actions are present (sample).
+        for action_label in (
+            "Help (F1)",
+            "Settings (F3)",
+            "Working tree (F4)",
+            "Quit (Ctrl-X)",
+        ):
+            assert action_label in names, f"missing F-key action from palette: {action_label}"
+
+        # The insert_command callback puts a slash command into the composer
+        # for review (does NOT auto-submit, so the user can add arguments).
+        composer = app.query_one("#composer", Input)
+        composer.value = ""
+        for name, _, cb in entries:
+            if name == "/model":
+                cb()
+                break
+        assert composer.value == "/model"
+        assert composer.cursor_position == len("/model")
+
+        # The action callback schedules a sync action via call_later.
+        for name, _, cb in entries:
+            if name == "Settings (F3)":
+                cb()
+                break
+        await pilot.pause()
+        # Settings screen is pushed as a modal.
+        assert any(
+            type(screen).__name__ == "SettingsScreen" for screen in app.screen_stack
+        ), "Settings action did not push the settings screen"
+        app.exit(0)
+
+
+@pytest.mark.asyncio
 async def test_tui_multiline_paste_is_retained_and_composer_does_not_overlap_footer(
     tmp_path,
 ):

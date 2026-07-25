@@ -26,6 +26,7 @@ from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.selection import Selection
@@ -1007,6 +1008,71 @@ class TuiClient:
             self._tool_titles[tool_call_id] = str(title)
 
 
+class GlmCommandProvider(Provider):
+    """Command-palette provider that surfaces every ``/``-command and F-key action.
+
+    Registered on :class:`NativeGlmTui.COMMANDS` so the built-in ``Ctrl+P``
+    palette (``App.COMMAND_PALETTE_BINDING``) lists our commands alongside
+    Textual's system commands.
+
+    Slash commands are inserted into the composer for review (the user can
+    then add arguments and press Enter); F-key actions run immediately.
+    """
+
+    @classmethod
+    def _app(cls, screen: Any) -> NativeGlmTui | None:
+        app = getattr(screen, "app", None)
+        return app if isinstance(app, NativeGlmTui) else None
+
+    def _build_entries(
+        self,
+    ) -> list[tuple[str, str, Callable[[], None]]]:
+        """Return ``(name, help_text, callback)`` tuples for palette entries."""
+        app = self._app(self.screen)
+        if app is None:
+            return []
+
+        entries: list[tuple[str, str, Callable[[], None]]] = []
+
+        # Slash commands — insert into composer for review/argument-editing.
+        # Iterate a snapshot so concurrent mutation of ``_slash_commands``
+        # during a session cannot change the palette mid-render.
+        for cmd in sorted(app._slash_commands):
+            help_text = app._slash_commands.get(cmd, "")
+            entries.append((cmd, help_text, app.make_insert_command_callback(cmd)))
+
+        # F-key / Ctrl-* actions — invoke immediately. Wrap with
+        # ``call_later`` so async actions are scheduled correctly and the
+        # palette screen can dismiss before the action pushes a new screen.
+        named_actions: list[tuple[str, str, str]] = [
+            ("Help (F1)", "Show the help screen", "show_help"),
+            ("Reasoning view (F2)", "Show or hide the reasoning panel", "toggle_thinking"),
+            ("Settings (F3)", "Open the live session settings", "settings"),
+            ("Working tree (F4)", "Cycle the working-tree panel", "toggle_working_tree"),
+            ("Push to talk (F5)", "Toggle push-to-talk voice input", "toggle_voice"),
+            ("History (F6)", "Browse and resume past sessions", "open_history"),
+            ("Search (Ctrl-F)", "Grep the current conversation", "open_search"),
+            ("Native mouse (F7)", "Toggle native terminal mouse mode", "toggle_native_mouse"),
+            ("Copy response (Ctrl-Y)", "Copy the last agent response", "copy_last_response"),
+            ("Clear view (Ctrl-L)", "Clear the visible transcript", "clear_transcript"),
+            ("Quit (Ctrl-X)", "Close the terminal agent", "quit_agent"),
+        ]
+        for name, help_text, action in named_actions:
+            entries.append((name, help_text, app.make_action_callback(action)))
+        return entries
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, help_text, callback in self._build_entries():
+            score = matcher.match(name)
+            if score > 0:
+                yield Hit(score, matcher.highlight(name), callback, help=help_text)
+
+    async def discover(self) -> Hits:
+        for name, help_text, callback in self._build_entries():
+            yield DiscoveryHit(name, callback, help=help_text)
+
+
 class NativeGlmTui(App[int]):
     """Full-screen coding-agent interface backed by one ``GlmAcpAgent``."""
 
@@ -1015,7 +1081,11 @@ class NativeGlmTui(App[int]):
     ACTIVITY_HOLD_SECONDS = 1.6
     TITLE = "Native GLM ACP"
     SUB_TITLE = "Full harness terminal"
-    ENABLE_COMMAND_PALETTE = False
+    # Enable Textual's built-in Ctrl+P command palette and register our
+    # GlmCommandProvider so the palette surfaces every /-command and F-key
+    # action alongside Textual's system commands.
+    ENABLE_COMMAND_PALETTE = True
+    COMMANDS = App.COMMANDS | {GlmCommandProvider}
     SHUTDOWN_TIMEOUT_SECONDS = 3.0
     # Make Textual's in-app text selection highly visible so users can see
     # what they are highlighting with click-drag (the default muted-purple
@@ -2143,6 +2213,42 @@ class NativeGlmTui(App[int]):
         await transcript.remove_children()
         self._current_agent = None
         self._current_agent_text = ""
+
+    def insert_command(self, command: str) -> None:
+        """Insert a slash command into the composer for review.
+
+        Used by the command-palette callbacks: the user can then add
+        arguments and press Enter, or backspace to cancel. Mirrors the
+        existing ``action_show_help`` pattern.
+        """
+        try:
+            composer = self.query_one("#composer", CommandInput)
+        except Exception:
+            return
+        composer.value = command
+        composer.focus()
+        composer.cursor_position = len(command)
+
+    def make_insert_command_callback(self, command: str) -> Callable[[], None]:
+        """Return a sync palette callback that inserts ``command`` for review."""
+
+        def _insert() -> None:
+            self.insert_command(command)
+
+        return _insert
+
+    def make_action_callback(self, action: str) -> Callable[[], None]:
+        """Return a sync palette callback that schedules ``action`` on the app.
+
+        Uses ``call_later`` so async actions are awaited correctly and the
+        palette screen can dismiss before the action (which may push its own
+        screen) runs.
+        """
+
+        def _run() -> None:
+            self.call_later(getattr(self, f"action_{action}"))
+
+        return _run
 
     async def action_show_help(self) -> None:
         composer = self.query_one("#composer", Input)

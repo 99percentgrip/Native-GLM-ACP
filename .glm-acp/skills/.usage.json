@@ -1,0 +1,28 @@
+{
+  "skills": {
+    "acp-stdio-smoke-test": {
+      "content_sha256": "214ceda0ee1112283537b1d92d04c8970eab239c31937e5640579f77c4b8c5a0",
+      "created_at": "2026-07-25T04:56:30.454337+00:00",
+      "last_used_at": null,
+      "pinned": false,
+      "revision_count": 1,
+      "state": "active",
+      "updated_at": "2026-07-25T04:56:30.454350+00:00",
+      "use_count": 0,
+      "view_count": 0
+    },
+    "cold-start-import-deferral": {
+      "content_sha256": "ce767a634c36fc83b283995733edbc6fcf8eb4da2d752d4b260c2edbe383dccb",
+      "created_at": "2026-07-25T04:56:30.417662+00:00",
+      "last_used_at": null,
+      "pinned": false,
+      "revision_count": 1,
+      "state": "active",
+      "updated_at": "2026-07-25T04:56:30.417681+00:00",
+      "use_count": 0,
+      "view_count": 0
+    }
+  },
+  "updated_at": "2026-07-25T04:56:30.454374+00:00",
+  "version": 1
+}
