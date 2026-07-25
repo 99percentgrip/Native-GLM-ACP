@@ -32,6 +32,12 @@ MAX_DELEGATE_OUTPUT_TOKENS_PER_TURN = 16_000
 # takes longer than this falls back to the normal user prompt.
 SMART_APPROVAL_TIMEOUT_SECONDS = 12
 
+# Per-session cap on concurrent background delegate_task workers
+# (Hermes v0.18 fan-out parity). Background workers use isolated budgets
+# and deliver reports via session messages when complete; this bound
+# prevents runaway fan-out from exhausting API quota.
+MAX_BACKGROUND_WORKERS_PER_SESSION = 3
+
 # Bounds for the per-session iteration override (``/max-iterations`` and
 # ``GLM_ACP_MAX_TOOL_ITERATIONS``). The lower bound guards against accidental
 # zero/negative; the upper bound guards against runaway loops.

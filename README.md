@@ -533,10 +533,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v2.5.0` before running the Unix
-installer, or pass `-Version v2.5.0` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v2.6.0` before running the Unix
+installer, or pass `-Version v2.6.0` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v2.5.0](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v2.5.0).
+[v2.6.0](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v2.6.0).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -942,7 +942,7 @@ preserved-thinking requests.
 | `list_skill_bundles` / `read_skill_bundle` | Discover and progressively load related relevant skills |
 | `manage_skill_bundle` | Permission-gate creation or removal of project-local bundles |
 | `evolve_skill` | Stage, promote, or discard objectively benchmarked skill candidates |
-| `delegate_task` | Run one permission-gated, read-only auxiliary GLM investigation or review; the worker writes a live `tail -f`-able transcript file under `<config_dir>/workers/` and the report carries the transcript path |
+| `delegate_task` | Run one permission-gated, read-only auxiliary GLM investigation or review; the worker writes a live `tail -f`-able transcript file under `<config_dir>/workers/` and the report carries the transcript path. Pass `background=true` to fan out up to 3 workers per session that run in the background and deliver their reports as session messages when complete |
 | `cronjob` | Permission-gated persistent scheduled automation and manual runs |
 | `web_search` / `web_reader` | Official Z.ai Coding Plan MCP services |
 | `vision_analyze` | Optional official local Z.ai Vision MCP |
@@ -1055,7 +1055,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-2.5.0.dist-info  (and editable-install metadata)
+# expect: glm_acp-2.6.0.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

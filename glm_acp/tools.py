@@ -805,7 +805,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "name": "delegate_task",
             "description": (
                 "Delegate one bounded read-only investigation or review to an independent "
-                "auxiliary GLM worker. The worker cannot edit files or run commands."
+                "auxiliary GLM worker. The worker cannot edit files or run commands. "
+                "Use background=true to fan out work and continue without blocking — "
+                "the worker runs in the background and delivers its report as a new "
+                "session message when complete (Hermes v0.18 fan-out parity)."
             ),
             "parameters": {
                 "type": "object",
@@ -815,6 +818,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "role": {
                         "type": "string",
                         "enum": ["investigator", "reviewer", "test-analyst"],
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, run the worker in the background and return "
+                            "immediately; the report arrives as a session message "
+                            "when complete. Default false (blocking)."
+                        ),
                     },
                 },
                 "required": ["goal"],

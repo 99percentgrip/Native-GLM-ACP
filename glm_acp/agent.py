@@ -71,6 +71,7 @@ from .config import (
     DELEGATE_TIMEOUT_SECONDS,
     DESTRUCTIVE_TOOLS,
     GENERATION_PROFILES,
+    MAX_BACKGROUND_WORKERS_PER_SESSION,
     MAX_COMPACTION_QUALITY_HISTORY,
     MAX_DELEGATE_INPUT_TOKENS_PER_TURN,
     MAX_DELEGATE_OUTPUT_TOKENS_PER_TURN,
@@ -432,6 +433,10 @@ class Session:
         self.read_cache: dict[str, str] = {}
         self.moa_cache_key = ""
         self.moa_cache_advice: list[str] = []
+        # Background worker fan-out (Hermes v0.18 parity). Each entry is an
+        # asyncio.Task running _delegate_task with a fresh isolated budget.
+        # Reports are delivered via _send_message when the task completes.
+        self.background_workers: dict[str, asyncio.Task] = {}
 
     def refresh_system_prompt(self, task: str | None = None) -> None:
         """Keep the managed system prompt aligned with the selected model."""
@@ -1374,9 +1379,16 @@ class GlmAcpAgent(acp.Agent):
         session.aux_client = None
         session.aux_client_key = None
         clients = [item for item in (client, aux_client) if item is not None]
+        # Cancel any in-flight background workers so they don't deliver
+        # reports to a stale/abandoned session.
+        bg_workers = list(session.background_workers.values())
+        session.background_workers.clear()
+        for task in bg_workers:
+            task.cancel()
         for item in clients:
             item.cancel()
         await asyncio.gather(*(item.aclose() for item in clients), return_exceptions=True)
+        await asyncio.gather(*bg_workers, return_exceptions=True)
 
     async def aclose(self) -> None:
         """Close pooled HTTP clients without deleting persisted sessions."""
@@ -3083,8 +3095,14 @@ class GlmAcpAgent(acp.Agent):
                 tool_started = time.monotonic()
                 try:
                     if tool_name == "delegate_task":
-                        delegated = await self._delegate_task(session, tool_args, delegation_budget)
-                        tool_result = ToolResult(output=delegated)
+                        if tool_args.get("background"):
+                            status = self._spawn_background_worker(session, tool_args)
+                            tool_result = ToolResult(output=status)
+                        else:
+                            delegated = await self._delegate_task(
+                                session, tool_args, delegation_budget
+                            )
+                            tool_result = ToolResult(output=delegated)
                     elif tool_name == "worktree_worker":
                         tool_result = await self._worktree_worker(session, tool_args)
                     elif tool_name == "semantic_code":
@@ -3521,6 +3539,72 @@ class GlmAcpAgent(acp.Agent):
         # Keep within MAX_TOOL_OUTPUT_CHARS by truncating the report if needed.
         cap = MAX_TOOL_OUTPUT_CHARS - len(suffix)
         return report[:cap] + suffix
+
+    # ----- Background fan-out delegation (Hermes v0.18 parity) -----
+
+    def _spawn_background_worker(
+        self,
+        session: Session,
+        arguments: dict[str, Any],
+    ) -> str:
+        """Dispatch a delegate_task worker in the background.
+
+        Returns a status string immediately; the worker's report is delivered
+        as a session message (``_send_message``) when the task completes.
+        Enforces a hard per-session cap on concurrent background workers.
+        """
+        if len(session.background_workers) >= MAX_BACKGROUND_WORKERS_PER_SESSION:
+            running = len(session.background_workers)
+            return (
+                f"Background worker cap reached ({running}/{MAX_BACKGROUND_WORKERS_PER_SESSION}); "
+                "wait for an existing worker to finish or call delegate_task "
+                "without background=true to run inline."
+            )
+        worker_id = uuid4().hex[:8]
+        goal_preview = str(arguments.get("goal", ""))[:120]
+
+        async def _runner() -> None:
+            try:
+                # Fresh isolated budget — background workers don't share the
+                # parent turn's delegation budget.
+                report = await self._delegate_task(session, arguments, None)
+            except asyncio.CancelledError:
+                # Expected when the session is invalidated or the agent shuts down.
+                raise
+            except ToolError as error:
+                report = f"Background worker failed: {error}"
+            except Exception as error:  # pragma: no cover - defensive
+                logger.warning("Background worker crashed: %s", error)
+                report = f"Background worker crashed: {error}"
+            finally:
+                # Always remove the task entry so the cap frees up.
+                session.background_workers.pop(worker_id, None)
+            # Deliver the report as a system-styled message. Wrapped as
+            # untrusted context — worker output is advisory data, not authority.
+            delivered = self._attach_transcript_path(report, self._NO_PATH)
+            # Strip the bogus transcript suffix when there's no real file.
+            delivered = delivered.replace(
+                f"\n\n_Transcript: {self._NO_PATH}_", ""
+            )
+            try:
+                await self._send_message(
+                    session.id,
+                    f"\n\n📥 **Background worker `{worker_id}` complete:**\n"
+                    + wrap_untrusted_output(delivered, f"background-worker:{worker_id}"),
+                )
+            except Exception as error:  # pragma: no cover - defensive
+                logger.warning("Background worker delivery failed: %s", error)
+
+        task = asyncio.create_task(_runner(), name=f"bg-worker-{worker_id}")
+        session.background_workers[worker_id] = task
+        return (
+            f"Background worker `{worker_id}` started (goal: {goal_preview}). "
+            f"It runs in the background and delivers its report as a session "
+            f"message when complete. Active background workers: "
+            f"{len(session.background_workers)}/{MAX_BACKGROUND_WORKERS_PER_SESSION}."
+        )
+
+    _NO_PATH = Path("/dev/null")
 
     async def _delegate_task(
         self,

@@ -935,6 +935,130 @@ class TestSmartApprovals:
         agent._conn.request_permission.assert_called_once()
 
 
+class TestBackgroundFanOut:
+    """Background delegate_task fan-out (Hermes v0.18 parity)."""
+
+    @pytest.mark.asyncio
+    async def test_spawn_returns_immediately_with_status(self, agent, session):
+        status = agent._spawn_background_worker(
+            session, {"goal": "find the bug", "role": "investigator"}
+        )
+        assert "started" in status
+        assert "find the bug" in status
+        # Worker is registered on the session.
+        assert len(session.background_workers) == 1
+        # Cancel so the test doesn't leak a pending task.
+        for task in list(session.background_workers.values()):
+            task.cancel()
+        session.background_workers.clear()
+
+    @pytest.mark.asyncio
+    async def test_spawn_respects_per_session_cap(self, agent, session):
+        from glm_acp.config import MAX_BACKGROUND_WORKERS_PER_SESSION
+
+        for _ in range(MAX_BACKGROUND_WORKERS_PER_SESSION):
+            agent._spawn_background_worker(session, {"goal": "x"})
+        # Fourth spawn is rejected with a clear cap message.
+        status = agent._spawn_background_worker(session, {"goal": "y"})
+        assert "cap reached" in status
+        assert len(session.background_workers) == MAX_BACKGROUND_WORKERS_PER_SESSION
+        # Cancel so the test doesn't leak pending tasks.
+        for task in list(session.background_workers.values()):
+            task.cancel()
+        session.background_workers.clear()
+
+    @pytest.mark.asyncio
+    async def test_background_worker_delivers_report_as_message(
+        self, agent, session, monkeypatch
+    ):
+        """A background worker runs and delivers its report via _send_message."""
+        # Stub _delegate_task so the worker completes immediately with a
+        # predictable report.
+        async def fake_delegate(sess, args, budget):
+            return f"Report for {args['goal']}"
+
+        monkeypatch.setattr(agent, "_delegate_task", fake_delegate)
+        sent: list[tuple] = []
+
+        async def fake_send(session_id, text, **kwargs):
+            sent.append((session_id, text))
+
+        monkeypatch.setattr(agent, "_send_message", fake_send)
+
+        status = agent._spawn_background_worker(
+            session, {"goal": "audit the module"}
+        )
+        assert "started" in status
+        # Wait for the background task to finish.
+        for _ in range(40):
+            await asyncio.sleep(0.01)
+            if not session.background_workers:
+                break
+        assert len(session.background_workers) == 0
+        # The report was delivered as a session message.
+        assert len(sent) == 1
+        assert sent[0][0] == session.id
+        assert "Report for audit the module" in sent[0][1]
+        assert "background worker" in sent[0][1].lower()
+
+    @pytest.mark.asyncio
+    async def test_background_worker_swallows_delegate_error(
+        self, agent, session, monkeypatch
+    ):
+        """If _delegate_task raises, the worker delivers an error message."""
+
+        async def fake_delegate(sess, args, budget):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(agent, "_delegate_task", fake_delegate)
+
+        sent: list[str] = []
+
+        async def fake_send(session_id, text, **kwargs):
+            sent.append(text)
+
+        monkeypatch.setattr(agent, "_send_message", fake_send)
+
+        agent._spawn_background_worker(session, {"goal": "x"})
+        for _ in range(40):
+            await asyncio.sleep(0.01)
+            if not session.background_workers:
+                break
+        assert len(session.background_workers) == 0
+        assert sent, "worker should deliver an error report"
+        assert "boom" in sent[0] or "crashed" in sent[0]
+
+    @pytest.mark.asyncio
+    async def test_invalidate_session_cancels_background_workers(
+        self, agent, session, monkeypatch
+    ):
+        """_invalidate_session_client cancels all background workers."""
+
+        async def slow_delegate(sess, args, budget):
+            await asyncio.sleep(60)
+            return "should never complete"
+
+        monkeypatch.setattr(agent, "_delegate_task", slow_delegate)
+        agent._spawn_background_worker(session, {"goal": "x"})
+        assert len(session.background_workers) == 1
+
+        async def fake_send(*_args, **_kwargs):
+            pass
+
+        monkeypatch.setattr(agent, "_send_message", fake_send)
+
+        await agent._invalidate_session_client(session)
+        # The session no longer tracks the worker.
+        assert session.background_workers == {}
+
+    @pytest.mark.asyncio
+    async def test_session_init_creates_empty_background_workers(self):
+        from glm_acp.agent import Session
+
+        sess = Session("s1", ".")
+        assert sess.background_workers == {}
+
+
 class TestAuxiliaryRouting:
     @pytest.mark.asyncio
     async def test_auxiliary_model_generates_titles_and_accounts_usage(
@@ -1646,7 +1770,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.5.0"
+        assert resp.agent_info.version == "2.6.0"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):
