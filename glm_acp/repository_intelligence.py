@@ -253,6 +253,11 @@ class RepositoryIntelligence:
     @staticmethod
     def _nearby_tests(root: Path, source: str) -> list[str]:
         path = root / source
+        # Guard: when root resolves to "/" (e.g. Zed workspace at filesystem root)
+        # the resolved path may be "/", whose .name is empty. Calling .with_name()
+        # on it raises ValueError("PosixPath('/') has an empty name"). Bail out.
+        if path.parent == path:
+            return []
         stem = path.stem.removeprefix("test_").removesuffix("_test")
         candidates = [
             path.with_name(f"test_{stem}{path.suffix}"),
@@ -326,6 +331,10 @@ class RepositoryIntelligence:
         else:
             normalized = name.replace("::", "/").replace(".", "/")
             base = root / normalized
+        # Guard: relative imports can resolve to "/" (e.g. "." -> source.parent / "/").
+        # Path('/').with_suffix(...) raises ValueError; bail out instead.
+        if base.parent == base:
+            return None
         for candidate in (
             base,
             *[base.with_suffix(s) for s in _SOURCE_SUFFIXES],

@@ -103,6 +103,55 @@ def test_direct_small_task_has_no_repository_overhead(tmp_path: Path) -> None:
     assert intelligence.premortem == []
 
 
+def test_root_resolving_to_filesystem_root_does_not_crash() -> None:
+    """Regression: prepare() must not raise when project_root resolves to '/'.
+
+    Previously _nearby_tests called path.with_name() and _resolve_import called
+    base.with_suffix() on Path('/'), which raises ValueError("PosixPath('/') has
+    an empty name"). This was triggered by editors (e.g. Zed) launching the
+    agent with a workspace whose detected root is the filesystem root.
+    """
+    from glm_acp.metacognition import MetacognitiveAssessment
+    from glm_acp.project_context import ProjectFacts
+
+    root_only = Path("/")
+    intelligence = RepositoryIntelligence()
+
+    # Direct static-method guards
+    assert intelligence._nearby_tests(root_only, ".") == []
+    assert intelligence._nearby_tests(root_only, "") == []
+    assert intelligence._resolve_import(root_only, root_only, ".") is None
+    assert intelligence._resolve_import(root_only, root_only, "..") is None
+
+    # End-to-end prepare() must not raise even when targets resolve under "/"
+    facts = ProjectFacts(
+        root=str(root_only),
+        manifests=(),
+        package_managers=(),
+        verify_commands=(),
+        branch="",
+        dirty=False,
+    )
+    assessment = MetacognitiveAssessment(
+        task_family="operations",
+        environment="python",
+        execution_mode="standard",
+        risk_score=4,
+        uncertainties=(),
+    )
+    intelligence.prepare(
+        task="edit plugins.py",
+        facts=facts,
+        targets=["glm_acp/plugins.py"],
+        changed_paths=["glm_acp/plugins.py"],
+        assessment=assessment,
+        edit_generation=1,
+    )
+    # No exception is the contract; nodes may legitimately be empty when the
+    # target paths do not exist relative to filesystem root.
+    assert isinstance(intelligence.nodes, dict)
+
+
 def test_world_state_round_trips_without_file_bodies(tmp_path: Path) -> None:
     secret = "body-that-must-not-be-persisted"
     source = tmp_path / "module.py"
