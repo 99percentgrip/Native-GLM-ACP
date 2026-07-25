@@ -13,6 +13,7 @@ os.environ.setdefault("ZAI_API_KEY", "test-key")
 from glm_acp.agent import GlmAcpAgent, Session, build_system_prompt
 from glm_acp.config import (
     CONTEXT_WINDOW_TOKENS,
+    MOA_PICKER_VALUE,
 )
 from glm_acp.glm_client import PlanQuota, PlanUsage
 from glm_acp.tools import Sandbox
@@ -252,12 +253,16 @@ class TestConfigOptions:
     def test_model_option_coding(self, agent, session):
         opt = agent._build_model_option(session)
         assert opt.id == "model"
-        assert len(opt.options) == 3  # coding plan = 3 models
+        # coding plan = 3 models + 1 synthetic MoA entry at the top
+        assert len(opt.options) == 4
+        assert opt.options[0].value == MOA_PICKER_VALUE
 
     def test_model_option_standard(self, agent, session):
         session.api_endpoint = "standard"
         opt = agent._build_model_option(session)
-        assert len(opt.options) == 6  # + current vision models
+        # + current vision models + 1 synthetic MoA entry
+        assert len(opt.options) == 7
+        assert opt.options[0].value == MOA_PICKER_VALUE
 
     def test_thought_option_vision(self, agent, session):
         session.model = "glm-4.5v"
@@ -461,7 +466,10 @@ class TestBoundedDelegation:
             },
         )
 
-        assert report == "Review found no regression."
+        # The report carries the worker's text plus a transcript-path suffix
+        # (Hermes v0.19 live-transcript parity) so the model/user can tail -f.
+        assert "Review found no regression." in report
+        assert "_Transcript:" in report
         assert captured["model"] == "glm-5-turbo"
         names = {tool["function"]["name"] for tool in captured["tools"]}
         assert names == {"read_file", "list_directory", "search_files", "grep"}
@@ -506,9 +514,148 @@ class TestBoundedDelegation:
             "output_tokens": 100,
         }
 
-        assert await agent._delegate_task(session, {"goal": "First"}, budget) == "Done"
+        first_report = await agent._delegate_task(session, {"goal": "First"}, budget)
+        assert "Done" in first_report
+        assert "_Transcript:" in first_report
         with pytest.raises(Exception, match="worker budget exhausted"):
             await agent._delegate_task(session, {"goal": "Second"}, budget)
+
+
+class TestWorkerTranscript:
+    """Worker transcript sink (Hermes v0.19 live-transcript parity)."""
+
+    def test_worker_transcript_path_is_under_config_dir(self, agent, monkeypatch, tmp_path):
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+        path = agent._worker_transcript_path("sess-123")
+        assert path.parent == tmp_path / "workers"
+        assert path.name.startswith("sess-123-")
+        assert path.suffix == ".log"
+
+    def test_worker_transcript_path_sanitizes_session_id(self, agent, monkeypatch, tmp_path):
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+        path = agent._worker_transcript_path("../escape/attempt")
+        # No path traversal — only [a-zA-Z0-9_-] survives.
+        assert ".." not in path.name
+        assert "/" not in path.name
+        assert path.parent == tmp_path / "workers"
+
+    def test_flush_worker_transcript_writes_lines_and_clears(self, agent, tmp_path):
+        path = tmp_path / "worker.log"
+        lines = ["line one", "line two"]
+        agent._flush_worker_transcript(path, lines)
+        assert path.read_text() == "line one\nline two\n"
+        # The caller's list is cleared so re-flush doesn't duplicate.
+        assert lines == []
+
+    def test_flush_worker_transcript_swallows_oserror(self, agent, tmp_path):
+        # Path whose parent doesn't exist → OSError on open; must not raise.
+        bad_path = tmp_path / "missing-dir" / "worker.log"
+        lines = ["x"]
+        agent._flush_worker_transcript(bad_path, lines)
+
+    def test_flush_worker_transcript_noop_on_empty(self, agent, tmp_path):
+        path = tmp_path / "worker.log"
+        agent._flush_worker_transcript(path, [])
+        assert not path.exists()
+
+    def test_attach_transcript_path_appends_suffix(self, agent, tmp_path):
+        path = tmp_path / "w.log"
+        out = agent._attach_transcript_path("Report body", path)
+        assert out.startswith("Report body")
+        assert str(path) in out
+
+    def test_attach_transcript_path_caps_at_max_tool_output_chars(self, agent, tmp_path):
+        from glm_acp.tools import MAX_TOOL_OUTPUT_CHARS
+
+        path = tmp_path / "w.log"
+        huge = "x" * (MAX_TOOL_OUTPUT_CHARS + 5000)
+        out = agent._attach_transcript_path(huge, path)
+        assert len(out) <= MAX_TOOL_OUTPUT_CHARS
+        assert str(path) in out
+
+    @pytest.mark.asyncio
+    async def test_delegate_writes_a_real_transcript_file(
+        self, agent, session, monkeypatch, tmp_path
+    ):
+        """End-to-end: a delegation produces a transcript file on disk."""
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
+
+        class FakeClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def begin_turn(self):
+                pass
+
+            async def stream_completion(self, **_kwargs):
+                return SimpleNamespace(
+                    content="Found the bug at line 42.",
+                    tool_calls=[],
+                    usage={"input_tokens": 5, "output_tokens": 3},
+                )
+
+            async def aclose(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        monkeypatch.setattr("glm_acp.agent.GlmClient", FakeClient)
+        report = await agent._delegate_task(session, {"goal": "find the bug"}, None)
+        assert "Found the bug" in report
+        assert "_Transcript:" in report
+        # Pull the transcript path out of the report and confirm the file
+        # exists with at least the worker-start line.
+        marker = "_Transcript: "
+        path_str = report.partition(marker)[2].rstrip("_").strip()
+        transcript = Path(path_str)
+        assert transcript.exists()
+        text = transcript.read_text()
+        assert "worker start" in text
+        assert "find the bug" in text
+        assert "worker done" in text
+
+
+class TestMixturePickerEntry:
+    """MoA as a model in the picker (Hermes v0.18 picker parity)."""
+
+    def test_model_option_includes_synthetic_moa_entry(self, agent, session):
+        opt = agent._build_model_option(session)
+        first = opt.options[0]
+        assert first.value == MOA_PICKER_VALUE
+        assert "Mixture of Agents" in first.name
+
+    def test_model_option_current_value_is_moa_when_enabled(self, agent, session):
+        session.mixture_mode = "enabled"
+        opt = agent._build_model_option(session)
+        assert opt.current_value == MOA_PICKER_VALUE
+
+    def test_model_option_current_value_is_real_model_when_disabled(self, agent, session):
+        session.mixture_mode = "off"
+        opt = agent._build_model_option(session)
+        assert opt.current_value == session.model
+
+    @pytest.mark.asyncio
+    async def test_setting_model_to_moa_enables_mixture_mode(self, agent, session):
+        agent._sessions[session.id] = session
+        assert session.mixture_mode == "off"
+        await agent.set_config_option(
+            config_id="model", session_id=session.id, value=MOA_PICKER_VALUE
+        )
+        assert session.mixture_mode == "enabled"
+        # The underlying model is untouched.
+        assert session.model == "glm-5.2"
+
+    @pytest.mark.asyncio
+    async def test_setting_real_model_leaves_mixture_mode_untouched(self, agent, session):
+        agent._sessions[session.id] = session
+        session.mixture_mode = "enabled"
+        await agent.set_config_option(
+            config_id="model", session_id=session.id, value="glm-4.7"
+        )
+        assert session.model == "glm-4.7"
+        # Mixture stays on — disabling is via /mixture off.
+        assert session.mixture_mode == "enabled"
 
 
 class TestAuxiliaryRouting:
@@ -1222,7 +1369,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.3.0"
+        assert resp.agent_info.version == "2.4.0"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):

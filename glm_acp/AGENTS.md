@@ -205,7 +205,7 @@ Session config options advertised to the client:
 - `permission_mode` (category: `permissions`) — tool execution permission: Ask / Read Only / Bypass
 - `generation_profile` (category: `other`) — Balanced provider defaults, Precise temperature 0.7, or Exploratory top-p 0.98; non-default profiles adjust only one sampling control
 - `auxiliary_model` (category: `other`) — main model or a non-vision GLM model on the active plan for titles, compaction, recall ranking, skill evaluation, and bounded delegation
-- `mixture_mode` (category: `other`) — off by default; Reference review runs up to two independent non-vision GLM advisers once per user turn and leaves the primary model as aggregator/actor
+- `mixture_mode` (category: `other`) — off by default; Reference review runs up to two independent non-vision GLM advisers once per user turn and leaves the primary model as aggregator/actor. **Selectable as a synthetic top entry "🔬 Mixture of Agents (council)" in the `/model` picker** (Hermes v0.18 parity): picking it toggles mixture_mode on without changing the underlying model; the picker highlights the entry while MoA is active. Picking any real model leaves mixture_mode alone — disable explicitly via `/mixture off`.
 
 ### Deep Thinking (GLM-5.2)
 

@@ -15,7 +15,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -81,9 +81,11 @@ from .config import (
     MAX_TOOL_ITERATIONS,
     MAX_TOOL_ITERATIONS_CEILING,
     MIN_TOOL_ITERATIONS,
+    MOA_PICKER_VALUE,
     MODELS,
     THOUGHT_LEVELS,
     VISION_MODELS,
+    config_dir,
     has_api_key,
     max_tool_iterations,
     models_for_plan,
@@ -1751,8 +1753,14 @@ class GlmAcpAgent(acp.Agent):
         )
         if config_id == "model":
             requested = str(value)
-            # Validate that this model is available on the current plan
-            if requested not in models_for_plan(session.api_endpoint):
+            # Synthetic MoA entry — toggle the Mixture-of-Agents layer on
+            # without changing the underlying model. Picking any real model
+            # leaves mixture_mode alone (use /mixture to disable explicitly).
+            if requested == MOA_PICKER_VALUE:
+                session.mixture_mode = "enabled"
+                session.moa_cache_key = ""
+                session.moa_cache_advice = []
+            elif requested not in models_for_plan(session.api_endpoint):
                 # Invalid model for this plan — keep current, log warning
                 logger.warning("Model %s not available on plan %s", requested, session.api_endpoint)
             else:
@@ -3471,6 +3479,48 @@ class GlmAcpAgent(acp.Agent):
             f"\n\n_Context pressure: {ratio:.0%}. {labels[level]}_\n",
         )
 
+    # ----- Worker transcript sink (Hermes v0.19 live-transcript parity) -----
+
+    def _worker_transcript_path(self, session_id: str) -> Path:
+        """Per-worker transcript file under the profile-scoped config dir.
+
+        Each delegation writes one file; ``tail -f`` shows live progress.
+        Files persist after the worker returns so the user can review them.
+        """
+        safe_session = re.sub(r"[^a-zA-Z0-9_-]", "_", str(session_id))[:32]
+        workers_dir = config_dir() / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        return workers_dir / f"{safe_session}-{uuid4().hex[:8]}.log"
+
+    @staticmethod
+    def _transcript_ts() -> str:
+        return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+    @staticmethod
+    def _flush_worker_transcript(path: Path, lines: list[str]) -> None:
+        """Best-effort append of pending transcript lines to the worker log.
+
+        Resets ``lines`` after writing so callers can keep appending across
+        iterations without duplicating earlier content. Failures are silent
+        — the transcript is best-effort and must not break the worker.
+        """
+        if not lines:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except OSError:
+            return
+        lines.clear()
+
+    @staticmethod
+    def _attach_transcript_path(report: str, transcript_path: Path) -> str:
+        """Append the transcript path to a worker report for the model/user."""
+        suffix = f"\n\n_Transcript: {transcript_path}_"
+        # Keep within MAX_TOOL_OUTPUT_CHARS by truncating the report if needed.
+        cap = MAX_TOOL_OUTPUT_CHARS - len(suffix)
+        return report[:cap] + suffix
+
     async def _delegate_task(
         self,
         session: Session,
@@ -3535,7 +3585,14 @@ class GlmAcpAgent(acp.Agent):
         ]
         started = time.monotonic()
         worker.begin_turn()
+        transcript_path = self._worker_transcript_path(session.id)
+        transcript_lines: list[str] = []
+        transcript_lines.append(
+            f"[{self._transcript_ts()}] worker start · role={role} · model={model} · "
+            f"goal={goal[:200]}{'…' if len(goal) > 200 else ''}"
+        )
         try:
+            self._flush_worker_transcript(transcript_path, transcript_lines)
             for _ in range(MAX_DELEGATE_TOOL_ITERATIONS):
                 if budget["input_tokens"] <= 0 or budget["output_tokens"] <= 0:
                     raise ToolError("Shared delegation token budget exhausted")
@@ -3568,10 +3625,18 @@ class GlmAcpAgent(acp.Agent):
                     "role": "assistant",
                     "content": result.content or None,
                 }
+                if result.content:
+                    transcript_lines.append(
+                        f"[{self._transcript_ts()}] assistant · "
+                        f"{result.content[:500]}{'…' if len(result.content) > 500 else ''}"
+                    )
                 if not result.tool_calls:
-                    return (result.content or "Delegated worker returned no report.")[
-                        :MAX_TOOL_OUTPUT_CHARS
-                    ]
+                    transcript_lines.append(f"[{self._transcript_ts()}] worker done")
+                    self._flush_worker_transcript(transcript_path, transcript_lines)
+                    report = (
+                        result.content or "Delegated worker returned no report."
+                    )[:MAX_TOOL_OUTPUT_CHARS]
+                    return self._attach_transcript_path(report, transcript_path)
                 assistant["tool_calls"] = [
                     {
                         "id": call["id"],
@@ -3590,6 +3655,10 @@ class GlmAcpAgent(acp.Agent):
                 for call in result.tool_calls:
                     name = str(call["function"].get("name", ""))
                     args = call["function"].get("arguments", {})
+                    transcript_lines.append(
+                        f"[{self._transcript_ts()}] tool call · {name} · "
+                        f"{json.dumps(args, ensure_ascii=False)[:200]}"
+                    )
                     if name not in read_names or not isinstance(args, dict):
                         output = "Error: delegated workers may use only read/search tools"
                     else:
@@ -3598,6 +3667,11 @@ class GlmAcpAgent(acp.Agent):
                             output = value.output
                         except ToolError as error:
                             output = f"Error: {error}"
+                    transcript_lines.append(
+                        f"[{self._transcript_ts()}] tool result · {name} · "
+                        f"{output[:300]}{'…' if len(output) > 300 else ''}"
+                    )
+                    self._flush_worker_transcript(transcript_path, transcript_lines)
                     messages.append(
                         {
                             "role": "tool",
@@ -3605,11 +3679,24 @@ class GlmAcpAgent(acp.Agent):
                             "content": self._guard_tool_output(name, output),
                         }
                     )
+            limit_msg = (
+                f"worker hit {MAX_DELEGATE_TOOL_ITERATIONS}-iteration limit"
+            )
+            transcript_lines.append(f"[{self._transcript_ts()}] {limit_msg}")
+            self._flush_worker_transcript(transcript_path, transcript_lines)
             raise ToolError(
                 f"Delegated worker reached its {MAX_DELEGATE_TOOL_ITERATIONS}-iteration limit"
             )
         except asyncio.TimeoutError as error:
+            transcript_lines.append(f"[{self._transcript_ts()}] worker timed out")
+            self._flush_worker_transcript(transcript_path, transcript_lines)
             raise ToolError("Delegated worker timed out") from error
+        except ToolError as error:
+            transcript_lines.append(
+                f"[{self._transcript_ts()}] worker error · {error}"
+            )
+            self._flush_worker_transcript(transcript_path, transcript_lines)
+            raise
         finally:
             worker.cancel()
             await worker.aclose()
@@ -6066,22 +6153,36 @@ class GlmAcpAgent(acp.Agent):
 
     def _build_model_option(self, session: Session) -> SessionConfigOptionSelect:
         plan_models = models_for_plan(session.api_endpoint)
-        # If the current model isn't in this plan, still show it as selected
-        # (the set_config_option handler will re-validate on switch)
+        # Synthetic MoA entry at the top — picking it toggles mixture_mode
+        # without changing the underlying model (Hermes v0.18 picker parity).
+        moa_entry = SessionConfigSelectOption(
+            value=MOA_PICKER_VALUE,
+            name="🔬 Mixture of Agents (council)",
+            description=(
+                "Toggle the Mixture-of-Agents layer: the current model stays the "
+                "aggregator; up to two reference advisers review in parallel"
+            ),
+        )
+        # If MoA is on, the picker highlights the synthetic entry instead of
+        # the bare model id, so users see the toggle state at a glance.
+        current = MOA_PICKER_VALUE if session.mixture_mode == "enabled" else session.model
         return SessionConfigOptionSelect(
             id="model",
             name="Model",
             description="GLM model to use",
             category="model",
             type="select",
-            current_value=session.model,
+            current_value=current,
             options=[
-                SessionConfigSelectOption(
-                    value=model_id,
-                    name=info["name"],
-                    description=f"{info['description']} ({info['context_window']} context)",
-                )
-                for model_id, info in plan_models.items()
+                moa_entry,
+                *(
+                    SessionConfigSelectOption(
+                        value=model_id,
+                        name=info["name"],
+                        description=f"{info['description']} ({info['context_window']} context)",
+                    )
+                    for model_id, info in plan_models.items()
+                ),
             ],
         )
 

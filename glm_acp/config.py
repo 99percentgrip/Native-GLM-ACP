@@ -13,6 +13,12 @@ DEFAULT_TIMEOUT = 180
 DEFAULT_MAX_TOKENS = 128_000
 MAX_AUTO_CONTINUATIONS = 20
 MAX_TOOL_ITERATIONS = 50
+
+# Synthetic value used by the model picker to represent the
+# Mixture-of-Agents layer (Hermes v0.18 picker parity). It is NOT a real
+# model id; picking it toggles ``session.mixture_mode`` and leaves the
+# underlying ``session.model`` untouched.
+MOA_PICKER_VALUE = "__moa__"
 MAX_REPEATED_TOOL_BATCHES = 3
 MAX_DELEGATIONS_PER_TURN = 3
 MAX_DELEGATE_TOOL_ITERATIONS = 6

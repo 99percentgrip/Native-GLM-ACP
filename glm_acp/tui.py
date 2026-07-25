@@ -53,6 +53,7 @@ from .config import (
     DEFAULT_AUXILIARY_MODEL,
     DEFAULT_MODEL,
     GENERATION_PROFILES,
+    MOA_PICKER_VALUE,
     MODELS,
     THOUGHT_LEVELS,
     VISION_MODELS,
@@ -1461,14 +1462,22 @@ class NativeGlmTui(App[int]):
         config_id = CONFIG_COMMANDS.get(command, ("", ""))[0]
         values: list[tuple[str, str]]
         if config_id == "model":
+            # Synthetic MoA entry at the top, matching the ACP-side picker
+            # (Hermes v0.18 picker parity).
             values = [
+                (
+                    MOA_PICKER_VALUE,
+                    "🔬 Mixture of Agents — toggle the MoA council layer",
+                )
+            ]
+            values.extend(
                 (
                     key,
                     f"{info['name']} — {info['description']} ({info['context_window']} context)",
                 )
                 for key, info in MODELS.items()
                 if session.api_endpoint in info.get("plans", [])
-            ]
+            )
         elif config_id == "thought_level":
             values = [
                 (
@@ -1527,6 +1536,8 @@ class NativeGlmTui(App[int]):
         if config_id == "api_endpoint":
             return str(API_ENDPOINTS.get(value, {}).get("name", value))
         if config_id == "model":
+            if value == MOA_PICKER_VALUE:
+                return "🔬 Mixture of Agents"
             return str(MODELS.get(value, {}).get("name", value))
         if config_id == "thought_level":
             return str(THOUGHT_LEVELS.get(value, {}).get("name", value))
