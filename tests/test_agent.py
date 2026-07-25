@@ -682,6 +682,11 @@ class TestSlashCommands:
 
     @pytest.mark.asyncio
     async def test_max_iterations_acp_command_rejects_non_integer(self, agent, session):
+        # Set a deterministic baseline so a real ~/.config/glm-acp/
+        # max-iterations.json from interactive use can't leak into the
+        # assertion. Mirrors the pattern in test_max_iterations_acp_command_
+        # sets_value (line 676).
+        session.max_tool_iterations = 50
         result = await agent._handle_command(session, "/max-iterations abc")
         assert "Invalid value" in result
         assert session.max_tool_iterations == 50  # unchanged
@@ -1164,7 +1169,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.2.0"
+        assert resp.agent_info.version == "2.2.1"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):

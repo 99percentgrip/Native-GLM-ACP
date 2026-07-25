@@ -134,8 +134,13 @@ class TestConstants:
 class TestMaxToolIterations:
     """Per-turn tool-call iteration cap — env-var override + bounds clamp."""
 
-    def test_default_is_fifty(self, monkeypatch):
+    def test_default_is_fifty(self, monkeypatch, tmp_path):
+        # The constant default applies only when no env var is set AND no
+        # persisted user preference exists. Redirect the config dir to an
+        # empty tmp_path so a real ~/.config/glm-acp/max-iterations.json
+        # from interactive use can't leak into this constant-default test.
         monkeypatch.delenv("GLM_ACP_MAX_TOOL_ITERATIONS", raising=False)
+        monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path))
         from glm_acp.config import max_tool_iterations
 
         assert max_tool_iterations() == 50
