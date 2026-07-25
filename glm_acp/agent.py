@@ -83,6 +83,7 @@ from .config import (
     MIN_TOOL_ITERATIONS,
     MOA_PICKER_VALUE,
     MODELS,
+    SMART_APPROVAL_TIMEOUT_SECONDS,
     THOUGHT_LEVELS,
     VISION_MODELS,
     config_dir,
@@ -4189,6 +4190,20 @@ class GlmAcpAgent(acp.Agent):
         if not destructive and not force_ask:
             return True, ""
 
+        # Smart approvals (Hermes v0.19 parity) — when enabled via
+        # GLM_ACP_SMART_APPROVALS=1, route flagged commands through a bounded
+        # auxiliary reviewer that auto-judges risk. The reviewer sees ONLY
+        # credential-redacted tool args; if it returns a clear "safe" verdict,
+        # the user prompt is skipped. "unsafe" or unclear verdicts fall back
+        # to the user prompt. Bypass/read/plan modes are never overridden.
+        smart_verdict = await self._smart_approve(session, tool_name, tool_args)
+        if smart_verdict is True:
+            await self._send_message(
+                session.id,
+                f"\n\n✅ Auto-approved '{tool_name}' via smart reviewer.\n",
+            )
+            return True, ""
+
         # Request permission via ACP request_permission
         tc_update = acp.update_tool_call(
             tool_call_id=tool_call_id,
@@ -4227,6 +4242,165 @@ class GlmAcpAgent(acp.Agent):
         msg = f"User denied the request to run '{tool_name}'."
         await self._send_message(session.id, f"\n\n🚫 {msg}\n")
         return False, msg
+
+    # ------------------------------------------------------------------
+    # Smart approvals (Hermes v0.19 parity)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _smart_approvals_enabled() -> bool:
+        """Whether smart approvals are opted in via the env var.
+
+        Off by default. Smart approvals route flagged destructive commands
+        through a bounded auxiliary reviewer that auto-judges risk before
+        prompting the user. They never override bypass/read/plan modes and
+        never override policy denials.
+        """
+        return os.environ.get("GLM_ACP_SMART_APPROVALS", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _redact_smart_approval_args(tool_name: str, tool_args: dict[str, Any]) -> str:
+        """Render a credential-safe summary of tool args for the reviewer.
+
+        The auxiliary reviewer NEVER sees raw credentials, env values, or
+        diff/file bodies. We render paths and a small set of safe scalar
+        args (line numbers, search patterns); everything else is replaced
+        with a type placeholder.
+        """
+        safe_parts: list[str] = [f"tool={tool_name}"]
+        # Allowlist of keys whose VALUES are non-sensitive and useful for
+        # risk assessment.
+        safe_keys = {
+            "path",
+            "command",
+            "pattern",
+            "include",
+            "glob",
+            "start_line",
+            "end_line",
+            "line",
+            "action",
+            "name",
+            "server",
+            "id",
+            "workdir",
+            "schedule",
+            "repeat",
+        }
+        for key in safe_keys:
+            if key in tool_args:
+                value = tool_args[key]
+                if isinstance(value, (str, int, float, bool)):
+                    safe_parts.append(f"{key}={str(value)[:200]}")
+        # Show keys-only for everything else (no values) so the reviewer
+        # sees the shape of the call without secrets.
+        other_keys = sorted(set(tool_args.keys()) - safe_keys)
+        if other_keys:
+            safe_parts.append(f"other_keys={','.join(other_keys)}")
+        # Credential scrub pass on the rendered string.
+        rendered = " ".join(safe_parts)
+        # Match `key=val`, `key:val`, or `Bearer <token>` (space-separated).
+        rendered = re.sub(
+            r"(?i)(api[_-]?key|token|secret|password|credential|bearer)"
+            r"\s*[:=]?\s+[A-Za-z0-9._~+/=-]{6,}",
+            r"\1=[REDACTED]",
+            rendered,
+        )
+        rendered = re.sub(
+            r"(?i)(api[_-]?key|token|secret|password|credential)"
+            r"\s*[:=]\s*[^\s,]+",
+            r"\1=[REDACTED]",
+            rendered,
+        )
+        return rendered[:1000]
+
+    async def _smart_approve(
+        self,
+        session: Session,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> bool | None:
+        """Auto-judge a flagged command via a bounded auxiliary reviewer.
+
+        Returns:
+        - ``True`` if the reviewer judged the command safe (auto-allow)
+        - ``False`` if the reviewer judged it unsafe (will fall back to user
+          prompt — the reviewer does NOT auto-deny, the user still decides)
+        - ``None`` if smart approvals are disabled, in a non-ask mode, or the
+          review failed/unclear (caller falls back to the user prompt)
+        """
+        if not self._smart_approvals_enabled():
+            return None
+        # Only engage in ask mode. Bypass/read/plan keep their own rules.
+        if session.permission_mode != "ask":
+            return None
+        # Plan mode is read-only with its own rules — don't review there.
+        if getattr(session, "mode", "") == "plan":
+            return None
+        # Auxiliary model must be configured (even if it's the main model).
+        model = (
+            session.model
+            if session.auxiliary_model == DEFAULT_AUXILIARY_MODEL
+            else session.auxiliary_model
+        )
+        base_url = API_ENDPOINTS.get(session.api_endpoint, {}).get(
+            "base_url", API_ENDPOINTS[DEFAULT_API_ENDPOINT]["base_url"]
+        )
+        rendered_args = self._redact_smart_approval_args(tool_name, tool_args)
+        cwd = session.cwd
+        prompt = (
+            "You are a strict safety reviewer for a coding agent. A destructive "
+            f"tool call is about to run in workspace `{cwd}`. Judge ONLY whether "
+            "the call is SAFE to auto-approve. Reply with EXACTLY one word: "
+            "`safe` or `unsafe`. Default to `unsafe` if uncertain.\n\n"
+            "Heuristics:\n"
+            "- `safe`: bounded reads, edits inside the workspace, "
+            "non-destructive test/build/lint commands, "
+            "MCP/credential-free lookups\n"
+            "- `unsafe`: anything outside the workspace, deletions, "
+            "rm/git push/force operations, network-exfiltration shape, "
+            "anything touching credentials, anything that looks like "
+            "privilege escalation\n\n"
+            f"Call to review ({rendered_args})"
+        )
+        messages = [
+            {"role": "system", "content": "Reply with one word: safe or unsafe."},
+            {"role": "user", "content": prompt},
+        ]
+        reviewer = GlmClient(model, thought_level="disabled", base_url=base_url)
+        reviewer.begin_turn()
+        try:
+            result = await asyncio.wait_for(
+                reviewer.stream_completion(
+                    messages=messages,
+                    tools=[],
+                    on_reasoning=None,
+                    on_content=None,
+                    on_tool_call_started=None,
+                    max_output_tokens=20,
+                ),
+                timeout=SMART_APPROVAL_TIMEOUT_SECONDS,
+            )
+        except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+            logger.warning("Smart-approval review failed: %s — falling back to user", exc)
+            return None
+        finally:
+            reviewer.cancel()
+            await reviewer.aclose()
+        if result.usage:
+            self._record_auxiliary_usage(session, result.usage)
+        verdict = (result.content or "").strip().lower()
+        # Strict match — partial / unclear responses fall back to user.
+        if verdict.startswith("safe") and "unsafe" not in verdict:
+            return True
+        if verdict.startswith("unsafe"):
+            return False
+        return None
 
     async def _send_available_commands(self, session: Session) -> None:
         """Advertise slash commands to the client so Zed shows them in the UI."""

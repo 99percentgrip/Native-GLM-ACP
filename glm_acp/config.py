@@ -27,6 +27,11 @@ MAX_DELEGATE_TOOL_CALLS_PER_TURN = 24
 MAX_DELEGATE_INPUT_TOKENS_PER_TURN = 120_000
 MAX_DELEGATE_OUTPUT_TOKENS_PER_TURN = 16_000
 
+# Hard timeout for the smart-approval auxiliary reviewer. Smart approvals
+# (Hermes v0.19 parity) must never block the user long: any verdict that
+# takes longer than this falls back to the normal user prompt.
+SMART_APPROVAL_TIMEOUT_SECONDS = 12
+
 # Bounds for the per-session iteration override (``/max-iterations`` and
 # ``GLM_ACP_MAX_TOOL_ITERATIONS``). The lower bound guards against accidental
 # zero/negative; the upper bound guards against runaway loops.

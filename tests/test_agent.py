@@ -658,6 +658,283 @@ class TestMixturePickerEntry:
         assert session.mixture_mode == "enabled"
 
 
+class TestSmartApprovals:
+    """Smart approvals (Hermes v0.19 parity) — credential-safe, bounded, opt-in."""
+
+    def test_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("GLM_ACP_SMART_APPROVALS", raising=False)
+        assert GlmAcpAgent._smart_approvals_enabled() is False
+
+    @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE", "On"])
+    def test_enabled_by_env_var(self, monkeypatch, val):
+        monkeypatch.setenv("GLM_ACP_SMART_APPROVALS", val)
+        assert GlmAcpAgent._smart_approvals_enabled() is True
+
+    @pytest.mark.parametrize("val", ["0", "false", "no", "off", "", "garbage"])
+    def test_disabled_by_other_env_values(self, monkeypatch, val):
+        monkeypatch.setenv("GLM_ACP_SMART_APPROVALS", val)
+        assert GlmAcpAgent._smart_approvals_enabled() is False
+
+    def test_redact_keeps_safe_keys(self):
+        rendered = GlmAcpAgent._redact_smart_approval_args(
+            "edit_file",
+            {"path": "src/foo.py", "start_line": 10, "end_line": 20},
+        )
+        assert "tool=edit_file" in rendered
+        assert "path=src/foo.py" in rendered
+        assert "start_line=10" in rendered
+        assert "end_line=20" in rendered
+
+    def test_redact_drops_sensitive_values(self):
+        # Command contains a curl-with-API-key shape; the command IS shown
+        # but the inline credential pattern is scrubbed.
+        rendered = GlmAcpAgent._redact_smart_approval_args(
+            "run_command",
+            {"command": "curl -H 'Authorization: Bearer sk-1234567890' example.com"},
+        )
+        # The reviewer sees the command shape, but the bearer token is scrubbed.
+        assert "tool=run_command" in rendered
+        assert "sk-1234567890" not in rendered
+        assert "[REDACTED]" in rendered
+
+    def test_redact_drops_unknown_keys_values(self):
+        # Unknown keys are listed by name only — values are NEVER rendered.
+        rendered = GlmAcpAgent._redact_smart_approval_args(
+            "write_file",
+            {"path": "x.py", "content": "TOP_SECRET_DATA_HERE", "reason": "because"},
+        )
+        assert "path=x.py" in rendered
+        assert "other_keys=content,reason" in rendered
+        assert "TOP_SECRET_DATA_HERE" not in rendered
+        assert "because" not in rendered
+
+    def test_redact_caps_at_1000_chars(self):
+        rendered = GlmAcpAgent._redact_smart_approval_args(
+            "run_command",
+            {"command": "x" * 5000},
+        )
+        assert len(rendered) <= 1000
+
+    @pytest.mark.asyncio
+    async def test_smart_approve_returns_none_when_disabled(self, agent, session, monkeypatch):
+        monkeypatch.delenv("GLM_ACP_SMART_APPROVALS", raising=False)
+        verdict = await agent._smart_approve(session, "write_file", {"path": "x.py"})
+        assert verdict is None
+
+    @pytest.mark.asyncio
+    async def test_smart_approve_returns_none_in_bypass_mode(
+        self, agent, session, monkeypatch
+    ):
+        monkeypatch.setenv("GLM_ACP_SMART_APPROVALS", "1")
+        session.permission_mode = "bypass"
+        verdict = await agent._smart_approve(session, "write_file", {"path": "x.py"})
+        assert verdict is None
+
+    @pytest.mark.asyncio
+    async def test_smart_approve_returns_none_in_read_mode(self, agent, session, monkeypatch):
+        monkeypatch.setenv("GLM_ACP_SMART_APPROVALS", "1")
+        session.permission_mode = "read"
+        verdict = await agent._smart_approve(session, "write_file", {"path": "x.py"})
+        assert verdict is None
+
+    @pytest.mark.asyncio
+    async def test_smart_approve_returns_none_in_plan_mode(self, agent, session, monkeypatch):
+        monkeypatch.setenv("GLM_ACP_SMART_APPROVALS", "1")
+        session.permission_mode = "ask"
+        session.mode = "plan"
+        verdict = await agent._smart_approve(session, "write_file", {"path": "x.py"})
+        assert verdict is None
+
+    @pytest.mark.asyncio
+    async def test_smart_approve_safe_verdict(self, agent, session, monkeypatch):
+        """Reviewer says 'safe' → auto-allow."""
+        monkeypatch.setenv("GLM_ACP_SMART_APPROVALS", "1")
+        session.permission_mode = "ask"
+        session.mode = "code"
+
+        class FakeReviewer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def begin_turn(self):
+                pass
+
+            async def stream_completion(self, **_kwargs):
+                return SimpleNamespace(content="safe", tool_calls=[], usage={})
+
+            async def aclose(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        monkeypatch.setattr("glm_acp.agent.GlmClient", FakeReviewer)
+        verdict = await agent._smart_approve(session, "edit_file", {"path": "x.py"})
+        assert verdict is True
+
+    @pytest.mark.asyncio
+    async def test_smart_approve_unsafe_verdict(self, agent, session, monkeypatch):
+        """Reviewer says 'unsafe' → fall back to user prompt (return False)."""
+        monkeypatch.setenv("GLM_ACP_SMART_APPROVALS", "1")
+        session.permission_mode = "ask"
+        session.mode = "code"
+
+        class FakeReviewer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def begin_turn(self):
+                pass
+
+            async def stream_completion(self, **_kwargs):
+                return SimpleNamespace(content="unsafe", tool_calls=[], usage={})
+
+            async def aclose(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        monkeypatch.setattr("glm_acp.agent.GlmClient", FakeReviewer)
+        verdict = await agent._smart_approve(session, "run_command", {"command": "rm -rf /"})
+        assert verdict is False
+
+    @pytest.mark.asyncio
+    async def test_smart_approve_unclear_verdict_returns_none(
+        self, agent, session, monkeypatch
+    ):
+        """Garbled reviewer response → return None (fall back to user)."""
+        monkeypatch.setenv("GLM_ACP_SMART_APPROVALS", "1")
+        session.permission_mode = "ask"
+        session.mode = "code"
+
+        class FakeReviewer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def begin_turn(self):
+                pass
+
+            async def stream_completion(self, **_kwargs):
+                return SimpleNamespace(content="maybe?", tool_calls=[], usage={})
+
+            async def aclose(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        monkeypatch.setattr("glm_acp.agent.GlmClient", FakeReviewer)
+        verdict = await agent._smart_approve(session, "write_file", {"path": "x.py"})
+        assert verdict is None
+
+    @pytest.mark.asyncio
+    async def test_smart_approve_reviewer_failure_returns_none(
+        self, agent, session, monkeypatch
+    ):
+        """Reviewer raises → return None (must never break the agent)."""
+        monkeypatch.setenv("GLM_ACP_SMART_APPROVALS", "1")
+        session.permission_mode = "ask"
+        session.mode = "code"
+
+        class FakeReviewer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def begin_turn(self):
+                pass
+
+            async def stream_completion(self, **_kwargs):
+                raise RuntimeError("API down")
+
+            async def aclose(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        monkeypatch.setattr("glm_acp.agent.GlmClient", FakeReviewer)
+        verdict = await agent._smart_approve(session, "write_file", {"path": "x.py"})
+        assert verdict is None
+
+    @pytest.mark.asyncio
+    async def test_check_permission_uses_smart_approve_when_enabled(
+        self, agent, session, monkeypatch
+    ):
+        """End-to-end: ask mode + smart approvals + safe verdict → auto-allow
+        WITHOUT calling request_permission."""
+        monkeypatch.setenv("GLM_ACP_SMART_APPROVALS", "1")
+        session.permission_mode = "ask"
+        session.mode = "code"
+
+        class FakeReviewer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def begin_turn(self):
+                pass
+
+            async def stream_completion(self, **_kwargs):
+                return SimpleNamespace(content="safe", tool_calls=[], usage={})
+
+            async def aclose(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        monkeypatch.setattr("glm_acp.agent.GlmClient", FakeReviewer)
+        # request_permission should NOT be called.
+        agent._conn.request_permission = AsyncMock(
+            side_effect=AssertionError("should not be called")
+        )
+
+        permitted, _ = await agent._check_permission(
+            session, "tc1", "write_file", {"path": "safe_path.py"}
+        )
+        assert permitted is True
+        agent._conn.request_permission.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_check_permission_falls_back_when_smart_unsafe(
+        self, agent, session, monkeypatch
+    ):
+        """Reviewer says 'unsafe' → request_permission still fires (user decides)."""
+        monkeypatch.setenv("GLM_ACP_SMART_APPROVALS", "1")
+        session.permission_mode = "ask"
+        session.mode = "code"
+
+        class FakeReviewer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def begin_turn(self):
+                pass
+
+            async def stream_completion(self, **_kwargs):
+                return SimpleNamespace(content="unsafe", tool_calls=[], usage={})
+
+            async def aclose(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        monkeypatch.setattr("glm_acp.agent.GlmClient", FakeReviewer)
+        mock_resp = SimpleNamespace(
+            outcome=SimpleNamespace(outcome="selected", option_id="reject"),
+            modified_raw_input=None,
+        )
+        agent._conn.request_permission = AsyncMock(return_value=mock_resp)
+
+        permitted, _ = await agent._check_permission(
+            session, "tc1", "run_command", {"command": "rm -rf /"}
+        )
+        # User was prompted and denied.
+        assert permitted is False
+        agent._conn.request_permission.assert_called_once()
+
+
 class TestAuxiliaryRouting:
     @pytest.mark.asyncio
     async def test_auxiliary_model_generates_titles_and_accounts_usage(
@@ -1369,7 +1646,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.4.0"
+        assert resp.agent_info.version == "2.5.0"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):

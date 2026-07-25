@@ -233,6 +233,16 @@ session's `permission_mode`:
 
 Permission state is stored per-session and persisted to disk.
 
+**Smart approvals** (Hermes v0.19 parity, opt-in via `GLM_ACP_SMART_APPROVALS=1`):
+when enabled, flagged destructive commands in **Ask** mode are routed through
+a bounded auxiliary GLM reviewer that auto-judges risk before prompting the
+user. The reviewer sees ONLY credential-redacted tool args (paths, command
+shape, safe scalars; secrets and unknown values are dropped or scrubbed) and
+replies `safe`/`unsafe`. A `safe` verdict auto-allows without a prompt;
+`unsafe`/unclear/failed verdicts fall back to the normal user prompt. Smart
+approvals never override Bypass/Read/Plan modes or policy denials, and the
+reviewer is bounded by a hard 12-second timeout.
+
 ### Scheduled automation
 
 - `cronjob` is one stable permission-gated tool for create/list/update/pause/resume/run/remove; scheduled sessions cannot call it recursively.
