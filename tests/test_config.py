@@ -100,6 +100,46 @@ class TestStatuslineConfig:
         assert load_statusline_config() == set(STATUSLINE_SEGMENT_IDS)
 
 
+class TestThemeConfig:
+    """Tier 2.8: persistent Textual theme preference."""
+
+    def test_default_returns_none_when_file_missing(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_theme_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        assert load_theme_config() is None
+
+    def test_save_then_load_round_trip(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_theme_config, save_theme_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        saved = save_theme_config("nord")
+        assert saved == "nord"
+        assert load_theme_config() == "nord"
+
+    def test_empty_or_blank_falls_back_to_textual_dark(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_theme_config, save_theme_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        # Empty string must not be persisted as-is; fall back to the default.
+        assert save_theme_config("") == "textual-dark"
+        assert load_theme_config() == "textual-dark"
+
+    def test_corrupt_file_falls_back_to_none(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_theme_config, theme_path
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        theme_path().write_text("not json {{{", encoding="utf-8")
+        assert load_theme_config() is None
+
+    def test_wrong_schema_falls_back_to_none(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_theme_config, theme_path
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        theme_path().write_text('{"wrong": "shape"}', encoding="utf-8")
+        assert load_theme_config() is None
+
+
 class TestModelRegistry:
     def test_all_models_have_context_window(self):
         for model_id in MODELS:

@@ -60,7 +60,9 @@ from .config import (
     THOUGHT_LEVELS,
     VISION_MODELS,
     load_statusline_config,
+    load_theme_config,
     save_statusline_config,
+    save_theme_config,
     thought_levels_for_model,
 )
 from .glm_client import PlanUsage
@@ -89,6 +91,7 @@ LOCAL_COMMANDS = {
     "/statusline": "Choose which sidebar segments are visible (state, model, tokens, quota, …)",
     "/context": "Visualize context-window usage by segment (system, user, assistant, tool)",
     "/btw": "Ask a side question without polluting the conversation (/btw <question>)",
+    "/theme": "Switch the visual theme (textual-dark, textual-light, ansi, dracula, nord, …)",
     # Agent-side commands (implemented in the shared runtime; listed here so
     # they appear in the /-menu and the Ctrl+P command palette for discovery).
     "/status": "Show session, model, permissions, context, and live evidence",
@@ -1591,6 +1594,11 @@ class NativeGlmTui(App[int]):
         # only renders segments whose IDs are in this set; defaults to
         # all visible on first run.
         self._statusline_segments: set[str] = load_statusline_config()
+        # Persisted Textual theme name (loaded from ``config_dir()/theme.json``).
+        # Applied on mount once the App is running; subsequent user changes
+        # via ``/theme`` are persisted by ``watch_theme``.
+        self._saved_theme: str | None = load_theme_config()
+        self._theme_persist_scheduled = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1640,6 +1648,12 @@ class NativeGlmTui(App[int]):
         self.query_one("#tools").border_title = "Activity"
         self.query_one("#command-menu").border_title = "Commands"
         self.query_one("#tools", RichLog).write("[dim]Waiting for tool activity…[/dim]")
+        # Apply persisted theme (if any) now that the App is running.
+        if self._saved_theme and self._saved_theme in self.available_themes:
+            try:
+                self.theme = self._saved_theme
+            except Exception:
+                pass
         self._activity_timer = self.set_interval(
             self.ACTIVITY_INTERVAL_SECONDS,
             self._advance_activity_animation,
@@ -1660,6 +1674,21 @@ class NativeGlmTui(App[int]):
             "on",
         }:
             self.call_after_refresh(self.action_toggle_native_mouse)
+
+    def watch_theme(self, theme_name: str) -> None:
+        """Persist user-initiated theme changes to ``config_dir()/theme.json``.
+
+        Skipped during the initial load (when ``_saved_theme`` is being
+        applied via ``on_mount``) to avoid writing back what we just read.
+        Subsequent user changes via ``/theme`` or the Ctrl+P palette flow
+        through here and are saved.
+        """
+        if theme_name and theme_name != self._saved_theme:
+            try:
+                save_theme_config(theme_name)
+            except OSError:
+                pass
+        self._saved_theme = theme_name
 
     @work(exclusive=True, group="agent-initialize")
     async def initialize_agent(self) -> None:
@@ -1830,6 +1859,9 @@ class NativeGlmTui(App[int]):
         if text == "/btw" or text.startswith("/btw "):
             question = text.partition(" ")[2].strip()
             await self.action_open_btw(question)
+            return True
+        if text == "/theme":
+            self.action_change_theme()
             return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)

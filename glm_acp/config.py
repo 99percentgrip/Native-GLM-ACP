@@ -205,6 +205,57 @@ def save_statusline_config(segments: set[str]) -> set[str]:
     return enabled
 
 
+def theme_path() -> Path:
+    """Return the path to the persistent user theme preference."""
+    return config_dir() / "theme.json"
+
+
+def load_theme_config() -> str | None:
+    """Return the persisted Textual theme name, or ``None`` if unset/invalid.
+
+    Best-effort: missing file, parse error, or wrong schema all fall back
+    to ``None`` so the caller uses Textual's default theme. The returned
+    name is validated against Textual's available themes by the caller
+    (the TUI App), not here — config stays framework-agnostic.
+    """
+    try:
+        payload = json.loads(theme_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("theme")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def save_theme_config(theme_name: str) -> str:
+    """Persist ``theme_name`` as the user default and return it.
+
+    The value is written atomically so concurrent readers never see a
+    partial file. Validation against Textual's available themes is the
+    caller's responsibility — config persists whatever string is given.
+    """
+    cleaned = (theme_name or "").strip() or "textual-dark"
+    payload = {"theme": cleaned}
+    path = theme_path()
+    _secure_dir(path.parent)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _secure_file(temporary)
+        os.replace(temporary, path)
+        _secure_file(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return cleaned
+
+
 def _secure_dir(path: Path) -> None:
     """Create ``path`` (and parents) with 0700 perms; never raise on chmod."""
     path.mkdir(parents=True, exist_ok=True, mode=0o700)

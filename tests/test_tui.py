@@ -1625,6 +1625,39 @@ async def test_tui_btw_command_routes_to_overlay_screen(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tui_theme_command_opens_picker_and_persists(tmp_path, monkeypatch):
+    """Tier 2.8: ``/theme`` opens Textual's built-in theme picker; setting a
+    theme via the reactive persists to ``config_dir()/theme.json``."""
+    from glm_acp.config import load_theme_config
+
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    picker_opened = {"yes": False}
+
+    def fake_search():
+        picker_opened["yes"] = True
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Stub the built-in so the test doesn't actually push a modal.
+        app.action_change_theme = fake_search  # type: ignore[method-assign]
+
+        handled = await app._handle_local_command("/theme")
+        assert handled is True
+        assert picker_opened["yes"] is True
+
+        # Simulate the user picking a theme: setting the reactive should
+        # trigger ``watch_theme`` and persist.
+        app.theme = "nord"
+        await pilot.pause(0.05)
+        assert load_theme_config() == "nord"
+        app.exit(0)
+
+
+@pytest.mark.asyncio
 async def test_tui_refresh_session_panel_hides_disabled_segments(tmp_path, monkeypatch):
     """When segments are toggled off, ``_refresh_session_panel`` omits them."""
     monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
