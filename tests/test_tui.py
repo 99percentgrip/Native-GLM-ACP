@@ -92,6 +92,16 @@ class FakeAgent:
         self.mode_calls.append(mode_id)
         self._sessions[session_id].mode = mode_id
 
+    def context_breakdown(self, session_id):
+        """Tier 2.2 test double — delegate to the real GlmAcpAgent method
+        so the TUI test for ``/context`` exercises the same code path
+        without spinning up the full ACP stack."""
+        from glm_acp.agent import GlmAcpAgent
+
+        agent = GlmAcpAgent.__new__(GlmAcpAgent)
+        agent._sessions = self._sessions
+        return agent.context_breakdown(session_id)
+
     async def query_provider_usage(self, session_id):
         self.usage_calls += 1
         return PlanUsage(
@@ -1524,6 +1534,46 @@ async def test_tui_statusline_command_opens_modal_and_persists(tmp_path, monkeyp
         assert app._statusline_segments == chosen
         reloaded = load_statusline_config()
         assert reloaded == chosen
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_context_command_routes_to_breakdown_screen(tmp_path):
+    """Tier 2.2: ``/context`` opens the ContextBudgetScreen with a real
+    per-segment breakdown of the live session."""
+    from glm_acp.tui import ContextBudgetScreen
+
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    captured: dict[str, object] = {}
+
+    async def fake_push(screen):
+        captured["screen"] = screen
+        return None
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen = fake_push  # type: ignore[method-assign]
+        # Seed a real breakdown via the shared agent method.
+        session = agent._sessions[app.session_id]
+        session.context_size = 1_000_000
+        session.messages = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "fix the bug"},
+            {"role": "assistant", "content": "ok reading file"},
+            {"role": "tool", "content": "file contents"},
+        ]
+
+        handled = await app._handle_local_command("/context")
+        assert handled is True
+        assert isinstance(captured.get("screen"), ContextBudgetScreen)
+        breakdown = captured["screen"]._breakdown  # type: ignore[attr-defined]
+        assert breakdown["total_tokens"] > 0
+        assert breakdown["context_size"] > 0
+        labels = [s["label"] for s in breakdown["segments"]]
+        assert "System prompt" in labels
+        assert "Tool results" in labels
         app.exit(0)
 
 

@@ -742,6 +742,66 @@ class GlmAcpAgent(acp.Agent):
         session = self._sessions[session_id]
         return self._client_for_session(session).query_plan_usage_sync()
 
+    def context_breakdown(self, session_id: str) -> dict[str, Any]:
+        """Return a per-segment token breakdown for the ``/context`` view.
+
+        Groups the live ``session.messages`` by role and estimates tokens
+        for each group using the same heuristic as ``_estimate_tokens``.
+        Returns a dict with ``segments`` (ordered list of
+        ``(label, role, count, tokens, percent_of_window)`` tuples),
+        ``total_tokens``, ``context_size``, and ``usage_percent``. Unknown
+        sessions return an empty breakdown so the caller can show a
+        graceful "session not ready" message instead of raising.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            return {
+                "segments": [],
+                "total_tokens": 0,
+                "context_size": 0,
+                "usage_percent": 0.0,
+            }
+        context_size = int(getattr(session, "context_size", 0)) or 1
+        # Group messages by role while preserving a stable, readable order.
+        role_order = ("system", "user", "assistant", "tool")
+        role_labels = {
+            "system": "System prompt",
+            "user": "User turns",
+            "assistant": "Assistant turns",
+            "tool": "Tool results",
+        }
+        buckets: dict[str, list[dict[str, Any]]] = {role: [] for role in role_order}
+        for message in session.messages:
+            role = str(message.get("role", "user"))
+            if role not in buckets:
+                # Unknown roles (rare) collapse into user for visibility.
+                buckets["user"].append(message)
+            else:
+                buckets[role].append(message)
+        segments: list[dict[str, Any]] = []
+        total_tokens = 0
+        for role in role_order:
+            messages = buckets[role]
+            if not messages:
+                continue
+            tokens = self._estimate_tokens(messages)
+            total_tokens += tokens
+            segments.append(
+                {
+                    "label": role_labels[role],
+                    "role": role,
+                    "count": len(messages),
+                    "tokens": tokens,
+                    "percent_of_window": round(tokens * 100.0 / context_size, 2),
+                }
+            )
+        return {
+            "segments": segments,
+            "total_tokens": total_tokens,
+            "context_size": context_size,
+            "usage_percent": round(total_tokens * 100.0 / context_size, 2),
+        }
+
     @staticmethod
     def format_provider_usage(usage: PlanUsage) -> str:
         """Render normalized provider quota data without exposing credentials."""

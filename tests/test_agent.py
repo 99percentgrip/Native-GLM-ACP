@@ -1220,6 +1220,79 @@ class TestSessionRecap:
         assert "base64" not in recap
 
 
+class TestContextBreakdown:
+    """Tier 2.2: ``/context`` per-segment token breakdown."""
+
+    def test_unknown_session_returns_empty_breakdown(self, agent):
+        breakdown = agent.context_breakdown("nonexistent-session-id")
+        assert breakdown["segments"] == []
+        assert breakdown["total_tokens"] == 0
+        assert breakdown["context_size"] == 0
+        assert breakdown["usage_percent"] == 0.0
+
+    def test_populated_session_groups_by_role_and_sums_tokens(self, agent, session):
+        session.context_size = 10_000
+        session.messages = [
+            {"role": "system", "content": "You are a helpful coding agent." * 30},
+            {"role": "user", "content": "Fix the auth bug in login.py"},
+            {"role": "assistant", "content": "I will read login.py first." * 10},
+            {"role": "tool", "content": "def login():\n    pass\n" * 50},
+            {"role": "user", "content": "Now fix the token refresh path too."},
+            {"role": "assistant", "content": "Done. Patching refresh.py." * 10},
+        ]
+        agent._sessions[session.id] = session
+
+        breakdown = agent.context_breakdown(session.id)
+
+        labels = [s["label"] for s in breakdown["segments"]]
+        assert labels == ["System prompt", "User turns", "Assistant turns", "Tool results"]
+        counts = {s["label"]: s["count"] for s in breakdown["segments"]}
+        assert counts["System prompt"] == 1
+        assert counts["User turns"] == 2
+        assert counts["Assistant turns"] == 2
+        assert counts["Tool results"] == 1
+        segment_sum = sum(s["tokens"] for s in breakdown["segments"])
+        assert breakdown["total_tokens"] == segment_sum
+        assert breakdown["total_tokens"] > 0
+        assert breakdown["context_size"] == 10_000
+        assert (
+            abs(breakdown["usage_percent"] - segment_sum * 100.0 / 10_000) < 0.01
+        )
+        for seg in breakdown["segments"]:
+            assert (
+                abs(seg["percent_of_window"] - seg["tokens"] * 100.0 / 10_000) < 0.01
+            )
+
+    def test_empty_session_returns_zero_total_but_keeps_context_size(self, agent, session):
+        session.context_size = 1_000_000
+        session.messages = []
+        agent._sessions[session.id] = session
+
+        breakdown = agent.context_breakdown(session.id)
+
+        assert breakdown["segments"] == []
+        assert breakdown["total_tokens"] == 0
+        assert breakdown["context_size"] == 1_000_000
+        assert breakdown["usage_percent"] == 0.0
+
+    def test_unknown_roles_collapse_into_user_bucket(self, agent, session):
+        session.context_size = 100_000
+        session.messages = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "first user turn"},
+            {"role": "weird-custom-role", "content": "should not crash"},
+        ]
+        agent._sessions[session.id] = session
+
+        breakdown = agent.context_breakdown(session.id)
+
+        labels = [s["label"] for s in breakdown["segments"]]
+        assert "System prompt" in labels
+        assert "User turns" in labels
+        user_seg = next(s for s in breakdown["segments"] if s["label"] == "User turns")
+        assert user_seg["count"] == 2
+
+
 class TestSetSessionMode:
     @pytest.mark.asyncio
     async def test_valid_mode(self, agent, session):
@@ -1869,7 +1942,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.7.4"
+        assert resp.agent_info.version == "2.7.5"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):

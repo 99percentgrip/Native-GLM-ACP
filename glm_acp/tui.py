@@ -87,6 +87,7 @@ LOCAL_COMMANDS = {
     "/recap": "Show a one-line summary of the session so far",
     "/blocks": "Pick a code block from recent responses to copy or save (Enter copy, w write)",
     "/statusline": "Choose which sidebar segments are visible (state, model, tokens, quota, …)",
+    "/context": "Visualize context-window usage by segment (system, user, assistant, tool)",
     # Agent-side commands (implemented in the shared runtime; listed here so
     # they appear in the /-menu and the Ctrl+P command palette for discovery).
     "/status": "Show session, model, permissions, context, and live evidence",
@@ -1037,6 +1038,90 @@ class StatusLineScreen(ModalScreen[set[str] | None]):
         self.dismiss(None)
 
 
+class ContextBudgetScreen(ModalScreen[None]):
+    """Visualize the per-segment context-window breakdown.
+
+    Renders a horizontal bar chart of token usage by message-role segment
+    (system prompt, user turns, assistant turns, tool results), with the
+    total used / context-window size and a percentage. Used by ``/context``.
+    Press ``c`` to dismiss and run ``/compact`` (which preserves the most
+    recent turns and summarizes the rest), or Esc to close.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close", priority=True),
+        Binding("c", "compact", "Compact", priority=True),
+    ]
+
+    CSS = """
+    ContextBudgetScreen { align: center middle; background: $background 70%; }
+    #context-dialog {
+        width: 86; max-width: 96%; height: auto; max-height: 90%;
+        border: thick $accent; background: $surface; padding: 1 2;
+    }
+    #context-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    #context-summary { color: $text-muted; margin-bottom: 1; }
+    .context-segment { height: auto; margin-bottom: 0; }
+    .context-segment-label { width: 22; color: $text; }
+    .context-segment-bar { color: $accent; }
+    .context-segment-tokens { color: $text-muted; }
+    #context-hint { color: $text-muted; margin-top: 1; }
+    """
+
+    # Each bar is rendered with this many cells at 100% context-window use.
+    BAR_WIDTH = 40
+
+    def __init__(self, breakdown: dict[str, Any]) -> None:
+        super().__init__()
+        self._breakdown = breakdown
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="context-dialog"):
+            yield Label("Context window budget", id="context-title")
+            yield Label(self._summary_line(), id="context-summary", markup=False)
+            with VerticalScroll():
+                for segment in self._breakdown.get("segments", []):
+                    yield Static(self._segment_line(segment), markup=False)
+            yield Label(
+                "c compact older context  ·  Esc close",
+                id="context-hint",
+                markup=False,
+            )
+
+    def _summary_line(self) -> str:
+        total = self._breakdown.get("total_tokens", 0)
+        size = self._breakdown.get("context_size", 0)
+        pct = self._breakdown.get("usage_percent", 0.0)
+        if not size:
+            return "Session not ready."
+        return (
+            f"{total:,} / {size:,} tokens  ·  {pct:g}% of context window  "
+            f"·  {size - total:,} remaining"
+        )
+
+    def _segment_line(self, segment: dict[str, Any]) -> str:
+        label = str(segment.get("label", "?"))
+        count = int(segment.get("count", 0))
+        tokens = int(segment.get("tokens", 0))
+        pct = float(segment.get("percent_of_window", 0.0))
+        # Bar: scale by share-of-window so the chart sums to total usage.
+        cells = max(1, int(round(pct / 100.0 * self.BAR_WIDTH))) if pct > 0 else 0
+        bar = "█" * cells + "·" * (self.BAR_WIDTH - cells)
+        return (
+            f"{label:<22} {count:>3} msgs  {tokens:>7,} tok  {pct:>5.2f}%  {bar}"
+        )
+
+    def action_compact(self) -> None:
+        # Signal the caller to run /compact by dismissing with "compact".
+        self.dismiss(None)
+        app = self.app
+        if isinstance(app, NativeGlmTui):
+            app.call_later(app.run_compact_from_context_view)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 def _extract_message_text(msg: dict[str, Any]) -> str:
     """Best-effort plain-text extraction from a session message dict."""
     parts: list[str] = []
@@ -1657,6 +1742,9 @@ class NativeGlmTui(App[int]):
             return True
         if text == "/statusline":
             await self.action_open_statusline()
+            return True
+        if text == "/context":
+            await self.action_open_context()
             return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)
@@ -2604,6 +2692,32 @@ class NativeGlmTui(App[int]):
             title="Statusline updated",
             severity="success",
         )
+
+    async def action_open_context(self) -> None:
+        """``/context``: visualize context-window usage by message-role segment."""
+        try:
+            breakdown = self.agent.context_breakdown(self.session_id)
+        except Exception as error:  # noqa: BLE001 — surface any error plainly
+            self.notify(f"Context breakdown failed: {error}", severity="error")
+            return
+        if not breakdown.get("segments"):
+            self.notify("Session not ready — try again in a moment", severity="information")
+            return
+        await self.push_screen(ContextBudgetScreen(breakdown))
+
+    async def run_compact_from_context_view(self) -> None:
+        """Run ``/compact`` after the context-view modal signals it (press ``c``).
+
+        Inserts ``/compact`` into the composer and submits it, reusing the
+        existing agent-side handler (which calls ``_maybe_compact`` with
+        ``force=True``).
+        """
+        composer = self.query_one("#composer", CommandInput)
+        if composer.disabled:
+            self.notify("Cannot compact while a turn is running", severity="warning")
+            return
+        composer.value = "/compact"
+        await composer.action_submit()
 
     async def _resume_session(self, session_id: str) -> None:
         """Resume a persisted session through the shared agent runtime."""
