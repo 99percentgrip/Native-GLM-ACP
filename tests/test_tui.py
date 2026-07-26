@@ -833,7 +833,10 @@ async def test_slash_menu_filters_live_agent_commands_and_supports_tab_escape(tm
         menu = app.query_one("#command-menu", OptionList)
 
         composer.value = "/"
-        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause(0.02)
+            if menu.has_class("visible"):
+                break
         assert menu.has_class("visible")
         assert "/status" in app._command_values
         assert "/checkpoint" in app._command_values
