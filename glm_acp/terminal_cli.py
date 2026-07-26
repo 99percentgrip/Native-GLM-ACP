@@ -49,6 +49,8 @@ def add_chat_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     parser.add_argument(
         "--plain", action="store_true", help="use the line-oriented REPL instead of the full TUI"
     )
+    parser.add_argument("--mobile-bind", default="127.0.0.1:8765", help="mobile companion bind")
+    parser.add_argument("--mobile-allow-public", action="store_true")
 
 
 class TerminalClient:

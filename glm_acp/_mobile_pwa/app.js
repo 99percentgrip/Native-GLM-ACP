@@ -1,0 +1,2 @@
+const query=new URLSearchParams(location.search), id=query.get("approval");
+if(id){document.querySelector("#status").innerHTML='<button id="allow">Allow</button> <button id="deny">Deny</button>';for(const [key,approved] of [["allow",true],["deny",false]])document.querySelector('#'+key).onclick=async()=>{await fetch('/approve/'+id,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({approved})});document.querySelector('#status').textContent='Response sent.'}}

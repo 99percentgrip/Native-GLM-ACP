@@ -77,6 +77,7 @@ from .config import (
 )
 from .glm_client import PlanUsage
 from .memory import list_learned_skills, read_memory, read_user_profile
+from .mobile_server import MobileServer, MobileServerError
 from .terminal_image import detect_graphics_protocol, path_link, render_inline
 from .worktree_session import WorktreeSessionError, create_worktree_session
 
@@ -120,6 +121,7 @@ LOCAL_COMMANDS = {
     "/screenshot": "Capture a screenshot and queue it for the next prompt",
     "/attach": "Queue an image file for the next prompt (/attach <path>)",
     "/sessions-new": "Create and switch to a parallel Git worktree session (/sessions-new <name>)",
+    "/mobile": "Start or stop the loopback mobile approval companion",
     "/rename": "Rename the current session (/rename <name>)",
     "/branch": "Fork the current session to try a different direction (/branch [name])",
     # Agent-side commands (implemented in the shared runtime; listed here so
@@ -1850,7 +1852,16 @@ class TuiClient:
         detail = TerminalClient._permission_detail(getattr(tool_call, "raw_input", None))
         self.app._set_activity("Waiting for approval", tone="warning")
         try:
-            allowed = await self.app.push_screen_wait(PermissionScreen(str(title), detail))
+            mobile = self.app._mobile_server
+            if mobile is not None and mobile.running:
+                decision: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+                approval_id = mobile.register_approval(decision)
+                await self.app._append_system(
+                    f"Mobile approval pending: {mobile.url}?approval={approval_id}"
+                )
+                allowed = await decision
+            else:
+                allowed = await self.app.push_screen_wait(PermissionScreen(str(title), detail))
         finally:
             if self.app._prompt_worker is not None:
                 self.app._set_activity(
@@ -2222,6 +2233,7 @@ class NativeGlmTui(App[int]):
         # Maps ACP session IDs to their durable worktree/session metadata.
         # The shared agent remains the source of truth for actual sessions.
         self._worktree_sessions: dict[str, dict[str, str]] = {}
+        self._mobile_server: MobileServer | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -2508,6 +2520,9 @@ class NativeGlmTui(App[int]):
             return True
         if text == "/sessions-new" or text.startswith("/sessions-new "):
             await self.action_new_worktree_session(text.partition(" ")[2].strip())
+            return True
+        if text == "/mobile":
+            await self.action_mobile()
             return True
         if text == "/context":
             await self.action_open_context()
@@ -3326,6 +3341,9 @@ class NativeGlmTui(App[int]):
         if self._shutdown_requested:
             return
         self._shutdown_requested = True
+        if self._mobile_server is not None:
+            self._mobile_server.stop()
+            self._mobile_server = None
         self.exit(0)
 
     async def _close_agent_resources(self) -> None:
@@ -3995,6 +4013,41 @@ class NativeGlmTui(App[int]):
         self._refresh_session_panel("Ready")
         self.query_one("#composer", Input).focus()
         self.notify(f"Worktree session ready: {requested}", severity="success")
+
+    async def action_mobile(self) -> None:
+        """Toggle the optional loopback mobile approval companion."""
+        if self._mobile_server is not None and self._mobile_server.running:
+            self._mobile_server.stop()
+            self._mobile_server = None
+            self.notify("Mobile companion stopped", severity="information")
+            return
+        try:
+            server = MobileServer(
+                getattr(self.args, "mobile_bind", "127.0.0.1:8765"),
+                allow_public=bool(getattr(self.args, "mobile_allow_public", False)),
+            )
+            server.start()
+        except MobileServerError as error:
+            self.notify(str(error), severity="warning")
+            return
+        self._mobile_server = server
+        qr = f"Mobile companion: {server.url}"
+        try:
+            import qrcode  # type: ignore[import-not-found]
+
+            code = qrcode.QRCode(border=1)
+            code.add_data(server.url)
+            code.make(fit=True)
+            qr += "\n" + "\n".join(
+                "".join("██" if bit else "  " for bit in row)
+                for row in code.get_matrix()
+            )
+        except ImportError:
+            qr += "\nInstall qrcode for a terminal QR code."
+        await self.query_one("#transcript", VerticalScroll).mount(
+            Static(qr, id="mobile-qr", classes="system-message", markup=False)
+        )
+        self.notify(f"Mobile companion running at {server.url}", severity="success")
 
     async def action_annotate(self) -> None:
         """Open the line-anchored diff annotator and prefill its follow-up."""

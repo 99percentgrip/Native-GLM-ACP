@@ -2893,3 +2893,36 @@ async def test_tui_worktree_tabs_switch_between_shared_sessions(tmp_path, monkey
         assert app.session_id != second_session
         assert app._session_cwd() == str(tmp_path)
         app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_mobile_command_toggles_server(tmp_path):
+    app = NativeGlmTui(_args(tmp_path, "--mobile-bind", "127.0.0.1:0"), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app.action_mobile()
+        assert app._mobile_server is not None and app._mobile_server.running
+        await app.action_mobile()
+        assert app._mobile_server is None
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_mobile_renders_qr_widget(tmp_path):
+    app = NativeGlmTui(_args(tmp_path, "--mobile-bind", "127.0.0.1:0"), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app._handle_local_command("/mobile")
+        assert app.query_one("#mobile-qr", Static)
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_mobile_stops_on_exit(tmp_path):
+    app = NativeGlmTui(_args(tmp_path, "--mobile-bind", "127.0.0.1:0"), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app.action_mobile()
+        server = app._mobile_server
+        await app.action_quit_agent()
+        assert server is not None and not server.running
