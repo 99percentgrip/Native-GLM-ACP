@@ -2199,6 +2199,10 @@ class NativeGlmTui(App[int]):
     .user-message { margin: 1 1 0 8; padding: 1; background: #12314b; }
     .agent-message { margin: 1 8 0 1; padding: 1; background: #171d26; }
     .system-message { margin: 1 4; color: $text-muted; }
+    #mobile-qr {
+        width: auto; height: auto; padding: 0;
+        color: #000000; background: #ffffff;
+    }
     """
 
     def __init__(
@@ -4131,7 +4135,7 @@ class NativeGlmTui(App[int]):
         code.make(fit=True)
         rendered = Text("Scan to pair your phone for approvals:\n")
         for row in code.get_matrix():
-            rendered.append("".join("  " if bit else "██" for bit in row), style="black on white")
+            rendered.append("".join("██" if bit else "  " for bit in row))
             rendered.append("\n")
         await self.query_one("#transcript", VerticalScroll).mount(
             Static(

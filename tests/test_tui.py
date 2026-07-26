@@ -14,6 +14,7 @@ from acp.helpers import update_available_commands
 from acp.schema import AvailableCommand, PermissionOption
 from textual import events
 from textual._xterm_parser import XTermParser
+from textual.color import Color
 from textual.containers import VerticalScroll
 from textual.widgets import (
     ContentSwitcher,
@@ -2974,6 +2975,8 @@ async def test_tui_mobile_renders_pairing_qr_and_routes_active_permission(tmp_pa
                 break
         qr = app.query_one("#mobile-qr", Static)
         assert "Scan to pair your phone for approvals" in str(qr.render())
+        assert qr.styles.color == Color(0, 0, 0)
+        assert qr.styles.background == Color(255, 255, 255)
         server = app._mobile_server
         assert server is not None and len(server._approvals) == 1
         approval_id = next(iter(server._approvals))

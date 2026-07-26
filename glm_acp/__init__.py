@@ -1,5 +1,5 @@
 """Native ACP agent for Z.ai GLM models."""
 
-__version__ = "2.7.31"
+__version__ = "2.7.32"
 
 __all__ = ["__version__"]
