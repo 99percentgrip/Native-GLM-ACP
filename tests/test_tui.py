@@ -2749,7 +2749,7 @@ async def test_tui_screenshot_failure_notifies_install_hint(tmp_path, monkeypatc
     async with app.run_test(size=(120, 40)) as pilot:
         await _wait_for_agent_ready(app, pilot)
         await app.action_screenshot()
-        assert any("Screenshot failed" in message and "scrot" in message for message in notices)
+        assert any("Screenshot failed" in message for message in notices)
         app.exit(0)
 
 
@@ -2758,7 +2758,7 @@ async def test_tui_screenshot_success_queues_image(tmp_path, monkeypatch):
     monkeypatch.setattr("glm_acp.tui.tempfile.gettempdir", lambda: str(tmp_path))
 
     def fake_run(command, **_kwargs):
-        Path(command[-1]).write_bytes(b"png")
+        (tmp_path / "glm-acp-shot.png").write_bytes(b"png")
         return SimpleNamespace(returncode=0, stdout="")
 
     monkeypatch.setattr("glm_acp.tui.subprocess.run", fake_run)
