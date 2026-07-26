@@ -74,6 +74,7 @@ from .config import (
 )
 from .glm_client import PlanUsage
 from .memory import list_learned_skills, read_memory, read_user_profile
+from .terminal_image import detect_graphics_protocol, path_link, render_inline
 
 LOCAL_COMMANDS = {
     "/plan": "Switch between Coding Plan, Standard API, and BigModel (CN)",
@@ -111,6 +112,7 @@ LOCAL_COMMANDS = {
     "/keybinds": "Customize TUI F-key and Ctrl-key bindings",
     "/vim": "Toggle vim-mode composer (Normal/Insert/Visual, F9)",
     "/annotate": "Annotate working-tree diff hunks for the next prompt",
+    "/image-render": "Render the last image inline (/image-render kitty|sixel|iterm2)",
     "/rename": "Rename the current session (/rename <name>)",
     "/branch": "Fork the current session to try a different direction (/branch [name])",
     # Agent-side commands (implemented in the shared runtime; listed here so
@@ -2107,6 +2109,7 @@ class NativeGlmTui(App[int]):
         self._last_agent_render: float = 0.0
         self._thinking_text = ""
         self._pending_images = list(args.image)
+        self._last_image_path: Path | None = None
         self._slash_commands = dict(LOCAL_COMMANDS)
         self._keybind_overrides = load_keybinds_config()
         vim_env = os.environ.get("GLM_ACP_VIM", "").strip().lower()
@@ -2428,6 +2431,10 @@ class NativeGlmTui(App[int]):
             return True
         if text == "/annotate":
             await self.action_annotate()
+            return True
+        if text == "/image-render" or text.startswith("/image-render "):
+            requested = text.partition(" ")[2].strip().lower()
+            await self.action_image_render(requested or None)
             return True
         if text == "/context":
             await self.action_open_context()
@@ -3013,7 +3020,19 @@ class NativeGlmTui(App[int]):
                 self._render_agent_content(self._current_agent_text),
                 raw_text=self._current_agent_text,
             )
+        for raw_path in re.findall(r"(?:/[^\s\]\)]+)+\.(?:png|jpe?g|webp|gif)", text, re.I):
+            await self._append_image_renderable(Path(raw_path))
         transcript.scroll_end(animate=False)
+
+    async def _append_image_renderable(self, path: Path, *, protocol: str | None = None) -> None:
+        """Mount an inline image renderable, or the accessible saved-path fallback."""
+        self._last_image_path = path
+        selected = protocol or detect_graphics_protocol()
+        inline = render_inline(path, selected) if selected != "none" else None
+        content: object = inline if inline is not None else path_link(path, protocol=selected)
+        await self.query_one("#transcript", VerticalScroll).mount(
+            Static(content, classes="system-message", markup=False)
+        )
 
     async def _append_system(self, text: str) -> None:
         transcript = self.query_one("#transcript", VerticalScroll)
@@ -3807,6 +3826,16 @@ class NativeGlmTui(App[int]):
         composer.focus()
         self.notify(f"Added {len(comments)} diff annotation(s) to the composer", severity="success")
 
+    async def action_image_render(self, protocol: str | None = None) -> None:
+        """Re-render the most recently seen image with an optional protocol override."""
+        if self._last_image_path is None:
+            self.notify("No saved image available to render", severity="information")
+            return
+        if protocol not in {None, "kitty", "sixel", "iterm2", "none"}:
+            self.notify("Use kitty, sixel, iterm2, or none", severity="warning")
+            return
+        await self._append_image_renderable(self._last_image_path, protocol=protocol)
+
     _WT_VIEW_IDS = ("wt-changes", "wt-git", "wt-diff", "wt-files", "wt-github")
     _WT_VIEW_LABELS = ("Changes", "Git", "Diff", "Files", "GitHub")
 
@@ -3995,6 +4024,11 @@ class NativeGlmTui(App[int]):
             full = os.path.join(cwd, entry)
             marker = "📁" if os.path.isdir(full) else "📄"
             await widget.mount(Static(f"{marker} {entry}", markup=False))
+            if Path(entry).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+                image_path = Path(full)
+                inline = render_inline(image_path)
+                preview: object = inline if inline is not None else path_link(image_path)
+                await widget.mount(Static(preview, markup=False))
             shown += 1
             if shown >= 200:
                 await widget.mount(Static(f"… ({len(entries) - shown} more)", markup=False))

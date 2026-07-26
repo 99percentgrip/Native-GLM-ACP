@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import acp
@@ -2682,4 +2683,54 @@ async def test_tui_annotate_no_comments_leaves_composer_unchanged(tmp_path, monk
         app.push_screen_wait = fake_push_wait  # type: ignore[method-assign]
         await app.action_annotate()
         assert composer.value == "keep this"
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_image_render_path_link_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr("glm_acp.tui.render_inline", lambda *_args, **_kwargs: None)
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    image = tmp_path / "output.png"
+    image.write_bytes(b"png")
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app._append_image_renderable(image, protocol="kitty")
+        rendered = "\n".join(
+            str(widget.render()) for widget in app.query_one("#transcript", VerticalScroll).children
+        )
+        assert f"[image saved to {image}]" in rendered
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_image_render_command_routes_protocol(tmp_path, monkeypatch):
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    image = tmp_path / "output.png"
+    image.write_bytes(b"png")
+    seen: list[tuple[Path, str | None]] = []
+
+    async def fake_render(path, *, protocol=None):
+        seen.append((path, protocol))
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app._last_image_path = image
+        app._append_image_renderable = fake_render  # type: ignore[method-assign]
+        assert await app._handle_local_command("/image-render kitty") is True
+        assert seen == [(image, "kitty")]
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_image_render_honors_env_protocol_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLM_ACP_IMAGE_PROTOCOL", "kitty")
+    seen: list[str] = []
+    monkeypatch.setattr("glm_acp.tui.render_inline", lambda _path, protocol: seen.append(protocol))
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    image = tmp_path / "output.png"
+    image.write_bytes(b"png")
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app._append_image_renderable(image)
+        assert seen == ["kitty"]
         app.exit(0)
