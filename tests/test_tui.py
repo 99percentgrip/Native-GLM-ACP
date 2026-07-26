@@ -2734,3 +2734,71 @@ async def test_tui_image_render_honors_env_protocol_override(tmp_path, monkeypat
         await app._append_image_renderable(image)
         assert seen == ["kitty"]
         app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_screenshot_failure_notifies_install_hint(tmp_path, monkeypatch):
+    monkeypatch.setattr("glm_acp.tui.tempfile.gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        "glm_acp.tui.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=""),
+    )
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    notices: list[str] = []
+    app.notify = lambda message, **_kwargs: notices.append(message)  # type: ignore[method-assign]
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app.action_screenshot()
+        assert any("Screenshot failed" in message and "scrot" in message for message in notices)
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_screenshot_success_queues_image(tmp_path, monkeypatch):
+    monkeypatch.setattr("glm_acp.tui.tempfile.gettempdir", lambda: str(tmp_path))
+
+    def fake_run(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"png")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr("glm_acp.tui.subprocess.run", fake_run)
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app.action_screenshot()
+        assert app._pending_images == [str(tmp_path / "glm-acp-shot.png")]
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_attach_valid_image(tmp_path):
+    image = tmp_path / "input.png"
+    image.write_bytes(b"png")
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        assert await app._handle_local_command(f"/attach {image}") is True
+        assert app._pending_images == [str(image)]
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_attach_rejects_missing_file(tmp_path):
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app.action_attach(str(tmp_path / "missing.png"))
+        assert app._pending_images == []
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_attach_rejects_non_image_file(tmp_path):
+    text_file = tmp_path / "note.txt"
+    text_file.write_text("not an image")
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app.action_attach(str(text_file))
+        assert app._pending_images == []
+        app.exit(0)

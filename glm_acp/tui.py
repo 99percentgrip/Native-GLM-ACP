@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -113,6 +114,8 @@ LOCAL_COMMANDS = {
     "/vim": "Toggle vim-mode composer (Normal/Insert/Visual, F9)",
     "/annotate": "Annotate working-tree diff hunks for the next prompt",
     "/image-render": "Render the last image inline (/image-render kitty|sixel|iterm2)",
+    "/screenshot": "Capture a screenshot and queue it for the next prompt",
+    "/attach": "Queue an image file for the next prompt (/attach <path>)",
     "/rename": "Rename the current session (/rename <name>)",
     "/branch": "Fork the current session to try a different direction (/branch [name])",
     # Agent-side commands (implemented in the shared runtime; listed here so
@@ -222,6 +225,7 @@ CONFIG_COMMANDS = {
 }
 
 MAX_CLIPBOARD_CHARS = 1_000_000
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
 
 
 def _read_system_clipboard() -> str:
@@ -2436,6 +2440,12 @@ class NativeGlmTui(App[int]):
             requested = text.partition(" ")[2].strip().lower()
             await self.action_image_render(requested or None)
             return True
+        if text == "/screenshot":
+            await self.action_screenshot()
+            return True
+        if text.startswith("/attach "):
+            await self.action_attach(text.partition(" ")[2].strip())
+            return True
         if text == "/context":
             await self.action_open_context()
             return True
@@ -3835,6 +3845,68 @@ class NativeGlmTui(App[int]):
             self.notify("Use kitty, sixel, iterm2, or none", severity="warning")
             return
         await self._append_image_renderable(self._last_image_path, protocol=protocol)
+
+    @staticmethod
+    def _screenshot_commands(target: Path) -> list[tuple[list[str], str]]:
+        """Return ordered platform capture commands and their install guidance."""
+        if sys.platform == "darwin":
+            return [(["screencapture", "-i", str(target)], "screencapture is built into macOS")]
+        if os.name == "nt":
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "Add-Type -AssemblyName System.Drawing; "
+                "$b=New-Object Drawing.Bitmap([Windows.Forms.Screen]::PrimaryScreen.Bounds.Width,"
+                "[Windows.Forms.Screen]::PrimaryScreen.Bounds.Height); "
+                "$g=[Drawing.Graphics]::FromImage($b); "
+                "$g.CopyFromScreen(0,0,0,0,$b.Size); "
+                f"$b.Save('{target}',[Drawing.Imaging.ImageFormat]::Png)"
+            )
+            command = ["powershell.exe", "-NoProfile", "-Command", script]
+            return [(command, "PowerShell is built into Windows")]
+        if os.environ.get("WAYLAND_DISPLAY"):
+            return [(["grim", str(target)], "install grim (and slurp for region capture)")]
+        return [
+            (["scrot", "-s", str(target)], "install scrot"),
+            (["gnome-screenshot", "-a", "-f", str(target)], "install gnome-screenshot"),
+            (["import", str(target)], "install ImageMagick"),
+        ]
+
+    async def action_screenshot(self) -> None:
+        """Capture a platform screenshot and queue it through the normal image path."""
+        target = Path(tempfile.gettempdir()) / "glm-acp-shot.png"
+        commands = self._screenshot_commands(target)
+        hint = commands[0][1]
+        for command, _hint in commands:
+            try:
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0 and target.is_file():
+                self._pending_images.append(str(target))
+                self._last_image_path = target
+                self.notify(f"Screenshot queued: {target}", severity="success")
+                return
+        self.notify(f"Screenshot failed — {hint}", severity="warning")
+
+    async def action_attach(self, raw_path: str) -> None:
+        """Validate and queue a user-selected local image for the next turn."""
+        path = Path(raw_path).expanduser()
+        if not raw_path or not path.is_file():
+            await self._append_system(f"Image file not found: {raw_path or '(missing path)'}")
+            return
+        if path.suffix.lower() not in IMAGE_EXTENSIONS:
+            await self._append_system("Attachment must be a PNG, JPG, JPEG, WEBP, or GIF image.")
+            return
+        self._pending_images.append(str(path))
+        self._last_image_path = path
+        await self._append_system(f"Queued image for the next prompt: {path}")
 
     _WT_VIEW_IDS = ("wt-changes", "wt-git", "wt-diff", "wt-files", "wt-github")
     _WT_VIEW_LABELS = ("Changes", "Git", "Diff", "Files", "GitHub")
