@@ -14,6 +14,7 @@ Own offline verification for ACP behavior, tools, persistence, packaging, authen
 - `test_uninstall.py` covers frozen-copy guards, default and installer-selected profile cleanup, command/PATH removal, credential preservation and purge, and surgical Zed JSONC cleanup with backup.
 - Remaining modules cover tools, sessions, streaming, compaction, and GLM HTTP behavior.
 - `test_mcp.py` and `test_memory.py` cover remote MCP, scoped memory, verified skills, telemetry, pinning, curation, and reversible archival.
+- `test_jit_tools.py` covers argument-aware BM25/regex ranking and limits, safe regex rejection, registry latency, initial schema reduction, MCP route preservation, gateway-only startup, ordered injection, secret-safe observability, and direct discovered-tool execution.
 - `test_security.py` covers promptware detection, stored-context blocking, and untrusted-output delimiters.
 - `test_session_store.py` covers JSON persistence plus redacted FTS5 discovery, scrolling, legacy backfill, and deletion.
 - `test_quality.py` covers tool-loop, failed-verification and unverified-edit recovery, benchmark locking/incremental reports, million-token estimation, and real stdio/SDK ACP process lifecycles.

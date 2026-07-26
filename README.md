@@ -40,6 +40,7 @@ from a terminal with `glm-acp chat`—Zed is optional.
 - **Semantic code navigation** — installed language servers provide symbols, definitions, references, hover types, implementations, rename preparation, and call hierarchy
 - **Transactional multi-file patches** — content hashes, pre-commit syntax checks, and rollback keep coordinated refactors all-or-nothing
 - **Context-efficient batch reads** — bounded concurrent file/search operations return one reduced JSON result
+- **Just-in-time tool loading** — sessions start with only `search_tools`; argument-aware BM25 or safe regex search appends at most five matching native or MCP schemas when needed, cutting initial tool-schema context by more than 85%
 - **Cache-aware prompt layout** — volatile context stays behind a stable prefix; `/status` reports its hash and cache-hit ratio
 - **Redacted trajectory telemetry** — metadata-only events support tuning without prompts, outputs, commands, reasoning, credentials, or raw session IDs
 - **Playwright UI testing** — permission-gated isolated browser automation returns accessibility, console, network, interaction, and screenshot evidence
@@ -534,10 +535,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v2.7.33` before running the Unix
-installer, or pass `-Version v2.7.33` to the downloaded PowerShell script.
+To pin the current release, set `GLM_ACP_VERSION=v2.7.34` before running the
+Unix installer, or pass `-Version v2.7.34` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v2.7.33](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v2.7.33).
+[v2.7.34](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v2.7.34).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -864,6 +865,7 @@ glm_acp/
 ├── diagnostics.py  # Syntax checks and optional LSP semantic diagnostics
 ├── failure_corpus.py # Secret-safe failure drafts and reviewed benchmark promotion
 ├── guardrails.py    # Result-aware repeated-failure/no-progress detection
+├── jit_tools.py     # Deferred tool registry with bounded BM25/regex discovery
 ├── observability.py # Metadata-only local quality and safety dashboard
 ├── os_sandbox.py    # Linux/macOS isolation and Windows process-tree containment
 ├── plugins.py       # Hash-pinned, Ed25519-verifiable data-only plugin packages
@@ -948,6 +950,7 @@ preserved-thinking requests.
 | `web_search` / `web_reader` | Official Z.ai Coding Plan MCP services |
 | `vision_analyze` | Optional official local Z.ai Vision MCP |
 | `browser_ui` | Permission-gated Playwright MCP inspection and interaction |
+| `search_tools` | Load up to five relevant deferred native or MCP tool schemas with BM25 or safe regex search |
 | `mcp_list_tools` / `mcp_call` | Generic configured MCP access |
 
 After changing files, the agent requires a successful auto-detected canonical
@@ -972,9 +975,14 @@ permissions and workspace sandboxing.
 Metadata-only trajectory events are appended with user-only permissions to
 `trajectory.jsonl` in the Native GLM ACP configuration directory. Set
 `GLM_ACP_TELEMETRY=0` to disable them. Records include model/tool names,
-durations, token counts, cache hits, changed-path counts, and verification state;
+durations, token counts, cache hits, changed-path counts, verification state,
+and JIT search mode/match-count/latency metadata;
 they exclude prompts, tool arguments and bodies, commands, reasoning, credentials,
 and raw session IDs.
+
+JIT state is visible while the agent works: `/status` reports whether deferred
+loading is active plus loaded/deferred counts, and `/observability` aggregates
+JIT searches and latency without retaining the search text or fetched schemas.
 
 Lifecycle hooks are opt-in through user-only `hooks.json` (or
 `GLM_ACP_HOOKS_CONFIG`). Each entry declares an event, an argv-form command, the
@@ -1056,7 +1064,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-2.7.33.dist-info  (and editable-install metadata)
+# expect: glm_acp-2.7.34.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials
