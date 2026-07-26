@@ -2950,7 +2950,7 @@ async def test_tui_mobile_loopback_status_does_not_render_unusable_qr(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_tui_mobile_renders_one_time_qr_for_active_permission(tmp_path, monkeypatch):
+async def test_tui_mobile_renders_pairing_qr_and_routes_active_permission(tmp_path, monkeypatch):
     monkeypatch.setattr("glm_acp.mobile_server._lan_address", lambda: "192.0.2.42")
     agent = FakeAgent()
     app = NativeGlmTui(
@@ -2973,7 +2973,7 @@ async def test_tui_mobile_renders_one_time_qr_for_active_permission(tmp_path, mo
             if list(app.query("#mobile-qr")):
                 break
         qr = app.query_one("#mobile-qr", Static)
-        assert "Scan to approve this request" in str(qr.render())
+        assert "Scan to pair your phone for approvals" in str(qr.render())
         server = app._mobile_server
         assert server is not None and len(server._approvals) == 1
         approval_id = next(iter(server._approvals))

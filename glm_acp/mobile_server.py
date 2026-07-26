@@ -17,7 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 
 class MobileServerError(RuntimeError):
@@ -68,6 +68,7 @@ class MobileServer:
         if normalized_public_url and not normalized_public_url.startswith(("http://", "https://")):
             raise MobileServerError("Mobile public URL must start with http:// or https://")
         self._public_url = normalized_public_url or None
+        self._pair_token = secrets.token_urlsafe(24)
         self._advertised_host: str | None = None
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -94,6 +95,20 @@ class MobileServer:
     def approval_url(self, approval_id: str) -> str:
         """Return the QR-ready, short-lived approval link for one request."""
         return f"{self.url}?approval={quote(approval_id, safe='')}"
+
+    @property
+    def pairing_url(self) -> str:
+        """Capability URL scanned once by the phone to await approvals."""
+        return f"{self.url}?pair={quote(self._pair_token, safe='')}"
+
+    def _pending_approval(self, pair_token: str) -> str | None:
+        if not secrets.compare_digest(pair_token, self._pair_token):
+            return None
+        with self._lock:
+            for approval_id, (_, future, expires) in self._approvals.items():
+                if expires >= time.monotonic() and not future.done():
+                    return approval_id
+        return ""
 
     def register_approval(self, future: asyncio.Future[bool], *, ttl_seconds: float = 120) -> str:
         approval_id = secrets.token_urlsafe(18)
@@ -139,7 +154,20 @@ class MobileServer:
                 self.wfile.write(body)
 
             def do_GET(self) -> None:  # noqa: N802
-                request_path = urlsplit(self.path).path
+                request = urlsplit(self.path)
+                request_path = request.path
+                if request_path == "/pending":
+                    pair_token = parse_qs(request.query).get("pair", [""])[0]
+                    approval_id = owner._pending_approval(pair_token)
+                    if approval_id is None:
+                        self._send(HTTPStatus.NOT_FOUND, b"Not found", "text/plain")
+                    else:
+                        self._send(
+                            HTTPStatus.OK,
+                            json.dumps({"approval": approval_id}).encode(),
+                            "application/json",
+                        )
+                    return
                 name = (
                     "index.html"
                     if request_path in {"/", "/index.html"}

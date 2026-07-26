@@ -1857,11 +1857,9 @@ class TuiClient:
             mobile = self.app._mobile_server
             if mobile is not None and mobile.running and mobile.phone_reachable:
                 decision: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-                approval_id = mobile.register_approval(decision)
-                approval_url = mobile.approval_url(approval_id)
-                await self.app._show_mobile_approval_qr(approval_url)
+                mobile.register_approval(decision)
                 await self.app._append_system(
-                    "Mobile approval pending — scan the one-time QR code."
+                    "Mobile approval pending — approve it from the paired phone."
                 )
                 allowed = await decision
             else:
@@ -4105,7 +4103,7 @@ class NativeGlmTui(App[int]):
             return
         self._mobile_server = server
         if server.phone_reachable:
-            message = "Mobile companion armed. A one-time QR code appears for each approval."
+            message = "Scan once to pair your phone; it will receive the next approval."
         else:
             message = (
                 "Mobile companion is loopback-only. For phone scan-to-approve, restart with "
@@ -4114,6 +4112,8 @@ class NativeGlmTui(App[int]):
         await self.query_one("#transcript", VerticalScroll).mount(
             Static(message, id="mobile-status", classes="system-message", markup=False)
         )
+        if server.phone_reachable:
+            await self._show_mobile_approval_qr(server.pairing_url)
         self.notify("Mobile companion armed", severity="success")
 
     async def _show_mobile_approval_qr(self, approval_url: str) -> None:
@@ -4130,7 +4130,7 @@ class NativeGlmTui(App[int]):
         )
         await self.query_one("#transcript", VerticalScroll).mount(
             Static(
-                f"Scan to approve this request (expires in 2 minutes):\n{rendered}",
+                f"Scan to pair your phone for approvals:\n{rendered}",
                 id="mobile-qr",
                 classes="system-message",
                 markup=False,
