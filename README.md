@@ -535,10 +535,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-For the `2.7.34` release, set `GLM_ACP_VERSION=v2.7.34` before running the Unix
-installer, or pass `-Version v2.7.34` to the downloaded PowerShell script.
-Until that tag is published, the current release and manual-download fallback is
-[v2.7.33](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v2.7.33).
+To pin the current release, set `GLM_ACP_VERSION=v2.7.34` before running the
+Unix installer, or pass `-Version v2.7.34` to the downloaded PowerShell script.
+The current release and manual-download fallback is
+[v2.7.34](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v2.7.34).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
