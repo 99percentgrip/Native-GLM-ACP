@@ -233,6 +233,40 @@ class TestKeybindsConfig:
         assert load_keybinds_config() == {}
 
 
+class TestVimConfig:
+    def test_default_is_false(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_vim_config
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        assert load_vim_config() is False
+
+    def test_round_trip_true(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_vim_config, save_vim_config
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        assert save_vim_config(True) is True
+        assert load_vim_config() is True
+
+    def test_round_trip_false_overwrites_true(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_vim_config, save_vim_config
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        save_vim_config(True)
+        assert save_vim_config(False) is False
+        assert load_vim_config() is False
+
+    def test_corrupt_file_falls_back_to_false(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_vim_config, vim_path
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        vim_path().parent.mkdir(parents=True, exist_ok=True)
+        vim_path().write_text("broken", encoding="utf-8")
+        assert load_vim_config() is False
+
+    def test_wrong_schema_falls_back_to_false(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_vim_config, vim_path
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        vim_path().parent.mkdir(parents=True, exist_ok=True)
+        vim_path().write_text('{"enabled": "yes"}', encoding="utf-8")
+        assert load_vim_config() is False
+
+
 class TestModelRegistry:
     def test_all_models_have_context_window(self):
         for model_id in MODELS:

@@ -215,6 +215,43 @@ def screen_reader_path() -> Path:
     return config_dir() / "screen-reader.json"
 
 
+def vim_path() -> Path:
+    """Return the path to the persistent Vim-composer preference."""
+    return config_dir() / "vim.json"
+
+
+def load_vim_config() -> bool:
+    """Return the persisted Vim-composer preference, defaulting to off."""
+    try:
+        payload = json.loads(vim_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("enabled"), bool)
+        and payload["enabled"]
+    )
+
+
+def save_vim_config(enabled: bool) -> bool:
+    """Atomically persist and return the Vim-composer preference."""
+    path = vim_path()
+    _secure_dir(path.parent)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump({"enabled": bool(enabled)}, handle)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _secure_file(temporary)
+        os.replace(temporary, path)
+        _secure_file(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return bool(enabled)
+
+
 def keybinds_path() -> Path:
     """Return the path to the persistent TUI keybinding overrides."""
     return config_dir() / "keybinds.json"
@@ -250,10 +287,7 @@ def save_keybinds_config(mapping: dict[str, str]) -> dict[str, str]:
     cleaned = {
         str(action).strip(): str(keys).strip()
         for action, keys in mapping.items()
-        if isinstance(action, str)
-        and action.strip()
-        and isinstance(keys, str)
-        and keys.strip()
+        if isinstance(action, str) and action.strip() and isinstance(keys, str) and keys.strip()
     }
     path = keybinds_path()
     _secure_dir(path.parent)

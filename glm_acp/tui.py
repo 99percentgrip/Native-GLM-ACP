@@ -64,10 +64,12 @@ from .config import (
     load_screen_reader_config,
     load_statusline_config,
     load_theme_config,
+    load_vim_config,
     save_keybinds_config,
     save_screen_reader_config,
     save_statusline_config,
     save_theme_config,
+    save_vim_config,
     thought_levels_for_model,
 )
 from .glm_client import PlanUsage
@@ -107,6 +109,7 @@ LOCAL_COMMANDS = {
     "/sound": "Toggle notification sounds on/off for this session",
     "/screen-reader": "Toggle screen-reader mode (plain text, no animations, F8)",
     "/keybinds": "Customize TUI F-key and Ctrl-key bindings",
+    "/vim": "Toggle vim-mode composer (Normal/Insert/Visual, F9)",
     "/rename": "Rename the current session (/rename <name>)",
     "/branch": "Fork the current session to try a different direction (/branch [name])",
     # Agent-side commands (implemented in the shared runtime; listed here so
@@ -281,8 +284,13 @@ def _write_system_clipboard(text: str) -> bool:
         commands = [("pbcopy",)]
     elif os.name == "nt":
         commands = [
-            ("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-             "$input = [Console]::In::ReadToEnd(); Set-Clipboard -Value $input"),
+            (
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$input = [Console]::In::ReadToEnd(); Set-Clipboard -Value $input",
+            ),
             ("clip",),
         ]
     else:
@@ -399,6 +407,129 @@ class CommandInput(Input):
                 severity="warning",
             )
 
+
+class ModalComposer(CommandInput):
+    """Single-line Vim modal layer that preserves the normal composer APIs."""
+
+    mode = "insert"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._pending_operator = ""
+        self._pending_g = False
+        self._clipboard = ""
+        self._undo_value = ""
+        self._visual_anchor = 0
+
+    def _word_end(self) -> int:
+        match = re.search(r"\w+", self.value[self.cursor_position :])
+        end = self.cursor_position + (match.end() if match else 1)
+        while end < len(self.value) and self.value[end].isspace():
+            end += 1
+        return end
+
+    def _delete_range(self, start: int, end: int, *, yank: bool = False) -> None:
+        self._undo_value = self.value
+        self._clipboard = self.value[start:end]
+        if not yank:
+            self.value = self.value[:start] + self.value[end:]
+            self.cursor_position = min(start, len(self.value))
+
+    def _move_cursor(self, position: int) -> None:
+        """Move the cursor while retaining the visual-mode anchor."""
+        self.cursor_position = max(0, min(len(self.value), position))
+        if self.mode == "visual":
+            self.selection = self.selection.__class__(self._visual_anchor, self.cursor_position)
+
+    def handle_vim_key(self, key: str) -> bool:
+        """Apply one modal editing key; return whether Textual should consume it."""
+        if self.mode == "insert":
+            if key == "escape":
+                self.set_mode("normal")
+                return True
+            return False
+        if self._pending_operator:
+            operator, self._pending_operator = self._pending_operator, ""
+            end = len(self.value) if key == "$" else self._word_end()
+            if key in {"d", "y"}:
+                end = self.value.find("\n", self.cursor_position)
+                end = len(self.value) if end < 0 else end + 1
+            if key in {"w", "d", "y"}:
+                self._delete_range(self.cursor_position, end, yank=operator == "y")
+                return True
+        if key == "escape":
+            self.set_mode("normal")
+        elif self.mode == "normal" and key in {"i", "a", "I", "A", "o", "O"}:
+            if key == "a":
+                self.cursor_position = min(len(self.value), self.cursor_position + 1)
+            elif key == "I":
+                self.cursor_position = 0
+            elif key == "A":
+                self.cursor_position = len(self.value)
+            elif key in {"o", "O"}:
+                self.insert_text_at_cursor(" ")
+            self.set_mode("insert")
+        elif self.mode == "visual" and key in {"y", "d"}:
+            start, end = sorted((self.selection.start, self.selection.end))
+            self._delete_range(start, end, yank=key == "y")
+            self.set_mode("normal")
+        elif key in {"d", "y"}:
+            self._pending_operator = key
+        elif key == "p":
+            self._undo_value = self.value
+            self.insert_text_at_cursor(self._clipboard)
+        elif key == "u":
+            self.value, self._undo_value = self._undo_value, self.value
+        elif key == "v":
+            self._visual_anchor = self.cursor_position
+            self.set_mode("visual")
+        elif key == "h":
+            self._move_cursor(self.cursor_position - 1)
+        elif key == "l":
+            self._move_cursor(self.cursor_position + 1)
+        elif key in {"j", "k"}:
+            # The composer is intentionally single-line; vertical movement is
+            # a safe no-op that still keeps Vim key sequences modal.
+            pass
+        elif key == "w":
+            self._move_cursor(self._word_end())
+        elif key == "b":
+            self._move_cursor(self.value.rfind(" ", 0, self.cursor_position - 1) + 1)
+        elif key == "0":
+            self._move_cursor(0)
+        elif key == "g":
+            if self._pending_g:
+                self._move_cursor(0)
+            self._pending_g = not self._pending_g
+        elif key in {"$", "G"}:
+            self._move_cursor(len(self.value))
+        elif key == "x":
+            self._delete_range(self.cursor_position, self.cursor_position + 1)
+        return True
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+        labels = {"normal": "[N] Normal", "insert": "[I] Insert", "visual": "[V] Visual"}
+        self.border_subtitle = labels[mode]
+
+    async def _on_key(self, event: events.Key) -> None:
+        app = self.app
+        if not isinstance(app, NativeGlmTui) or not app._vim_enabled:
+            await super()._on_key(event)
+            return
+        key = event.key
+        # Slash-command completion remains available in Normal mode: entering
+        # '/' switches to Insert and lets CommandInput open the live menu.
+        if self.mode == "normal" and key in {"/", "slash"}:
+            self.set_mode("insert")
+            await super()._on_key(event)
+            return
+        if self.mode == "insert" and key != "escape":
+            await super()._on_key(event)
+            return
+        if self.handle_vim_key(key):
+            event.stop()
+            event.prevent_default()
 
 class PermissionScreen(ModalScreen[bool]):
     """Fail-closed approval dialog for a single tool invocation."""
@@ -898,34 +1029,42 @@ class JourneyScreen(ModalScreen[None]):
             else:
                 when = None
             uses = int(skill.get("use_count", 0) or 0)
-            state_marker = "📌 " if skill.get("pinned") else (
-                "📦 " if skill.get("state") == "archived" else "✓ "
+            state_marker = (
+                "📌 "
+                if skill.get("pinned")
+                else ("📦 " if skill.get("state") == "archived" else "✓ ")
             )
             summary = f"{skill.get('description', '') or '(no description)'}"
             if uses:
                 summary += f"  · {uses} use{'s' if uses != 1 else ''}"
-            entries.append((
-                when or "—",
-                when,
-                f"{state_marker}skill · {escape(str(skill.get('name', '')))}",
-                escape(summary),
-            ))
+            entries.append(
+                (
+                    when or "—",
+                    when,
+                    f"{state_marker}skill · {escape(str(skill.get('name', '')))}",
+                    escape(summary),
+                )
+            )
         # Project memory — no timestamps; show file order as "memory".
         for entry in self.memories:
-            entries.append((
-                "—",
-                None,
-                "✓ memory",
-                escape(entry),
-            ))
+            entries.append(
+                (
+                    "—",
+                    None,
+                    "✓ memory",
+                    escape(entry),
+                )
+            )
         # User profile — no timestamps either.
         for entry in self.profile:
-            entries.append((
-                "—",
-                None,
-                "✓ profile",
-                escape(entry),
-            ))
+            entries.append(
+                (
+                    "—",
+                    None,
+                    "✓ profile",
+                    escape(entry),
+                )
+            )
         # Sort by date desc (skills with timestamps first), then alphabetic.
         entries.sort(key=lambda e: (e[1] or "", e[0]), reverse=True)
         listview = self.query_one("#journey-list", ListView)
@@ -1093,12 +1232,9 @@ class StatusLineScreen(ModalScreen[set[str] | None]):
             else:
                 self._enabled.add(sid)
             event.button.label = (
-                f"{'[✓]' if sid in self._enabled else '[ ]'} "
-                f"{dict(STATUSLINE_SEGMENTS)[sid]}"
+                f"{'[✓]' if sid in self._enabled else '[ ]'} {dict(STATUSLINE_SEGMENTS)[sid]}"
             )
-            event.button.set_classes(
-                "statusline-toggle" + (" on" if sid in self._enabled else "")
-            )
+            event.button.set_classes("statusline-toggle" + (" on" if sid in self._enabled else ""))
             event.button.variant = "success" if sid in self._enabled else "default"
         elif event.button.id == "statusline-save":
             self.dismiss(self._enabled)
@@ -1137,9 +1273,7 @@ class KeybindsScreen(ModalScreen[dict[str, str] | None]):
     def __init__(self, overrides: dict[str, str]) -> None:
         super().__init__()
         self._overrides = {
-            action: keys
-            for action, keys in overrides.items()
-            if action in KEYBINDABLE_ACTION_IDS
+            action: keys for action, keys in overrides.items() if action in KEYBINDABLE_ACTION_IDS
         }
 
     def compose(self) -> ComposeResult:
@@ -1252,9 +1386,7 @@ class ContextBudgetScreen(ModalScreen[None]):
         # Bar: scale by share-of-window so the chart sums to total usage.
         cells = max(1, int(round(pct / 100.0 * self.BAR_WIDTH))) if pct > 0 else 0
         bar = "█" * cells + "·" * (self.BAR_WIDTH - cells)
-        return (
-            f"{label:<22} {count:>3} msgs  {tokens:>7,} tok  {pct:>5.2f}%  {bar}"
-        )
+        return f"{label:<22} {count:>3} msgs  {tokens:>7,} tok  {pct:>5.2f}%  {bar}"
 
     def action_compact(self) -> None:
         # Signal the caller to run /compact by dismissing with "compact".
@@ -1544,8 +1676,6 @@ class SelectableStatic(Static):
         return text, "\n"
 
 
-
-
 class TuiClient:
     """ACP Client adapter that maps updates to Textual widgets."""
 
@@ -1735,6 +1865,7 @@ class NativeGlmTui(App[int]):
             priority=True,
             id="toggle_screen_reader",
         ),
+        Binding("f9", "toggle_vim", "Vim mode", show=False, priority=True),
     ]
 
     CSS = """
@@ -1838,6 +1969,8 @@ class NativeGlmTui(App[int]):
         self._pending_images = list(args.image)
         self._slash_commands = dict(LOCAL_COMMANDS)
         self._keybind_overrides = load_keybinds_config()
+        vim_env = os.environ.get("GLM_ACP_VIM", "").strip().lower()
+        self._vim_enabled = vim_env in {"1", "true", "yes", "on"} or load_vim_config()
         self._command_values: list[str] = []
         self._provider_usage: PlanUsage | None = None
         self._provider_usage_error = ""
@@ -1855,8 +1988,7 @@ class NativeGlmTui(App[int]):
         # ``GLM_ACP_SCREEN_READER=1`` regardless of saved state.
         screen_reader_env = os.environ.get("GLM_ACP_SCREEN_READER", "").strip().lower()
         self._screen_reader = (
-            screen_reader_env in {"1", "true", "yes", "on"}
-            or load_screen_reader_config()
+            screen_reader_env in {"1", "true", "yes", "on"} or load_screen_reader_config()
         )
         if self._screen_reader:
             # Activity animation relies on glyph cycling, which is hostile
@@ -1929,7 +2061,8 @@ class NativeGlmTui(App[int]):
         )
         yield Static("◌ Starting session", id="activity-status", markup=False)
         yield Static("", id="queue-status", markup=False)
-        yield CommandInput(
+        composer_type = ModalComposer if self._vim_enabled else CommandInput
+        yield composer_type(
             placeholder="Ask Native GLM ACP… (/help for commands)",
             id="composer",
             disabled=True,
@@ -1943,6 +2076,8 @@ class NativeGlmTui(App[int]):
         self.query_one("#tools").border_title = "Activity"
         self.query_one("#command-menu").border_title = "Commands"
         self.query_one("#tools", RichLog).write("[dim]Waiting for tool activity…[/dim]")
+        if self._vim_enabled:
+            self.query_one("#composer", ModalComposer).set_mode("normal")
         self._apply_keybind_overrides(self._keybind_overrides)
         # Apply persisted theme (if any) now that the App is running.
         if self._saved_theme and self._saved_theme in self.available_themes:
@@ -2038,9 +2173,7 @@ class NativeGlmTui(App[int]):
         if text.startswith("/planmode ") and self._agent_ready:
             prd = text.partition(" ")[2].strip()
             if prd:
-                await self.agent.set_session_mode(
-                    mode_id="plan", session_id=self.session_id
-                )
+                await self.agent.set_session_mode(mode_id="plan", session_id=self.session_id)
                 self.notify("Plan Mode activated — read-only research mode", severity="information")
                 text = prd
             else:
@@ -2124,9 +2257,7 @@ class NativeGlmTui(App[int]):
                 return True
             # set_config_option signature is (config_id, session_id, value).
             # It clamps to [1, 1000] and persists on session.
-            await self.agent.set_config_option(
-                "max_tool_iterations", self.session_id, str(new_cap)
-            )
+            await self.agent.set_config_option("max_tool_iterations", self.session_id, str(new_cap))
             actual = session.max_tool_iterations
             self.notify(
                 f"Tool-call iteration cap: {current} → {actual}",
@@ -2151,6 +2282,9 @@ class NativeGlmTui(App[int]):
             return True
         if text == "/keybinds":
             await self.action_open_keybinds()
+            return True
+        if text == "/vim":
+            await self.action_toggle_vim()
             return True
         if text == "/context":
             await self.action_open_context()
@@ -2502,9 +2636,7 @@ class NativeGlmTui(App[int]):
                     return
 
                 if self._current_agent is not None and self._current_agent_text:
-                    self._current_agent.update(
-                        self._render_agent_content(self._current_agent_text)
-                    )
+                    self._current_agent.update(self._render_agent_content(self._current_agent_text))
                     self._last_agent_render = time.monotonic()
 
                 if not self._prompt_queue or self._shutdown_requested:
@@ -2528,9 +2660,7 @@ class NativeGlmTui(App[int]):
                 turn_duration = time.monotonic() - self._turn_start_time
                 if outcome == "completed":
                     play_sound("success")
-                    send_notification(
-                        "GLM ACP", "Task completed", turn_duration=turn_duration
-                    )
+                    send_notification("GLM ACP", "Task completed", turn_duration=turn_duration)
                 elif outcome == "failed":
                     play_sound("error")
                     send_notification(
@@ -3035,6 +3165,42 @@ class NativeGlmTui(App[int]):
         state = "hidden" if thinking.has_class("hidden") else "shown"
         self.notify(f"Reasoning panel {state}", severity="information")
 
+    async def _set_vim_mode(self, enabled: bool) -> None:
+        """Swap the composer without losing an in-progress prompt or focus."""
+        old = self.query_one("#composer", CommandInput)
+        composer_type = ModalComposer if enabled else CommandInput
+        if isinstance(old, composer_type):
+            composer = old
+        else:
+            value = old.value
+            disabled = old.disabled
+            had_focus = self.focused is old
+            composer = composer_type(
+                placeholder=old.placeholder,
+                id="composer",
+                disabled=disabled,
+            )
+            composer.value = value
+            composer.cursor_position = min(old.cursor_position, len(value))
+            await old.remove()
+            await self.mount(composer, before=self.query_one(Footer))
+            if had_focus:
+                composer.focus()
+        self._vim_enabled = enabled
+        if isinstance(composer, ModalComposer):
+            composer.set_mode("normal")
+        self.notify(
+            "Vim composer enabled — press i to edit" if enabled else "Vim composer disabled",
+            severity="information",
+        )
+
+    async def action_toggle_vim(self) -> None:
+        await self._set_vim_mode(not self._vim_enabled)
+        try:
+            save_vim_config(self._vim_enabled)
+        except OSError as error:
+            self.notify(f"Could not save Vim preference: {error}", severity="warning")
+
     def action_settings(self) -> None:
         if self._agent_ready and self._prompt_worker is None:
             self.open_settings()
@@ -3108,13 +3274,9 @@ class NativeGlmTui(App[int]):
         if action == "copy":
             if _write_system_clipboard(code):
                 preview = code.splitlines()[0][:60] if code else ""
-                self.notify(
-                    f"Copied {len(code)} chars: {preview}…", severity="success"
-                )
+                self.notify(f"Copied {len(code)} chars: {preview}…", severity="success")
             else:
-                self.notify(
-                    "Clipboard unavailable (install xclip or xsel)", severity="warning"
-                )
+                self.notify("Clipboard unavailable (install xclip or xsel)", severity="warning")
         elif action == "write":
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             target = Path(self._session_cwd()) / f"glm-block-{timestamp}.txt"
@@ -3141,9 +3303,7 @@ class NativeGlmTui(App[int]):
             self.notify(f"Could not save statusline config: {error}", severity="warning")
             self._statusline_segments = set(result)
         # Force an immediate re-render with the new segment set.
-        self._refresh_session_panel(
-            "Running" if self._prompt_worker is not None else "Ready"
-        )
+        self._refresh_session_panel("Running" if self._prompt_worker is not None else "Ready")
         enabled_count = len(self._statusline_segments)
         total = len(STATUSLINE_SEGMENTS)
         self.notify(
@@ -3245,9 +3405,7 @@ class NativeGlmTui(App[int]):
             "session": {
                 "model": getattr(session, "model", self.args.model or "?"),
                 "mode": getattr(session, "mode", self.args.mode or "?"),
-                "permission": getattr(
-                    session, "permission_mode", self.args.permission or "?"
-                ),
+                "permission": getattr(session, "permission_mode", self.args.permission or "?"),
                 "input_tokens": int(getattr(session, "total_input_tokens", 0)),
                 "output_tokens": int(getattr(session, "total_output_tokens", 0)),
                 "cached_tokens": int(getattr(session, "total_cached_tokens", 0)),
@@ -3600,7 +3758,8 @@ class NativeGlmTui(App[int]):
             temp_path = fh.name
         try:
             proc = await asyncio.create_subprocess_exec(
-                *editor_argv, temp_path,
+                *editor_argv,
+                temp_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -3617,10 +3776,7 @@ class NativeGlmTui(App[int]):
                 os.unlink(temp_path)
             except OSError:
                 pass
-        cleaned_lines = [
-            line for line in raw.splitlines()
-            if not line.lstrip().startswith("#")
-        ]
+        cleaned_lines = [line for line in raw.splitlines() if not line.lstrip().startswith("#")]
         return "\n".join(cleaned_lines).strip()
 
     async def _refresh_wt_changes(self) -> None:
@@ -3695,7 +3851,8 @@ class NativeGlmTui(App[int]):
         async def _gh(args: list[str]) -> str | None:
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "gh", *args,
+                    "gh",
+                    *args,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=cwd,
@@ -3706,11 +3863,18 @@ class NativeGlmTui(App[int]):
                 return None
 
         # PRs for this branch.
-        pr_json = await _gh([
-            "pr", "list", "--head", branch,
-            "--json", "number,title,state,isDraft,reviewDecision",
-            "--limit", "5",
-        ])
+        pr_json = await _gh(
+            [
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--json",
+                "number,title,state,isDraft,reviewDecision",
+                "--limit",
+                "5",
+            ]
+        )
         if pr_json is not None:
             try:
                 prs = json.loads(pr_json)
@@ -3723,10 +3887,12 @@ class NativeGlmTui(App[int]):
                     marker = "🔵" if pr.get("isDraft") else "🟢"
                     review = pr.get("reviewDecision", "")
                     review_str = f"  review:{review}" if review else ""
-                    await widget.mount(Static(
-                        f"  {marker} #{pr['number']} {pr['title']}{review_str}",
-                        markup=False,
-                    ))
+                    await widget.mount(
+                        Static(
+                            f"  {marker} #{pr['number']} {pr['title']}{review_str}",
+                            markup=False,
+                        )
+                    )
             else:
                 await widget.mount(Static("No open PRs for this branch.", markup=False))
         else:
@@ -3734,11 +3900,18 @@ class NativeGlmTui(App[int]):
             await widget.mount(Static("(gh not available or not authenticated)", markup=False))
 
         # Assigned issues.
-        issue_json = await _gh([
-            "issue", "list", "--assignee", "@me",
-            "--json", "number,title,state",
-            "--limit", "5",
-        ])
+        issue_json = await _gh(
+            [
+                "issue",
+                "list",
+                "--assignee",
+                "@me",
+                "--json",
+                "number,title,state",
+                "--limit",
+                "5",
+            ]
+        )
         if issue_json is not None:
             try:
                 issues = json.loads(issue_json)
@@ -3748,10 +3921,12 @@ class NativeGlmTui(App[int]):
             if issues:
                 await widget.mount(Static("Assigned Issues", markup=False))
                 for issue in issues:
-                    await widget.mount(Static(
-                        f"  #{issue['number']} {issue['title']}",
-                        markup=False,
-                    ))
+                    await widget.mount(
+                        Static(
+                            f"  #{issue['number']} {issue['title']}",
+                            markup=False,
+                        )
+                    )
             else:
                 await widget.mount(Static("No issues assigned to you.", markup=False))
 
@@ -3833,9 +4008,7 @@ class NativeGlmTui(App[int]):
             text = ""
         if text:
             if _write_system_clipboard(text):
-                self.notify(
-                    f"Copied {len(text)} characters to clipboard", severity="success"
-                )
+                self.notify(f"Copied {len(text)} characters to clipboard", severity="success")
             else:
                 self.notify("Clipboard unavailable (install xclip or xsel)", severity="warning")
         else:

@@ -1634,6 +1634,103 @@ async def test_tui_keybinds_reset_removes_persisted_mapping(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_tui_vim_toggle_modes_and_basic_edits(tmp_path, monkeypatch):
+    from glm_acp.config import load_vim_config
+    from glm_acp.tui import CommandInput, ModalComposer
+
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        assert isinstance(app.query_one("#composer"), CommandInput)
+        await app.action_toggle_vim()
+        composer = app.query_one("#composer", ModalComposer)
+        assert load_vim_config() is True
+        assert composer.mode == "normal"
+        assert composer.handle_vim_key("i") is True
+        assert composer.mode == "insert"
+        assert composer.handle_vim_key("escape") is True
+        assert composer.mode == "normal"
+        assert composer.handle_vim_key("v") is True
+        assert composer.mode == "visual"
+        assert composer.handle_vim_key("escape") is True
+        composer.value = "hello world"
+        composer.cursor_position = 0
+        composer.handle_vim_key("d")
+        composer.handle_vim_key("w")
+        assert composer.value == "world"
+        composer.handle_vim_key("u")
+        composer.cursor_position = 0
+        composer.handle_vim_key("y")
+        composer.handle_vim_key("w")
+        composer.handle_vim_key("p")
+        assert composer.value.startswith("hello")
+        composer.value = "line one"
+        composer.cursor_position = 0
+        composer.handle_vim_key("d")
+        composer.handle_vim_key("d")
+        assert composer.value == ""
+        composer.value = "line one"
+        composer.cursor_position = 0
+        composer.handle_vim_key("y")
+        composer.handle_vim_key("y")
+        composer.handle_vim_key("p")
+        assert composer.value == "line oneline one"
+        await app.action_toggle_vim()
+        assert isinstance(app.query_one("#composer"), CommandInput)
+        app.exit(0)
+
+
+def test_tui_f9_binding_present_for_vim_mode():
+    binding = next(item for item in NativeGlmTui.BINDINGS if str(item.key) == "f9")
+    assert binding.action == "toggle_vim"
+
+
+@pytest.mark.asyncio
+async def test_tui_vim_command_routes_to_toggle(tmp_path, monkeypatch):
+    from glm_acp.tui import ModalComposer
+
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        assert await app._handle_local_command("/vim") is True
+        assert app._vim_enabled is True
+        assert isinstance(app.query_one("#composer"), ModalComposer)
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_vim_normal_mode_keeps_slash_menu_available(tmp_path, monkeypatch):
+    from glm_acp.tui import ModalComposer
+
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app.action_toggle_vim()
+        composer = app.query_one("#composer", ModalComposer)
+        composer.focus()
+        await pilot.press("slash")
+        assert composer.mode == "insert"
+        assert composer.value == "/"
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_vim_env_var_forces_on_at_startup(tmp_path, monkeypatch):
+    from glm_acp.tui import ModalComposer
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+    monkeypatch.setenv("GLM_ACP_VIM", "1")
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        assert app._vim_enabled is True
+        assert app.query_one("#composer", ModalComposer).mode == "normal"
+        app.exit(0)
+
+
+@pytest.mark.asyncio
 async def test_tui_context_command_routes_to_breakdown_screen(tmp_path):
     """Tier 2.2: ``/context`` opens the ContextBudgetScreen with a real
     per-segment breakdown of the live session."""
