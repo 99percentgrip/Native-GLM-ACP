@@ -140,6 +140,53 @@ class TestThemeConfig:
         assert load_theme_config() is None
 
 
+class TestScreenReaderConfig:
+    """Tier 4 accessibility: persistent screen-reader (plain-text) preference."""
+
+    def test_default_returns_false_when_file_missing(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_screen_reader_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        assert load_screen_reader_config() is False
+
+    def test_save_then_load_round_trip_true(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_screen_reader_config, save_screen_reader_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        saved = save_screen_reader_config(True)
+        assert saved is True
+        assert load_screen_reader_config() is True
+
+    def test_save_then_load_round_trip_false(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_screen_reader_config, save_screen_reader_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        # Saving False explicitly (e.g. user toggled off) should overwrite
+        # a previously persisted True rather than silently no-op.
+        save_screen_reader_config(True)
+        assert save_screen_reader_config(False) is False
+        assert load_screen_reader_config() is False
+
+    def test_corrupt_file_falls_back_to_false(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_screen_reader_config, screen_reader_path
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        screen_reader_path().write_text("not json {{{", encoding="utf-8")
+        assert load_screen_reader_config() is False
+
+    def test_wrong_schema_falls_back_to_false(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_screen_reader_config, screen_reader_path
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        # "enabled" must be a bool — strings, ints, and missing keys fall back.
+        screen_reader_path().write_text('{"enabled": "yes"}', encoding="utf-8")
+        assert load_screen_reader_config() is False
+        screen_reader_path().write_text('{"enabled": 1}', encoding="utf-8")
+        assert load_screen_reader_config() is False
+        screen_reader_path().write_text('{"wrong": "shape"}', encoding="utf-8")
+        assert load_screen_reader_config() is False
+
+
 class TestModelRegistry:
     def test_all_models_have_context_window(self):
         for model_id in MODELS:

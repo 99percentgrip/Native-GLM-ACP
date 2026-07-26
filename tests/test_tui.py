@@ -1889,6 +1889,93 @@ async def test_tui_sound_command_toggles_notification_sounds(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tui_screen_reader_command_toggles_and_persists(tmp_path, monkeypatch):
+    """Tier 4 accessibility: ``/screen-reader`` toggles plain-text mode and
+    persists the choice to ``config_dir()/screen-reader.json``. While on,
+    the activity animation is forced off."""
+    from glm_acp.config import load_screen_reader_config
+
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        # Known starting state: off, persisted file absent.
+        assert app._screen_reader is False
+        assert load_screen_reader_config() is False
+
+        # Toggle on.
+        handled = await app._handle_local_command("/screen-reader")
+        assert handled is True
+        assert app._screen_reader is True
+        assert load_screen_reader_config() is True
+        # Animation must be disabled while screen-reader is on.
+        assert app._activity_animation_enabled is False
+
+        # Toggle off.
+        handled = await app._handle_local_command("/screen-reader")
+        assert handled is True
+        assert app._screen_reader is False
+        assert load_screen_reader_config() is False
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_screen_reader_renders_plain_text_for_agent_message(tmp_path, monkeypatch):
+    """When screen-reader mode is on, agent messages render as the raw
+    markdown source string (no ANSI styling) rather than a Rich Markdown
+    renderable, so assistive technology reads the message naturally."""
+    from rich.markdown import Markdown as RichMarkdown
+
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+
+        # Default mode: RichMarkdown renderable.
+        rendered = app._render_agent_content("**hi** code")
+        assert isinstance(rendered, RichMarkdown)
+
+        # Screen-reader mode: raw string preserved, no styling.
+        app._screen_reader = True
+        rendered = app._render_agent_content("**hi** code")
+        assert isinstance(rendered, str)
+        assert rendered == "**hi** code"
+        app.exit(0)
+
+
+def test_tui_f8_binding_present_for_screen_reader():
+    """F8 is bound to the screen-reader toggle so the feature is reachable
+    without typing ``/screen-reader``."""
+    keys = {str(b.key) for b in NativeGlmTui.BINDINGS}
+    assert "f8" in keys
+    f8 = [b for b in NativeGlmTui.BINDINGS if str(b.key) == "f8"][0]
+    assert f8.action == "toggle_screen_reader"
+
+
+@pytest.mark.asyncio
+async def test_tui_screen_reader_env_var_forces_on_at_startup(tmp_path, monkeypatch):
+    """``GLM_ACP_SCREEN_READER=1`` forces screen-reader mode on at startup
+    regardless of the persisted config, and disables animation."""
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+    monkeypatch.setenv("GLM_ACP_SCREEN_READER", "1")
+
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        assert app._screen_reader is True
+        assert app._activity_animation_enabled is False
+        app.exit(0)
+
+
+@pytest.mark.asyncio
 async def test_tui_refresh_session_panel_hides_disabled_segments(tmp_path, monkeypatch):
     """When segments are toggled off, ``_refresh_session_panel`` omits them."""
     monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))

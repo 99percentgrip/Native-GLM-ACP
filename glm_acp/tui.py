@@ -59,8 +59,10 @@ from .config import (
     STATUSLINE_SEGMENTS,
     THOUGHT_LEVELS,
     VISION_MODELS,
+    load_screen_reader_config,
     load_statusline_config,
     load_theme_config,
+    save_screen_reader_config,
     save_statusline_config,
     save_theme_config,
     thought_levels_for_model,
@@ -100,6 +102,7 @@ LOCAL_COMMANDS = {
     "/rewind": "Alias for /rollback — rewind conversation to a prior checkpoint",
     "/smart": "Expand a smart-prompt template with git context (/smart pr, review, commit, fix-ci)",
     "/sound": "Toggle notification sounds on/off for this session",
+    "/screen-reader": "Toggle screen-reader mode (plain text, no animations, F8)",
     "/rename": "Rename the current session (/rename <name>)",
     "/branch": "Fork the current session to try a different direction (/branch [name])",
     # Agent-side commands (implemented in the shared runtime; listed here so
@@ -1592,6 +1595,12 @@ class NativeGlmTui(App[int]):
         # context menu and click-drag selection work (Codex/Claude-Code
         # approach). When OFF (default), Textual handles all mouse events.
         Binding("f7", "toggle_native_mouse", "Native mouse", show=False, priority=True),
+        # Screen-reader mode toggle. When ON, agent messages render as plain
+        # text instead of Rich Markdown (avoiding ANSI/styling sequences that
+        # trip up screen readers), the activity status line stops animating,
+        # and the preference persists across sessions. Toggle via F8 or
+        # ``/screen-reader``; force on at startup via GLM_ACP_SCREEN_READER=1.
+        Binding("f8", "toggle_screen_reader", "Screen reader", show=False, priority=True),
     ]
 
     CSS = """
@@ -1700,6 +1709,20 @@ class NativeGlmTui(App[int]):
             "no",
             "off",
         }
+        # Screen-reader mode: when True, agent messages render as plain text
+        # (no Rich Markdown), the activity status line stops animating, and
+        # the user gets a screen-reader-friendlier transcript. Loaded from
+        # ``config_dir()/screen-reader.json`` but forced on by
+        # ``GLM_ACP_SCREEN_READER=1`` regardless of saved state.
+        screen_reader_env = os.environ.get("GLM_ACP_SCREEN_READER", "").strip().lower()
+        self._screen_reader = (
+            screen_reader_env in {"1", "true", "yes", "on"}
+            or load_screen_reader_config()
+        )
+        if self._screen_reader:
+            # Activity animation relies on glyph cycling, which is hostile
+            # to assistive tech — disable it whenever screen-reader is on.
+            self._activity_animation_enabled = False
         self._activity_timer: Timer | None = None
         self._activity_frame = 0
         self._activity_label = "Starting session"
@@ -2034,6 +2057,9 @@ class NativeGlmTui(App[int]):
                 severity="success" if new_state else "information",
             )
             return True
+        if text == "/screen-reader":
+            self.action_toggle_screen_reader()
+            return True
         if text == "/copy" or text == "/copy last":
             await self._copy_response(None)
             return True
@@ -2333,7 +2359,9 @@ class NativeGlmTui(App[int]):
                     return
 
                 if self._current_agent is not None and self._current_agent_text:
-                    self._current_agent.update(RichMarkdown(self._current_agent_text))
+                    self._current_agent.update(
+                        self._render_agent_content(self._current_agent_text)
+                    )
                     self._last_agent_render = time.monotonic()
 
                 if not self._prompt_queue or self._shutdown_requested:
@@ -2566,7 +2594,7 @@ class NativeGlmTui(App[int]):
         if now - self._last_agent_render > 0.12:
             self._last_agent_render = now
             self._current_agent.update(
-                RichMarkdown(self._current_agent_text),
+                self._render_agent_content(self._current_agent_text),
                 raw_text=self._current_agent_text,
             )
         transcript.scroll_end(animate=False)
@@ -3720,6 +3748,71 @@ class NativeGlmTui(App[int]):
                 f"Could not toggle mouse mode: {error}",
                 severity="error",
             )
+
+    def action_toggle_screen_reader(self) -> None:
+        """Toggle screen-reader (plain-text) mode and persist the choice.
+
+        When screen-reader mode is **ON**:
+
+        * Agent messages render as raw markdown text instead of a Rich
+          Markdown renderable. ANSI styling sequences, box drawing, and
+          Rich's heading rules are stripped so assistive technology reads
+          the message naturally.
+        * The activity status line stops animating (no glyph cycling) —
+          the activity label becomes the only visible signal.
+        * The preference persists across sessions in
+          ``config_dir()/screen-reader.json`` and is also forced on at
+          startup via ``GLM_ACP_SCREEN_READER=1``.
+
+        Press **F8** or run ``/screen-reader`` to toggle. The currently
+        visible agent message is re-rendered immediately so the user
+        sees the change without restarting.
+        """
+        self._screen_reader = not self._screen_reader
+        # Animation is hostile to screen readers — always force it off
+        # when screen-reader is on, and restore the env-var preference
+        # when toggling back off.
+        if self._screen_reader:
+            self._activity_animation_enabled = False
+        else:
+            animation_setting = os.environ.get("GLM_ACP_TUI_ANIMATION", "1")
+            self._activity_animation_enabled = animation_setting.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+        try:
+            save_screen_reader_config(self._screen_reader)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        # Re-render the in-flight agent message so the change is visible
+        # without waiting for the next streaming chunk.
+        if self._current_agent is not None and self._current_agent_text:
+            self._current_agent.update(
+                self._render_agent_content(self._current_agent_text),
+                raw_text=self._current_agent_text,
+            )
+        state_str = "on" if self._screen_reader else "off"
+        self.notify(
+            f"Screen-reader mode: {state_str}",
+            title="Screen reader",
+            severity="information" if self._screen_reader else "success",
+            timeout=6,
+        )
+
+    def _render_agent_content(self, text: str) -> Any:
+        """Return the renderable for an agent message respecting screen-reader mode.
+
+        In screen-reader mode we render the **raw markdown source** as
+        plain text — no Rich styling, no box drawing, no heading rules —
+        so screen readers and braille displays read the message naturally
+        without tripping over ANSI escape sequences. In normal mode we
+        render the rich :class:`Markdown` renderable as before.
+        """
+        if self._screen_reader:
+            return text
+        return RichMarkdown(text)
 
     async def _export_last_response(self) -> None:
         """Export the last agent response to a timestamped Markdown file."""

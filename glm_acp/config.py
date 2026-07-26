@@ -210,6 +210,54 @@ def theme_path() -> Path:
     return config_dir() / "theme.json"
 
 
+def screen_reader_path() -> Path:
+    """Return the path to the persistent screen-reader-mode preference."""
+    return config_dir() / "screen-reader.json"
+
+
+def load_screen_reader_config() -> bool:
+    """Return whether the TUI should start in screen-reader (plain-text) mode.
+
+    Best-effort: missing file, parse error, or wrong schema all fall back
+    to ``False`` so users who never opted in get the default Rich-rendered
+    experience. The on-disk schema is ``{"enabled": bool}``.
+    """
+    try:
+        payload = json.loads(screen_reader_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    value = payload.get("enabled")
+    if not isinstance(value, bool):
+        return False
+    return value
+
+
+def save_screen_reader_config(enabled: bool) -> bool:
+    """Persist ``enabled`` as the user default and return it.
+
+    The value is written atomically so concurrent readers never see a
+    partial file. The persisted shape is ``{"enabled": bool}``.
+    """
+    payload = {"enabled": bool(enabled)}
+    path = screen_reader_path()
+    _secure_dir(path.parent)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _secure_file(temporary)
+        os.replace(temporary, path)
+        _secure_file(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return bool(enabled)
+
+
 def load_theme_config() -> str | None:
     """Return the persisted Textual theme name, or ``None`` if unset/invalid.
 
