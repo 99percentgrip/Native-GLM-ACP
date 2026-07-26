@@ -117,6 +117,7 @@ The TUI session sidebar also shows a **live token meter** (cumulative input ↑,
 | `/checkpoint clear [confirm]` | Preview or remove this workspace's deduplicated checkpoints |
 | `/rollback [checkpoint-id]` | Restore recorded agent changes unless a later conflicting edit is detected |
 | `/plugins` | List installed declarative plugins and their integrity state |
+| `/mobile` | Start or stop the optional scan-to-approve companion. Start chat with `--mobile-bind 0.0.0.0:8765 --mobile-allow-public`, then use `/mobile`; each approval displays a one-time QR code that the phone opens directly to Allow or Deny. Loopback remains the safe default; use `--mobile-url` for an explicitly supplied Tailscale/reverse-proxy URL. |
 | `/awareness` | Show knowledge, uncertainty, stale evidence, capability limits, next evidence, and completion coverage |
 | `/metacognition` | Show uncertainty classes, risk, adaptive execution mode, and matching empirical capability profile |
 | `/deliberation` | Show falsifiable hypotheses, evidence-backed tests, critic verdict, and value-of-information ranking |
@@ -533,10 +534,10 @@ checksum, install without administrator privileges, and expose both `glm-acp`
 and `native-glm-acp`. No Python or Node.js runtime is required. Open a new
 terminal after installation if `glm-acp` is not immediately found.
 
-To pin a release, set `GLM_ACP_VERSION=v2.7.27` before running the Unix
-installer, or pass `-Version v2.7.27` to the downloaded PowerShell script.
+To pin a release, set `GLM_ACP_VERSION=v2.7.28` before running the Unix
+installer, or pass `-Version v2.7.28` to the downloaded PowerShell script.
 The current release and manual-download fallback is
-[v2.7.27](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v2.7.27).
+[v2.7.28](https://github.com/99percentgrip/Native-GLM-ACP/releases/tag/v2.7.28).
 
 The setup prompts without echoing the API key and stores it in a user-only
 configuration file. You can also keep using `ZAI_API_KEY` or `Z_AI_API_KEY`;
@@ -1055,7 +1056,7 @@ You can confirm it's installed by checking for the editable finder:
 
 ```bash
 ls .venv/lib/*/site-packages/ | grep glm_acp
-# expect: glm_acp-2.7.27.dist-info  (and editable-install metadata)
+# expect: glm_acp-2.7.28.dist-info  (and editable-install metadata)
 ```
 
 ### Agent reports missing API credentials

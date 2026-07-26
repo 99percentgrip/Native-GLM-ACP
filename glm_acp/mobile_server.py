@@ -10,22 +10,50 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import socket
 import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 
 class MobileServerError(RuntimeError):
     pass
 
 
+def _lan_address() -> str | None:
+    """Best-effort local IPv4 address selection without mDNS/discovery traffic."""
+    try:
+        candidates = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError:
+        candidates = []
+    for candidate in candidates:
+        address = candidate[4][0]
+        if not address.startswith("127."):
+            return address
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            # Connecting a UDP socket only asks the OS for its preferred route.
+            probe.connect(("192.0.2.1", 9))
+            address = probe.getsockname()[0]
+    except OSError:
+        return None
+    return address if not address.startswith("127.") else None
+
+
 class MobileServer:
     """Serve the bundled PWA and resolve short-lived approval IDs."""
 
-    def __init__(self, bind: str = "127.0.0.1:8765", *, allow_public: bool = False) -> None:
+    def __init__(
+        self,
+        bind: str = "127.0.0.1:8765",
+        *,
+        allow_public: bool = False,
+        public_url: str | None = None,
+    ) -> None:
         host, separator, port_text = bind.rpartition(":")
         if not separator or not host or not port_text.isdigit():
             raise MobileServerError("Mobile bind must be host:port")
@@ -36,6 +64,11 @@ class MobileServer:
                 "Mobile server may bind only to loopback or explicitly acknowledged 0.0.0.0"
             )
         self.host, self.port = host, int(port_text)
+        normalized_public_url = (public_url or "").strip().rstrip("/")
+        if normalized_public_url and not normalized_public_url.startswith(("http://", "https://")):
+            raise MobileServerError("Mobile public URL must start with http:// or https://")
+        self._public_url = normalized_public_url or None
+        self._advertised_host: str | None = None
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._approvals: dict[
@@ -49,7 +82,18 @@ class MobileServer:
 
     @property
     def url(self) -> str:
-        return f"http://{self.host}:{self.port}/"
+        if self._public_url:
+            return f"{self._public_url}/"
+        host = self._advertised_host or self.host
+        return f"http://{host}:{self.port}/"
+
+    @property
+    def phone_reachable(self) -> bool:
+        return self._public_url is not None or self._advertised_host is not None
+
+    def approval_url(self, approval_id: str) -> str:
+        """Return the QR-ready, short-lived approval link for one request."""
+        return f"{self.url}?approval={quote(approval_id, safe='')}"
 
     def register_approval(self, future: asyncio.Future[bool], *, ttl_seconds: float = 120) -> str:
         approval_id = secrets.token_urlsafe(18)
@@ -73,6 +117,12 @@ class MobileServer:
     def start(self) -> None:
         if self._server is not None:
             return
+        if self.host == "0.0.0.0" and self._public_url is None:
+            self._advertised_host = _lan_address()
+            if self._advertised_host is None:
+                raise MobileServerError(
+                    "Could not determine a LAN address; use --mobile-url with an explicit URL"
+                )
         owner = self
         asset_dir = Path(__file__).with_name("_mobile_pwa")
 
@@ -89,7 +139,12 @@ class MobileServer:
                 self.wfile.write(body)
 
             def do_GET(self) -> None:  # noqa: N802
-                name = "index.html" if self.path in {"/", "/index.html"} else self.path.lstrip("/")
+                request_path = urlsplit(self.path).path
+                name = (
+                    "index.html"
+                    if request_path in {"/", "/index.html"}
+                    else request_path.lstrip("/")
+                )
                 if name not in {"index.html", "manifest.webmanifest", "app.js"}:
                     self._send(HTTPStatus.NOT_FOUND, b"Not found", "text/plain")
                     return
@@ -107,7 +162,8 @@ class MobileServer:
 
             def do_POST(self) -> None:  # noqa: N802
                 prefix = "/approve/"
-                if not self.path.startswith(prefix):
+                request_path = urlsplit(self.path).path
+                if not request_path.startswith(prefix):
                     self._send(HTTPStatus.NOT_FOUND, b"Not found", "text/plain")
                     return
                 size = int(self.headers.get("Content-Length", "0") or 0)
@@ -120,7 +176,7 @@ class MobileServer:
                 except (ValueError, UnicodeDecodeError):
                     self._send(HTTPStatus.BAD_REQUEST, b"Invalid request", "text/plain")
                     return
-                if not owner._resolve(self.path[len(prefix) :], allowed):
+                if not owner._resolve(request_path[len(prefix) :], allowed):
                     self._send(HTTPStatus.NOT_FOUND, b"Unknown approval", "text/plain")
                     return
                 self._send(HTTPStatus.OK, b'{"ok":true}', "application/json")

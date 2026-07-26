@@ -51,6 +51,10 @@ def add_chat_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     )
     parser.add_argument("--mobile-bind", default="127.0.0.1:8765", help="mobile companion bind")
     parser.add_argument("--mobile-allow-public", action="store_true")
+    parser.add_argument(
+        "--mobile-url",
+        help="public/Tailscale URL advertised in scan-to-approve QR codes",
+    )
 
 
 class TerminalClient:

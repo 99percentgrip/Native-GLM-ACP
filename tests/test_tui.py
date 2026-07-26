@@ -2939,12 +2939,50 @@ async def test_tui_mobile_command_toggles_server(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_tui_mobile_renders_qr_widget(tmp_path):
+async def test_tui_mobile_loopback_status_does_not_render_unusable_qr(tmp_path):
     app = NativeGlmTui(_args(tmp_path, "--mobile-bind", "127.0.0.1:0"), agent_factory=FakeAgent)
     async with app.run_test(size=(120, 40)) as pilot:
         await _wait_for_agent_ready(app, pilot)
         await app._handle_local_command("/mobile")
-        assert app.query_one("#mobile-qr", Static)
+        assert app.query_one("#mobile-status", Static)
+        assert not list(app.query("#mobile-qr"))
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_mobile_renders_one_time_qr_for_active_permission(tmp_path, monkeypatch):
+    monkeypatch.setattr("glm_acp.mobile_server._lan_address", lambda: "192.0.2.42")
+    agent = FakeAgent()
+    app = NativeGlmTui(
+        _args(
+            tmp_path,
+            "--mobile-bind",
+            "0.0.0.0:0",
+            "--mobile-allow-public",
+        ),
+        agent_factory=lambda: agent,
+    )
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app.action_mobile()
+        composer = app.query_one("#composer", Input)
+        composer.value = "Make the requested edit"
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if list(app.query("#mobile-qr")):
+                break
+        qr = app.query_one("#mobile-qr", Static)
+        assert "Scan to approve this request" in str(qr.render())
+        server = app._mobile_server
+        assert server is not None and len(server._approvals) == 1
+        approval_id = next(iter(server._approvals))
+        assert server._resolve(approval_id, True) is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if agent.permission is not None:
+                break
+        assert agent.permission.outcome.outcome == "selected"
         app.exit(0)
 
 

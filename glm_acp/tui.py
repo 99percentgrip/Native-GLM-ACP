@@ -123,7 +123,7 @@ LOCAL_COMMANDS = {
     "/screenshot": "Capture a screenshot and queue it for the next prompt",
     "/attach": "Queue an image file for the next prompt (/attach <path>)",
     "/sessions-new": "Create and switch to a parallel Git worktree session (/sessions-new <name>)",
-    "/mobile": "Start or stop the loopback mobile approval companion",
+    "/mobile": "Start or stop scan-to-approve mobile companion",
     "/rename": "Rename the current session (/rename <name>)",
     "/branch": "Fork the current session to try a different direction (/branch [name])",
     # Agent-side commands (implemented in the shared runtime; listed here so
@@ -1855,11 +1855,13 @@ class TuiClient:
         self.app._set_activity("Waiting for approval", tone="warning")
         try:
             mobile = self.app._mobile_server
-            if mobile is not None and mobile.running:
+            if mobile is not None and mobile.running and mobile.phone_reachable:
                 decision: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
                 approval_id = mobile.register_approval(decision)
+                approval_url = mobile.approval_url(approval_id)
+                await self.app._show_mobile_approval_qr(approval_url)
                 await self.app._append_system(
-                    f"Mobile approval pending: {mobile.url}?approval={approval_id}"
+                    "Mobile approval pending — scan the one-time QR code."
                 )
                 allowed = await decision
             else:
@@ -4095,28 +4097,45 @@ class NativeGlmTui(App[int]):
             server = MobileServer(
                 getattr(self.args, "mobile_bind", "127.0.0.1:8765"),
                 allow_public=bool(getattr(self.args, "mobile_allow_public", False)),
+                public_url=getattr(self.args, "mobile_url", None),
             )
             server.start()
         except MobileServerError as error:
             self.notify(str(error), severity="warning")
             return
         self._mobile_server = server
-        qr = f"Mobile companion: {server.url}"
-        try:
-            import qrcode  # type: ignore[import-not-found]
-
-            code = qrcode.QRCode(border=1)
-            code.add_data(server.url)
-            code.make(fit=True)
-            qr += "\n" + "\n".join(
-                "".join("██" if bit else "  " for bit in row) for row in code.get_matrix()
+        if server.phone_reachable:
+            message = "Mobile companion armed. A one-time QR code appears for each approval."
+        else:
+            message = (
+                "Mobile companion is loopback-only. For phone scan-to-approve, restart with "
+                "--mobile-bind 0.0.0.0:8765 --mobile-allow-public."
             )
-        except ImportError:
-            qr += "\nInstall qrcode for a terminal QR code."
         await self.query_one("#transcript", VerticalScroll).mount(
-            Static(qr, id="mobile-qr", classes="system-message", markup=False)
+            Static(message, id="mobile-status", classes="system-message", markup=False)
         )
-        self.notify(f"Mobile companion running at {server.url}", severity="success")
+        self.notify("Mobile companion armed", severity="success")
+
+    async def _show_mobile_approval_qr(self, approval_url: str) -> None:
+        """Show a scan-ready, single-approval QR code in the active transcript."""
+        import qrcode
+
+        for widget in self.query("#mobile-qr"):
+            await widget.remove()
+        code = qrcode.QRCode(border=1)
+        code.add_data(approval_url)
+        code.make(fit=True)
+        rendered = "\n".join(
+            "".join("██" if bit else "  " for bit in row) for row in code.get_matrix()
+        )
+        await self.query_one("#transcript", VerticalScroll).mount(
+            Static(
+                f"Scan to approve this request (expires in 2 minutes):\n{rendered}",
+                id="mobile-qr",
+                classes="system-message",
+                markup=False,
+            )
+        )
 
     async def action_open_plugins(self) -> None:
         """Load verified plugins, then expose per-plugin reload/disable actions."""

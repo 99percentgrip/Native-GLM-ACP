@@ -27,6 +27,29 @@ def test_mobile_server_refuses_public_bind_without_acknowledgement():
         MobileServer("0.0.0.0:8765")
 
 
+def test_mobile_server_public_bind_advertises_lan_address(monkeypatch):
+    monkeypatch.setattr("glm_acp.mobile_server._lan_address", lambda: "192.0.2.42")
+    server = MobileServer("0.0.0.0:0", allow_public=True)
+    server.start()
+    try:
+        assert server.phone_reachable is True
+        assert server.url.startswith("http://192.0.2.42:")
+    finally:
+        server.stop()
+
+
+def test_mobile_server_public_bind_requires_a_reachable_advertised_address(monkeypatch):
+    monkeypatch.setattr("glm_acp.mobile_server._lan_address", lambda: None)
+    server = MobileServer("0.0.0.0:0", allow_public=True)
+    with pytest.raises(MobileServerError, match="Could not determine"):
+        server.start()
+
+
+def test_mobile_approval_url_carries_a_single_approval_id():
+    server = MobileServer("127.0.0.1:8765")
+    assert server.approval_url("one time/id") == "http://127.0.0.1:8765/?approval=one%20time%2Fid"
+
+
 @pytest.mark.asyncio
 async def test_mobile_approval_id_resolves_future():
     server = MobileServer("127.0.0.1:0")
@@ -71,6 +94,15 @@ def test_mobile_server_get_root_returns_pwa():
     server.start()
     try:
         assert b"Native GLM ACP" in _request(server, "/").read()
+    finally:
+        server.stop()
+
+
+def test_mobile_server_get_root_with_approval_query_returns_pwa():
+    server = MobileServer("127.0.0.1:0")
+    server.start()
+    try:
+        assert b"Native GLM ACP" in _request(server, "/?approval=scan-token").read()
     finally:
         server.stop()
 
