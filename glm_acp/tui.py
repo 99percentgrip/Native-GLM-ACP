@@ -110,6 +110,7 @@ LOCAL_COMMANDS = {
     "/screen-reader": "Toggle screen-reader mode (plain text, no animations, F8)",
     "/keybinds": "Customize TUI F-key and Ctrl-key bindings",
     "/vim": "Toggle vim-mode composer (Normal/Insert/Visual, F9)",
+    "/annotate": "Annotate working-tree diff hunks for the next prompt",
     "/rename": "Rename the current session (/rename <name>)",
     "/branch": "Fork the current session to try a different direction (/branch [name])",
     # Agent-side commands (implemented in the shared runtime; listed here so
@@ -530,6 +531,145 @@ class ModalComposer(CommandInput):
         if self.handle_vim_key(key):
             event.stop()
             event.prevent_default()
+
+
+def _diff_annotation_anchors(diff_text: str) -> list[tuple[str, int, str]]:
+    """Return displayable diff lines with their best-effort new-file anchors."""
+    anchors: list[tuple[str, int, str]] = []
+    current_file = "(unknown)"
+    next_line = 1
+    hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+    for raw_line in diff_text.splitlines():
+        if raw_line.startswith("diff --git a/"):
+            parts = raw_line.split()
+            if len(parts) >= 4 and parts[-1].startswith("b/"):
+                current_file = parts[-1][2:]
+        elif raw_line.startswith("+++ b/"):
+            current_file = raw_line[6:]
+        match = hunk.match(raw_line)
+        if match:
+            next_line = int(match.group(1))
+            anchors.append((current_file, next_line, raw_line))
+            continue
+        if raw_line.startswith("+") and not raw_line.startswith("+++"):
+            anchors.append((current_file, next_line, raw_line))
+            next_line += 1
+        elif raw_line.startswith("-") and not raw_line.startswith("---"):
+            anchors.append((current_file, max(1, next_line - 1), raw_line))
+        elif raw_line.startswith(" "):
+            anchors.append((current_file, next_line, raw_line))
+            next_line += 1
+        else:
+            anchors.append((current_file, next_line, raw_line))
+    return anchors
+
+
+class AnnotationCommentScreen(ModalScreen[str | None]):
+    """Small focused editor for one line-anchored diff comment."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    CSS = """
+    AnnotationCommentScreen { align: center middle; background: $background 70%; }
+    #annotation-comment-dialog {
+        width: 76; max-width: 94%; height: auto; border: thick $accent;
+        background: $surface; padding: 1 2;
+    }
+    #annotation-comment-input { width: 1fr; }
+    """
+
+    def __init__(self, file_path: str, line: int) -> None:
+        super().__init__()
+        self._file_path = file_path
+        self._line = line
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="annotation-comment-dialog"):
+            yield Label(f"Comment on {self._file_path}:{self._line}")
+            yield Input(
+                placeholder="Describe the requested revision…",
+                id="annotation-comment-input",
+            )
+            yield Static("Enter save  ·  Esc cancel", markup=False)
+
+    def on_mount(self) -> None:
+        self.query_one("#annotation-comment-input", Input).focus()
+
+    @on(Input.Submitted, "#annotation-comment-input")
+    def save_comment(self, event: Input.Submitted) -> None:
+        comment = event.value.strip()
+        self.dismiss(comment or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class DiffAnnotationScreen(ModalScreen[list[tuple[str, int, str]] | None]):
+    """Navigate a working-tree diff and attach revision comments to its lines."""
+
+    BINDINGS = [
+        Binding("c", "comment", "Comment", priority=True),
+        Binding("escape", "done", "Done", priority=True),
+    ]
+
+    CSS = """
+    DiffAnnotationScreen { align: center middle; background: $background 70%; }
+    #annotation-dialog {
+        width: 112; max-width: 98%; height: 88%; border: thick $accent;
+        background: $surface; padding: 1 2;
+    }
+    #annotation-lines { height: 1fr; border: solid $panel; }
+    #annotation-comments { height: auto; max-height: 6; color: $text-muted; }
+    #annotation-hint { height: 1; color: $text-muted; }
+    """
+
+    def __init__(self, diff_text: str) -> None:
+        super().__init__()
+        self._anchors = _diff_annotation_anchors(diff_text)
+        self.comments: list[tuple[str, int, str]] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="annotation-dialog"):
+            yield Label("Diff annotations")
+            yield OptionList(
+                *[
+                    Option(f"{file_path}:{line:>5}  {text}", id=str(index))
+                    for index, (file_path, line, text) in enumerate(self._anchors)
+                ],
+                id="annotation-lines",
+                markup=False,
+            )
+            yield Static("No comments yet.", id="annotation-comments", markup=False)
+            yield Static(
+                "↑↓ select a line  ·  c comment  ·  Esc insert follow-up prompt",
+                id="annotation-hint",
+                markup=False,
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#annotation-lines", OptionList).focus()
+
+    def action_comment(self) -> None:
+        lines = self.query_one("#annotation-lines", OptionList)
+        index = lines.highlighted
+        if index is None or not 0 <= index < len(self._anchors):
+            return
+        file_path, line, _text = self._anchors[index]
+        self.app.push_screen(
+            AnnotationCommentScreen(file_path, line),
+            lambda comment: self._save_comment(file_path, line, comment),
+        )
+
+    def _save_comment(self, file_path: str, line: int, comment: str | None) -> None:
+        if not comment:
+            return
+        self.comments.append((file_path, line, comment))
+        rendered = "\n".join(f"• {path}:{number} — {note}" for path, number, note in self.comments)
+        self.query_one("#annotation-comments", Static).update(rendered)
+
+    def action_done(self) -> None:
+        self.dismiss(self.comments or None)
+
 
 class PermissionScreen(ModalScreen[bool]):
     """Fail-closed approval dialog for a single tool invocation."""
@@ -2286,6 +2426,9 @@ class NativeGlmTui(App[int]):
         if text == "/vim":
             await self.action_toggle_vim()
             return True
+        if text == "/annotate":
+            await self.action_annotate()
+            return True
         if text == "/context":
             await self.action_open_context()
             return True
@@ -3642,6 +3785,27 @@ class NativeGlmTui(App[int]):
             self.notify("Working tree panel closed", severity="information")
         else:
             await self._switch_wt_view(self._wt_view)
+
+    async def action_annotate(self) -> None:
+        """Open the line-anchored diff annotator and prefill its follow-up."""
+        if self._wt_visible:
+            self._wt_view = 2
+            await self._switch_wt_view(2)
+        diff_text = await asyncio.to_thread(self._run_git, self._session_cwd(), "diff", "HEAD")
+        if not diff_text or not diff_text.strip():
+            self.notify("No working-tree diff to annotate", severity="information")
+            return
+        comments = await self.push_screen_wait(DiffAnnotationScreen(diff_text))
+        if not comments:
+            return
+        prompt = "Please revise the following hunks:\n" + "\n".join(
+            f"- {file_path}:{line} — {comment}" for file_path, line, comment in comments
+        )
+        composer = self.query_one("#composer", Input)
+        composer.value = prompt
+        composer.cursor_position = len(prompt)
+        composer.focus()
+        self.notify(f"Added {len(comments)} diff annotation(s) to the composer", severity="success")
 
     _WT_VIEW_IDS = ("wt-changes", "wt-git", "wt-diff", "wt-files", "wt-github")
     _WT_VIEW_LABELS = ("Changes", "Git", "Diff", "Files", "GitHub")

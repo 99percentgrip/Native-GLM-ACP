@@ -2565,3 +2565,121 @@ async def test_journey_command_routes_to_modal(tmp_path, monkeypatch):
 
     assert len(pushed) == 1
     assert isinstance(pushed[0], JourneyScreen)
+
+
+_ANNOTATION_DIFF = """diff --git a/foo.py b/foo.py
+index 0000000..1111111 100644
+--- a/foo.py
++++ b/foo.py
+@@ -1,2 +1,3 @@
+ one
+-two
++two revised
++three
+"""
+
+
+def test_diff_annotation_anchors_track_new_file_lines():
+    from glm_acp.tui import _diff_annotation_anchors
+
+    anchors = _diff_annotation_anchors(_ANNOTATION_DIFF)
+    assert ("foo.py", 2, "+two revised") in anchors
+    assert ("foo.py", 3, "+three") in anchors
+
+
+@pytest.mark.asyncio
+async def test_tui_diff_annotation_screen_opens_with_diff(tmp_path):
+    from glm_acp.tui import DiffAnnotationScreen
+
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen(DiffAnnotationScreen(_ANNOTATION_DIFF))
+        for _ in range(10):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, DiffAnnotationScreen):
+                break
+        assert isinstance(app.screen, DiffAnnotationScreen)
+        assert len(app.screen._anchors) == len(_ANNOTATION_DIFF.splitlines())
+        app.pop_screen()
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_diff_annotation_c_opens_input_and_stores_comment(tmp_path):
+    from glm_acp.tui import AnnotationCommentScreen, DiffAnnotationScreen
+
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        screen = DiffAnnotationScreen(_ANNOTATION_DIFF)
+        app.push_screen(screen)
+        for _ in range(10):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, DiffAnnotationScreen):
+                break
+        await pilot.press("c")
+        for _ in range(10):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, AnnotationCommentScreen):
+                break
+        assert isinstance(app.screen, AnnotationCommentScreen)
+        await pilot.press(*"rename", "enter")
+        for _ in range(10):
+            await pilot.pause(0.05)
+            if app.screen is screen and screen.comments:
+                break
+        assert screen.comments[0][2] == "rename"
+        app.pop_screen()
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_annotate_formats_multiple_comments_in_composer(tmp_path, monkeypatch):
+    from glm_acp.tui import DiffAnnotationScreen
+
+    monkeypatch.setattr(
+        "glm_acp.tui.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=_ANNOTATION_DIFF),
+    )
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    pushed: list[DiffAnnotationScreen] = []
+
+    async def fake_push_wait(screen):
+        pushed.append(screen)
+        return [("foo.py", 2, "rename this"), ("bar.py", 8, "add a test")]
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen_wait = fake_push_wait  # type: ignore[method-assign]
+        await app.action_toggle_working_tree()
+        assert await app._handle_local_command("/annotate") is True
+        assert app._wt_view == 2
+        composer = app.query_one("#composer", Input)
+        assert composer.value == (
+            "Please revise the following hunks:\n"
+            "- foo.py:2 — rename this\n- bar.py:8 — add a test"
+        )
+        assert isinstance(pushed[0], DiffAnnotationScreen)
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_annotate_no_comments_leaves_composer_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "glm_acp.tui.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=_ANNOTATION_DIFF),
+    )
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+
+    async def fake_push_wait(_screen):
+        return None
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        composer = app.query_one("#composer", Input)
+        composer.value = "keep this"
+        app.push_screen_wait = fake_push_wait  # type: ignore[method-assign]
+        await app.action_annotate()
+        assert composer.value == "keep this"
+        app.exit(0)
