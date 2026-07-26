@@ -64,12 +64,13 @@ jobs:
           if [ "${{ matrix.target }}" != "darwin-x86_64" ]; then
             VOICE_FLAGS="--collect-all faster_whisper --collect-all ctranslate2 --collect-all onnxruntime --collect-all av --collect-all tokenizers"
           fi
-          uv run --frozen pyinstaller --noconfirm --clean --onedir --name native-glm-acp --collect-all acp $VOICE_FLAGS glm_acp/launcher.py
+          uv run --frozen pyinstaller --noconfirm --clean --onedir --name native-glm-acp --collect-all acp --collect-all textual $VOICE_FLAGS glm_acp/launcher.py
       - name: Verify frozen executable
         shell: bash
         run: |
           test "$("dist/native-glm-acp/${{ matrix.binary }}" --version)" = "${GITHUB_REF_NAME#v}"
           "dist/native-glm-acp/${{ matrix.binary }}" chat --help | grep -q -- "--plain"
+          test -f "dist/native-glm-acp/_internal/textual/widgets/_tab_pane.py"
       - name: Package Unix executable
         if: matrix.archive == 'tar.gz'
         shell: bash

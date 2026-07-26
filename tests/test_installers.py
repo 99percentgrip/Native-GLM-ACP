@@ -149,7 +149,9 @@ def test_installer_release_contract():
     assert "Ctrl-X to exit" in windows
     assert "scripts/install.sh" in workflow
     assert "scripts/install.ps1" in workflow
+    assert "--collect-all textual" in workflow
     assert 'chat --help | grep -q -- "--plain"' in workflow
+    assert "textual/widgets/_tab_pane.py" in workflow
     assert "Enforce compressed frozen archive size ceiling" in workflow
     assert 'cmd: "./native-glm-acp/native-glm-acp"' in workflow
 
