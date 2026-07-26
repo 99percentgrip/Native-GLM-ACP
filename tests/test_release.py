@@ -99,3 +99,60 @@ async def test_version_info(tmp_path: Path):
     )
     result = version_info(str(tmp_path))
     assert "4.2.0" in result
+
+
+@pytest.mark.asyncio
+async def test_ci_status_returns_gh_not_found(monkeypatch, tmp_path):
+    """When gh is not available, ci_status returns a helpful message."""
+    from glm_acp import release
+
+    monkeypatch.setattr(release, "_has_tool", lambda _name: False)
+    result = await release.ci_status(str(tmp_path))
+    assert "gh" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_fetch_failed_run_logs_returns_empty_on_success(monkeypatch, tmp_path):
+    """When all recent runs passed, _fetch_failed_run_logs returns empty string."""
+    import json
+
+    from glm_acp import release
+
+    # Mock _run to return successful runs only.
+    async def fake_run(cmd, cwd, timeout=10):
+        if "--json" in cmd:
+            return 0, json.dumps([
+                {"databaseId": 123, "status": "completed", "conclusion": "success"},
+            ]), ""
+        return 0, "", ""
+
+    monkeypatch.setattr(release, "_run", fake_run)
+    result = await release._fetch_failed_run_logs(str(tmp_path))
+    assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_fetch_failed_run_logs_returns_logs_on_failure(monkeypatch, tmp_path):
+    """When a run failed, _fetch_failed_run_logs fetches and returns its logs."""
+    import json
+
+    from glm_acp import release
+
+    call_count = {"n": 0}
+
+    async def fake_run(cmd, cwd, timeout=10):
+        call_count["n"] += 1
+        if "--json" in cmd:
+            return 0, json.dumps([
+                {"databaseId": 999, "status": "completed", "conclusion": "failure"},
+                {"databaseId": 998, "status": "completed", "conclusion": "success"},
+            ]), ""
+        # This is the gh run view --log-failed call.
+        assert "999" in cmd
+        return 0, "Error: test failed\nAssertionError: expected 2 but got 1", ""
+
+    monkeypatch.setattr(release, "_run", fake_run)
+    monkeypatch.setattr(release, "_has_tool", lambda _name: True)
+    result = await release._fetch_failed_run_logs(str(tmp_path))
+    assert "test failed" in result
+    assert "AssertionError" in result

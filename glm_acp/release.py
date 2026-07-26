@@ -266,7 +266,13 @@ async def cut_release(cwd: str, release_type: str = "patch") -> str:
 
 
 async def ci_status(cwd: str = ".") -> str:
-    """Show CI run status via gh CLI."""
+    """Show CI run status via gh CLI, with failure logs when available.
+
+    Tier 3.3 CI Auto-Heal: when the most recent CI run failed, this function
+    also fetches the failure output (``gh run view --log-failed``) and
+    suggests running ``/smart fix-ci`` so the user can close the loop
+    without leaving the TUI.
+    """
     if not _has_tool("gh"):
         return "`gh` CLI not found. Install from https://cli.github.com/"
 
@@ -282,6 +288,74 @@ async def ci_status(cwd: str = ".") -> str:
     lines.append("```")
     lines.append(out.strip())
     lines.append("```")
-    lines.append("\nUse `/ci` again to refresh.")
+
+    # Try to detect the most recent failed run and fetch its logs.
+    failed_log = await _fetch_failed_run_logs(cwd)
+    if failed_log:
+        lines.append("\n## ❌ Most recent failure\n")
+        lines.append("```")
+        lines.append(failed_log)
+        lines.append("```")
+        lines.append("\n💡 Run `/smart fix-ci` to have the agent fix these failures.")
+    else:
+        lines.append("\nUse `/ci` again to refresh.")
 
     return "\n".join(lines)
+
+
+async def _fetch_failed_run_logs(cwd: str) -> str:
+    """Fetch the log output of the most recent failed CI run, if any.
+
+    Returns a truncated (≤2000 char) summary of the failure, or an empty
+    string when no recent run failed or logs are unavailable.
+    """
+    import json as _json
+
+    # Use --json for reliable parsing of run status.
+    rc, out, _ = await _run(
+        [
+            "gh", "run", "list",
+            "--limit", "5",
+            "--json", "databaseId,status,conclusion,name",
+        ],
+        cwd,
+        timeout=15,
+    )
+    if rc != 0:
+        return ""
+
+    try:
+        runs = _json.loads(out)
+    except (ValueError, TypeError):
+        return ""
+
+    # Find the most recent failed run (status == "completed", conclusion == "failure").
+    failed_run = next(
+        (
+            r for r in runs
+            if r.get("status") == "completed"
+            and r.get("conclusion") in {"failure", "cancelled", "timed_out"}
+        ),
+        None,
+    )
+    if not failed_run:
+        return ""
+
+    run_id = failed_run.get("databaseId")
+    if not run_id:
+        return ""
+
+    # Fetch the failed-step logs (truncated to keep the response bounded).
+    rc, out, err = await _run(
+        ["gh", "run", "view", str(run_id), "--log-failed"],
+        cwd,
+        timeout=20,
+    )
+    if rc != 0 or not out.strip():
+        return ""
+
+    # Trim to 2000 chars, keeping the tail (where the actual errors usually are).
+    log_text = out.strip()
+    if len(log_text) > 2000:
+        log_text = "…(truncated)…\n" + log_text[-2000:]
+    return log_text
