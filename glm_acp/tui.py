@@ -4109,6 +4109,8 @@ class NativeGlmTui(App[int]):
                 "Mobile companion is loopback-only. For phone scan-to-approve, restart with "
                 "--mobile-bind 0.0.0.0:8765 --mobile-allow-public."
             )
+        for widget in self.query("#mobile-status"):
+            await widget.remove()
         await self.query_one("#transcript", VerticalScroll).mount(
             Static(message, id="mobile-status", classes="system-message", markup=False)
         )

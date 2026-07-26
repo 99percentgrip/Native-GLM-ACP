@@ -2987,6 +2987,23 @@ async def test_tui_mobile_renders_pairing_qr_and_routes_active_permission(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_tui_mobile_replaces_stale_status_without_duplicate_widget_id(tmp_path, monkeypatch):
+    monkeypatch.setattr("glm_acp.mobile_server._lan_address", lambda: "192.0.2.42")
+    app = NativeGlmTui(
+        _args(tmp_path, "--mobile-bind", "0.0.0.0:0", "--mobile-allow-public"),
+        agent_factory=FakeAgent,
+    )
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app.query_one("#transcript", VerticalScroll).mount(
+            Static("stale", id="mobile-status")
+        )
+        await app.action_mobile()
+        assert "Scan once to pair" in str(app.query_one("#mobile-status", Static).render())
+        app.exit(0)
+
+
+@pytest.mark.asyncio
 async def test_tui_mobile_stops_on_exit(tmp_path):
     app = NativeGlmTui(_args(tmp_path, "--mobile-bind", "127.0.0.1:0"), agent_factory=FakeAgent)
     async with app.run_test(size=(120, 40)) as pilot:
