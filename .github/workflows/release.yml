@@ -64,22 +64,23 @@ jobs:
           if [ "${{ matrix.target }}" != "darwin-x86_64" ]; then
             VOICE_FLAGS="--collect-all faster_whisper --collect-all ctranslate2 --collect-all onnxruntime --collect-all av --collect-all tokenizers"
           fi
-          uv run --frozen pyinstaller --noconfirm --clean --onefile --name native-glm-acp --collect-all acp $VOICE_FLAGS glm_acp/launcher.py
+          uv run --frozen pyinstaller --noconfirm --clean --onedir --name native-glm-acp --collect-all acp $VOICE_FLAGS glm_acp/launcher.py
       - name: Verify frozen executable
         shell: bash
         run: |
-          test "$("dist/${{ matrix.binary }}" --version)" = "${GITHUB_REF_NAME#v}"
-          "dist/${{ matrix.binary }}" chat --help | grep -q -- "--plain"
-      - name: Enforce frozen executable size ceiling
-        run: python -c "from pathlib import Path; size=Path('dist/${{ matrix.binary }}').stat().st_size; print(f'{size} bytes'); assert size < 200 * 1024 * 1024"
+          test "$("dist/native-glm-acp/${{ matrix.binary }}" --version)" = "${GITHUB_REF_NAME#v}"
+          "dist/native-glm-acp/${{ matrix.binary }}" chat --help | grep -q -- "--plain"
       - name: Package Unix executable
         if: matrix.archive == 'tar.gz'
         shell: bash
-        run: tar -C dist -czf native-glm-acp-${{ matrix.target }}.tar.gz ${{ matrix.binary }}
+        run: tar -C dist -czf native-glm-acp-${{ matrix.target }}.tar.gz native-glm-acp
       - name: Package Windows executable
         if: matrix.archive == 'zip'
         shell: pwsh
-        run: Compress-Archive -Path dist/${{ matrix.binary }} -DestinationPath native-glm-acp-${{ matrix.target }}.zip
+        run: Compress-Archive -Path dist/native-glm-acp -DestinationPath native-glm-acp-${{ matrix.target }}.zip
+      - name: Enforce compressed frozen archive size ceiling
+        shell: bash
+        run: python -c "from pathlib import Path; asset=Path('native-glm-acp-${{ matrix.target }}.${{ matrix.archive }}'); size=asset.stat().st_size; print(f'{size} bytes'); assert size < 200 * 1024 * 1024"
       - name: Write SHA-256 checksum
         shell: bash
         run: |
@@ -134,11 +135,11 @@ jobs:
             authors: ["Aleksejs Kozlitins"],
             license: "Apache-2.0",
             distribution: {binary: {
-              "darwin-x86_64": {archive: ($base + "/native-glm-acp-darwin-x86_64.tar.gz"), cmd: "./native-glm-acp"},
-              "darwin-aarch64": {archive: ($base + "/native-glm-acp-darwin-aarch64.tar.gz"), cmd: "./native-glm-acp"},
-              "linux-x86_64": {archive: ($base + "/native-glm-acp-linux-x86_64.tar.gz"), cmd: "./native-glm-acp"},
-              "linux-aarch64": {archive: ($base + "/native-glm-acp-linux-aarch64.tar.gz"), cmd: "./native-glm-acp"},
-              "windows-x86_64": {archive: ($base + "/native-glm-acp-windows-x86_64.zip"), cmd: "./native-glm-acp.exe"}
+              "darwin-x86_64": {archive: ($base + "/native-glm-acp-darwin-x86_64.tar.gz"), cmd: "./native-glm-acp/native-glm-acp"},
+              "darwin-aarch64": {archive: ($base + "/native-glm-acp-darwin-aarch64.tar.gz"), cmd: "./native-glm-acp/native-glm-acp"},
+              "linux-x86_64": {archive: ($base + "/native-glm-acp-linux-x86_64.tar.gz"), cmd: "./native-glm-acp/native-glm-acp"},
+              "linux-aarch64": {archive: ($base + "/native-glm-acp-linux-aarch64.tar.gz"), cmd: "./native-glm-acp/native-glm-acp"},
+              "windows-x86_64": {archive: ($base + "/native-glm-acp-windows-x86_64.zip"), cmd: "./native-glm-acp/native-glm-acp.exe"}
             }}
           }' > agent.json
           cp registry/icon.svg icon.svg

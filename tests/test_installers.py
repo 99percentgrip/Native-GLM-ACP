@@ -18,7 +18,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def _fake_unix_release(tmp_path: Path, checksum: str | None = None) -> Path:
     download = tmp_path / "releases" / "latest" / "download"
     download.mkdir(parents=True)
-    executable = tmp_path / "native-glm-acp"
+    bundle = tmp_path / "native-glm-acp"
+    bundle.mkdir()
+    executable = bundle / "native-glm-acp"
     executable.write_text("#!/bin/sh\nprintf '1.6.1\\n'\n", encoding="utf-8")
     executable.chmod(0o755)
     system = platform.system().lower()
@@ -26,7 +28,7 @@ def _fake_unix_release(tmp_path: Path, checksum: str | None = None) -> Path:
     architecture = "aarch64" if machine in {"arm64", "aarch64"} else "x86_64"
     asset = download / f"native-glm-acp-{system}-{architecture}.tar.gz"
     with tarfile.open(asset, "w:gz") as archive:
-        archive.add(executable, arcname="native-glm-acp")
+        archive.add(bundle, arcname="native-glm-acp")
     digest = checksum or hashlib.sha256(asset.read_bytes()).hexdigest()
     asset.with_suffix(asset.suffix + ".sha256").write_text(
         f"{digest}  {asset.name}\n", encoding="utf-8"
@@ -38,11 +40,13 @@ def _fake_unix_release(tmp_path: Path, checksum: str | None = None) -> Path:
 def test_unix_installer_verifies_and_installs_both_commands(tmp_path):
     _fake_unix_release(tmp_path)
     install_dir = tmp_path / "bin"
+    bundle_dir = tmp_path / "bundle"
     env = os.environ.copy()
     env.update(
         {
             "GLM_ACP_RELEASE_BASE_URL": (tmp_path / "releases").as_uri(),
             "GLM_ACP_INSTALL_DIR": str(install_dir),
+            "GLM_ACP_BUNDLE_DIR": str(bundle_dir),
             "PATH": f"{install_dir}:{env['PATH']}",
         }
     )
@@ -60,6 +64,7 @@ def test_unix_installer_verifies_and_installs_both_commands(tmp_path):
     assert (install_dir / "native-glm-acp").stat().st_mode & 0o111
     assert (install_dir / "glm-acp").is_symlink()
     assert os.readlink(install_dir / "glm-acp") == "native-glm-acp"
+    assert (bundle_dir / "native-glm-acp").exists()
     assert subprocess.check_output([install_dir / "glm-acp", "--version"], text=True).strip() == (
         "1.6.1"
     )
@@ -74,12 +79,14 @@ def test_unix_installer_verifies_and_installs_both_commands(tmp_path):
 def test_unix_installer_persists_user_path_once(tmp_path):
     _fake_unix_release(tmp_path)
     install_dir = tmp_path / "bin"
+    bundle_dir = tmp_path / "bundle"
     profile = tmp_path / ".profile"
     env = os.environ.copy()
     env.update(
         {
             "GLM_ACP_RELEASE_BASE_URL": (tmp_path / "releases").as_uri(),
             "GLM_ACP_INSTALL_DIR": str(install_dir),
+            "GLM_ACP_BUNDLE_DIR": str(bundle_dir),
             "GLM_ACP_SHELL_PROFILE": str(profile),
         }
     )
@@ -103,11 +110,13 @@ def test_unix_installer_persists_user_path_once(tmp_path):
 def test_unix_installer_rejects_bad_checksum(tmp_path):
     _fake_unix_release(tmp_path, checksum="0" * 64)
     install_dir = tmp_path / "bin"
+    bundle_dir = tmp_path / "bundle"
     env = os.environ.copy()
     env.update(
         {
             "GLM_ACP_RELEASE_BASE_URL": (tmp_path / "releases").as_uri(),
             "GLM_ACP_INSTALL_DIR": str(install_dir),
+            "GLM_ACP_BUNDLE_DIR": str(bundle_dir),
         }
     )
 
@@ -132,8 +141,8 @@ def test_installer_release_contract():
     assert "sha256sum -c" in unix
     assert "ln -sf native-glm-acp" in unix
     assert "Get-FileHash -Algorithm SHA256" in windows
-    assert '"native-glm-acp.exe"' in windows
-    assert '"glm-acp.exe"' in windows
+    assert "native-glm-acp.bundle" in windows
+    assert "native-glm-acp.cmd" in windows
     assert "type / for the live menu" in unix
     assert "type / for the live menu" in windows
     assert "Ctrl-X to exit" in unix
@@ -141,6 +150,8 @@ def test_installer_release_contract():
     assert "scripts/install.sh" in workflow
     assert "scripts/install.ps1" in workflow
     assert 'chat --help | grep -q -- "--plain"' in workflow
+    assert "Enforce compressed frozen archive size ceiling" in workflow
+    assert 'cmd: "./native-glm-acp/native-glm-acp"' in workflow
 
 
 def test_unix_installer_has_valid_shell_syntax():

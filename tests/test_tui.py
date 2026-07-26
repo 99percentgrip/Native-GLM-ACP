@@ -37,6 +37,7 @@ from glm_acp.tui import (
     JourneyScreen,
     NativeGlmTui,
     PermissionScreen,
+    PluginsScreen,
     SearchScreen,
     SettingsScreen,
     _extract_message_text,
@@ -883,7 +884,12 @@ async def test_slash_model_menu_navigates_and_changes_shared_session(tmp_path):
         menu = app.query_one("#command-menu", OptionList)
 
         composer.value = "/model"
-        await pilot.pause()
+        # Textual delivers Input.Changed on the next message-loop turn; a
+        # single pause is occasionally too short on the Windows CI worker.
+        for _ in range(10):
+            await pilot.pause(0.05)
+            if app._command_values == ["/model"]:
+                break
         assert app._command_values == ["/model"]
         await pilot.press("enter")
         await pilot.pause()
@@ -1621,6 +1627,28 @@ async def test_tui_keybinds_unknown_action_is_rejected_with_warning(tmp_path, mo
         transcript = app.query_one("#transcript", VerticalScroll)
         rendered = "\n".join(str(child.render()) for child in transcript.children)
         assert "Ignored unknown keybinding action(s): not_a_tui_action" in rendered
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_plugins_modal_disables_registered_command(tmp_path):
+    """The plugin manager removes a declarative command from the live dispatcher."""
+    from glm_acp.plugin_runtime import PluginManifest
+
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    plugin = PluginManifest("demo", "1", ["/demo Run demo"], [], [])
+    app._plugin_runtime.loaded["demo"] = plugin
+    app._plugin_runtime.register_commands(plugin, app)
+
+    async def fake_push(screen):
+        assert isinstance(screen, PluginsScreen)
+        return ("disable", "demo")
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen_wait = fake_push  # type: ignore[method-assign]
+        assert await app._handle_local_command("/plugins") is True
+        assert "/demo" not in app._slash_commands
         app.exit(0)
 
 

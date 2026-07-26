@@ -15,7 +15,13 @@ from typing import NamedTuple
 from .config import config_dir, credentials_path
 
 COMMAND_NAMES = ("glm-acp", "native-glm-acp")
-WINDOWS_COMMAND_NAMES = ("glm-acp.exe", "native-glm-acp.exe")
+WINDOWS_COMMAND_NAMES = (
+    "glm-acp.cmd",
+    "native-glm-acp.cmd",
+    # Keep recognizing release bundles from before the onedir layout.
+    "glm-acp.exe",
+    "native-glm-acp.exe",
+)
 PROFILE_MARKER = "# Native GLM ACP"
 
 
@@ -54,6 +60,17 @@ def _default_install_dir(platform_name: str) -> Path:
             return Path(local_app_data) / "Programs" / "NativeGLMAcp"
         return Path.home() / "AppData" / "Local" / "Programs" / "NativeGLMAcp"
     return Path(os.environ.get("XDG_BIN_HOME", Path.home() / ".local" / "bin"))
+
+
+def _default_bundle_dir(install_dir: Path, platform_name: str) -> Path:
+    """Return the exact installer-owned directory containing an onedir binary."""
+    if platform_name == "windows":
+        return install_dir / "native-glm-acp.bundle"
+    override = os.environ.get("GLM_ACP_BUNDLE_DIR")
+    if override:
+        return Path(override).expanduser()
+    data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return data_home / "native-glm-acp"
 
 
 def _tokenize_jsonc(text: str) -> list[_Token]:
@@ -297,13 +314,16 @@ def _remove_windows_user_path(install_dir: Path) -> bool:
         return True
 
 
-def _schedule_windows_removal(commands: tuple[Path, ...]) -> None:
+def _schedule_windows_removal(commands: tuple[Path, ...], bundle: Path | None = None) -> None:
     descriptor, script_name = tempfile.mkstemp(prefix="glm-acp-uninstall-", suffix=".cmd")
     script = Path(script_name)
     lines = ["@echo off", "set tries=0", ":retry"]
     for command in commands:
         lines.append(f'del /f /q "{command}" >nul 2>&1')
-    missing = " ".join(f'if not exist "{command}"' for command in commands)
+    if bundle is not None:
+        lines.append(f'rmdir /s /q "{bundle}" >nul 2>&1')
+    removal_targets = (*commands, *((bundle,) if bundle is not None else ()))
+    missing = " ".join(f'if not exist "{target}"' for target in removal_targets)
     lines.extend(
         [
             f"{missing} goto done",
@@ -347,10 +367,12 @@ def uninstall_release(
         )
     executable = (executable or Path(sys.executable)).resolve()
     expected_dir = (install_dir or _default_install_dir(platform_name)).expanduser().resolve()
-    if executable.parent != expected_dir or executable.name not in {
-        *COMMAND_NAMES,
-        *WINDOWS_COMMAND_NAMES,
-    }:
+    bundle_dir = _default_bundle_dir(expected_dir, platform_name).resolve()
+    binary_name = "native-glm-acp.exe" if platform_name == "windows" else "native-glm-acp"
+    legacy_binary_names = {*COMMAND_NAMES, *WINDOWS_COMMAND_NAMES}
+    is_legacy_binary = executable.parent == expected_dir and executable.name in legacy_binary_names
+    is_bundle_binary = executable == bundle_dir / binary_name
+    if not (is_legacy_binary or is_bundle_binary):
         raise UninstallError(
             "This executable is not a public installer-owned copy. "
             "Registry agents must be removed from Zed."
@@ -365,7 +387,7 @@ def uninstall_release(
     if platform_name == "windows":
         try:
             profile_updated = _remove_windows_user_path(expected_dir)
-            _schedule_windows_removal(commands)
+            _schedule_windows_removal(commands, bundle_dir if is_bundle_binary else None)
         except OSError as error:
             raise UninstallError(f"Could not schedule command removal: {error}") from error
         scheduled = True
@@ -374,6 +396,8 @@ def uninstall_release(
             profile_updated = _remove_unix_profile_path(home, expected_dir)
             for command in commands:
                 command.unlink(missing_ok=True)
+            if is_bundle_binary:
+                shutil.rmtree(bundle_dir)
         except OSError as error:
             raise UninstallError(f"Could not remove installed commands: {error}") from error
         scheduled = False

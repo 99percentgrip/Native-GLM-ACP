@@ -5,6 +5,7 @@ repository="99percentgrip/Native-GLM-ACP"
 release_base="${GLM_ACP_RELEASE_BASE_URL:-https://github.com/$repository/releases}"
 version="${GLM_ACP_VERSION:-latest}"
 install_dir="${GLM_ACP_INSTALL_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
+bundle_dir="${GLM_ACP_BUNDLE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/native-glm-acp}"
 
 fail() {
     printf 'glm-acp installer: %s\n' "$1" >&2
@@ -55,10 +56,14 @@ else
 fi
 
 tar -xzf "$temporary/$asset" -C "$temporary"
-[ -f "$temporary/native-glm-acp" ] || fail "archive did not contain native-glm-acp"
+[ -f "$temporary/native-glm-acp/native-glm-acp" ] || fail "archive did not contain native-glm-acp bundle"
 
 mkdir -p "$install_dir"
-install -m 0755 "$temporary/native-glm-acp" "$install_dir/native-glm-acp"
+mkdir -p "$(dirname "$bundle_dir")"
+rm -rf "$bundle_dir"
+mv "$temporary/native-glm-acp" "$bundle_dir"
+printf '#!/bin/sh\nexec "%s/native-glm-acp" "$@"\n' "$bundle_dir" > "$install_dir/native-glm-acp"
+chmod 0755 "$install_dir/native-glm-acp"
 ln -sf native-glm-acp "$install_dir/glm-acp"
 
 installed_version="$($install_dir/native-glm-acp --version)"

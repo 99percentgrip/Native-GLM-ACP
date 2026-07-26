@@ -28,7 +28,8 @@ def test_registry_manifest_matches_release_contract():
     for target, distribution in binaries.items():
         assert f"/v{__version__}/" in distribution["archive"]
         assert target in distribution["archive"]
-        assert distribution["cmd"].startswith("./native-glm-acp")
+        suffix = ".exe" if target == "windows-x86_64" else ""
+        assert distribution["cmd"] == f"./native-glm-acp/native-glm-acp{suffix}"
 
 
 def test_registry_icon_is_small_monochrome_svg():

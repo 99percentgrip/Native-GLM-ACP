@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -47,6 +48,7 @@ def test_command_registration(tmp_path):
     app = SimpleNamespace(_slash_commands={})
     runtime.register_commands(plugin, app)
     assert "/demo" in app._slash_commands
+    assert runtime.owner_for("/demo") == "demo"
 
 
 def test_unload_removes_commands(tmp_path):
@@ -71,3 +73,36 @@ def test_hot_reload_reregisters(tmp_path):
     root = manifest(tmp_path).parent
     runtime.hot_reload(root, app)
     assert "/demo" in app._slash_commands
+
+
+def test_watch_reloads_manifest_changes_when_watchdog_is_available(monkeypatch, tmp_path):
+    class Handler:
+        pass
+
+    class Observer:
+        def schedule(self, handler, _path, recursive=False):
+            self.handler = handler
+            self.recursive = recursive
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            self.stopped = True
+
+    events = SimpleNamespace(FileSystemEventHandler=Handler)
+    observers = SimpleNamespace(Observer=Observer)
+    monkeypatch.setitem(sys.modules, "watchdog", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "watchdog.events", events)
+    monkeypatch.setitem(sys.modules, "watchdog.observers", observers)
+    runtime = PluginRuntime(Registry())
+    app = SimpleNamespace(_slash_commands={})
+    root = manifest(tmp_path).parent
+
+    observer = runtime.watch(root, app)
+    assert observer is not None and observer.started is True
+    observer.handler.on_modified(SimpleNamespace(is_directory=False, src_path=root / "plugin.json"))
+
+    assert "/demo" in app._slash_commands
+    runtime.shutdown()
+    assert observer.stopped is True

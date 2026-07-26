@@ -79,6 +79,7 @@ from .glm_client import PlanUsage
 from .memory import list_learned_skills, read_memory, read_user_profile
 from .mobile_server import MobileServer, MobileServerError
 from .plugin_runtime import PluginRuntime
+from .plugins import PluginError
 from .terminal_image import detect_graphics_protocol, path_link, render_inline
 from .worktree_session import WorktreeSessionError, create_worktree_session
 
@@ -1986,6 +1987,63 @@ class NewWorktreeSessionScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class PluginsScreen(ModalScreen[tuple[str, str] | None]):
+    """Small management surface for already verified declarative plugins."""
+
+    BINDINGS = [Binding("escape", "cancel", "Close", priority=True)]
+    CSS = """
+    PluginsScreen { align: center middle; background: $background 70%; }
+    #plugins-dialog {
+        width: 76; max-width: 94%; height: auto; max-height: 86%;
+        border: thick $accent; background: $surface; padding: 1 2;
+    }
+    .plugin-row { height: auto; margin: 1 0; }
+    .plugin-description { width: 1fr; }
+    .plugin-row Button { margin-left: 1; }
+    #plugins-actions { height: auto; align-horizontal: right; margin-top: 1; }
+    """
+
+    def __init__(self, plugins: dict[str, Any]) -> None:
+        super().__init__()
+        self._plugins = plugins
+        self._plugin_names = sorted(plugins)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="plugins-dialog"):
+            yield Label("Verified plugins", markup=False)
+            if not self._plugin_names:
+                yield Static("No verified declarative plugins are loaded.", markup=False)
+            for index, name in enumerate(self._plugin_names):
+                plugin = self._plugins[name]
+                commands = ", ".join(plugin.commands) or "no slash commands"
+                with Horizontal(classes="plugin-row"):
+                    yield Static(
+                        f"{name} v{plugin.version} — {commands}",
+                        classes="plugin-description",
+                        markup=False,
+                    )
+                    yield Button("Reload", id=f"plugin-reload-{index}")
+                    yield Button("Disable", id=f"plugin-disable-{index}", variant="warning")
+            with Horizontal(id="plugins-actions"):
+                yield Button("Close", id="plugins-close", variant="primary")
+
+    @on(Button.Pressed)
+    def press_button(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == "plugins-close":
+            self.dismiss(None)
+            return
+        for action in ("reload", "disable"):
+            prefix = f"plugin-{action}-"
+            if button_id.startswith(prefix):
+                index = int(button_id.removeprefix(prefix))
+                self.dismiss((action, self._plugin_names[index]))
+                return
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class NativeGlmTui(App[int]):
     """Full-screen coding-agent interface backed by one ``GlmAcpAgent``."""
 
@@ -2624,6 +2682,12 @@ class NativeGlmTui(App[int]):
                 self.refresh_command_menu(composer.value)
                 return True
             await self._apply_inline_config(command, argument.strip())
+            return True
+        if owner := self._plugin_runtime.owner_for(command):
+            await self._append_system(
+                f"Plugin command {command} is registered by {owner}. "
+                "Verified plugins are declarative, so they cannot execute local code."
+            )
             return True
         return False
 
@@ -3349,6 +3413,7 @@ class NativeGlmTui(App[int]):
         if self._mobile_server is not None:
             self._mobile_server.stop()
             self._mobile_server = None
+        self._plugin_runtime.shutdown()
         self.exit(0)
 
     async def _close_agent_resources(self) -> None:
@@ -4054,7 +4119,7 @@ class NativeGlmTui(App[int]):
         self.notify(f"Mobile companion running at {server.url}", severity="success")
 
     async def action_open_plugins(self) -> None:
-        """Load verified declarative plugins and expose their commands."""
+        """Load verified plugins, then expose per-plugin reload/disable actions."""
         entries = self._plugin_runtime.registry.list()
         loaded: list[str] = []
         for entry in entries:
@@ -4066,13 +4131,31 @@ class NativeGlmTui(App[int]):
                     self._plugin_runtime.registry.base_dir / name / "plugin.json"
                 )
                 self._plugin_runtime.register_commands(manifest, self)
+                self._plugin_runtime.watch(
+                    self._plugin_runtime.registry.base_dir / name,
+                    self,
+                )
                 loaded.append(name)
             except Exception as error:  # noqa: BLE001 - plugin boundaries fail closed
                 await self._append_system(f"Plugin {name} disabled: {error}")
-        await self._append_system(
-            "Plugins: "
-            + (", ".join(loaded) if loaded else "no verified declarative plugins installed")
-        )
+        if not loaded and not self._plugin_runtime.loaded:
+            await self._append_system("Plugins: no verified declarative plugins installed")
+        result = await self.push_screen_wait(PluginsScreen(self._plugin_runtime.loaded))
+        if not result:
+            return
+        action, name = result
+        plugin_dir = self._plugin_runtime.registry.base_dir / name
+        try:
+            if action == "reload":
+                self._plugin_runtime.hot_reload(plugin_dir, self)
+                self._plugin_runtime.watch(plugin_dir, self)
+                await self._append_system(f"Plugin {name} reloaded.")
+            elif action == "disable":
+                self._plugin_runtime.unload(name, self)
+                self._plugin_runtime.stop_watch(name)
+                await self._append_system(f"Plugin {name} disabled.")
+        except PluginError as error:
+            await self._append_system(f"Plugin {name} disabled: {error}")
 
     async def action_annotate(self) -> None:
         """Open the line-anchored diff annotator and prefill its follow-up."""
@@ -4874,6 +4957,7 @@ class NativeGlmTui(App[int]):
 
     async def on_unmount(self) -> None:
         self._shutdown_requested = True
+        self._plugin_runtime.shutdown()
         await self._close_agent_resources()
 
 

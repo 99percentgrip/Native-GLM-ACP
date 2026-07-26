@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from glm_acp.config import CONFIG_DIR_ENV, credentials_path, store_api_key
 from glm_acp.uninstall import (
     UninstallError,
     _default_zed_settings,
+    _schedule_windows_removal,
     _without_windows_path,
     remove_zed_custom_agent,
     uninstall_release,
@@ -80,6 +82,29 @@ def test_uninstall_removes_public_commands_path_and_custom_zed_entry(tmp_path):
     assert '"codex-acp"' in updated_settings
     assert result.zed_backup is not None
     assert result.zed_backup.read_text(encoding="utf-8") == original_settings
+
+
+def test_uninstall_removes_installer_owned_onedir_bundle(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    install_dir, _ = _public_install(home)
+    bundle = home / ".local" / "share" / "native-glm-acp"
+    bundle.mkdir(parents=True)
+    native = bundle / "native-glm-acp"
+    native.write_text("binary", encoding="utf-8")
+    monkeypatch.setenv("GLM_ACP_BUNDLE_DIR", str(bundle))
+
+    uninstall_release(
+        executable=native,
+        install_dir=install_dir,
+        frozen=True,
+        platform_name="unix",
+        home=home,
+        zed_settings=tmp_path / "missing-settings.json",
+    )
+
+    assert not bundle.exists()
+    assert not (install_dir / "native-glm-acp").exists()
+    assert not (install_dir / "glm-acp").exists()
 
 
 def test_uninstall_honors_installer_shell_profile_override(monkeypatch, tmp_path):
@@ -186,6 +211,23 @@ def test_windows_path_removal_preserves_other_entries(tmp_path):
     install_dir = tmp_path / "NativeGLMAcp"
     value = f"C:\\Windows;{install_dir};C:\\Tools"
     assert _without_windows_path(value, install_dir) == "C:\\Windows;C:\\Tools"
+
+
+def test_windows_deferred_removal_waits_for_onedir_bundle(monkeypatch, tmp_path):
+    """A running Windows binary keeps its bundle locked after launchers vanish."""
+    import glm_acp.uninstall as uninstall
+
+    script = tmp_path / "remove.cmd"
+    monkeypatch.setattr(
+        uninstall.tempfile,
+        "mkstemp",
+        lambda **_kwargs: (os.open(script, os.O_WRONLY | os.O_CREAT | os.O_TRUNC), str(script)),
+    )
+    monkeypatch.setattr(uninstall.subprocess, "Popen", lambda *_args, **_kwargs: None)
+    bundle = tmp_path / "native-glm-acp.bundle"
+    _schedule_windows_removal((tmp_path / "native-glm-acp.cmd",), bundle)
+
+    assert f'if not exist "{bundle}"' in script.read_text(encoding="utf-8")
 
 
 def test_zed_settings_honors_xdg_config_home(monkeypatch, tmp_path):

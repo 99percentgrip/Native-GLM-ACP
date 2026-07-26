@@ -37,14 +37,20 @@ try {
     }
 
     Expand-Archive -Path $archive -DestinationPath $temporary -Force
-    $source = Join-Path $temporary "native-glm-acp.exe"
+    $source = Join-Path $temporary "native-glm-acp"
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-        throw "glm-acp installer: archive did not contain native-glm-acp.exe"
+        if (-not (Test-Path -LiteralPath $source -PathType Container)) {
+            throw "glm-acp installer: archive did not contain native-glm-acp bundle"
+        }
     }
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    Copy-Item -LiteralPath $source -Destination (Join-Path $InstallDir "native-glm-acp.exe") -Force
-    Copy-Item -LiteralPath $source -Destination (Join-Path $InstallDir "glm-acp.exe") -Force
+    $bundle = Join-Path $InstallDir "native-glm-acp.bundle"
+    Remove-Item -LiteralPath $bundle -Recurse -Force -ErrorAction SilentlyContinue
+    Move-Item -LiteralPath $source -Destination $bundle
+    $launcher = Join-Path $InstallDir "native-glm-acp.cmd"
+    Set-Content -LiteralPath $launcher -Value "@echo off`r`n\"%~dp0native-glm-acp.bundle\native-glm-acp.exe\" %*" -NoNewline
+    Copy-Item -LiteralPath $launcher -Destination (Join-Path $InstallDir "glm-acp.cmd") -Force
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $pathEntries = @($userPath -split ";" | Where-Object { $_ })
@@ -56,10 +62,10 @@ try {
         $env:Path = "$InstallDir;$env:Path"
     }
 
-    $installedVersion = & (Join-Path $InstallDir "native-glm-acp.exe") --version
+    $installedVersion = & $launcher --version
     Write-Host "Installed Native GLM ACP ${installedVersion}:"
-    Write-Host "  $(Join-Path $InstallDir 'native-glm-acp.exe')"
-    Write-Host "  $(Join-Path $InstallDir 'glm-acp.exe')"
+    Write-Host "  $launcher"
+    Write-Host "  $(Join-Path $InstallDir 'glm-acp.cmd')"
     Write-Host ""
     Write-Host "Open a new terminal, then run: glm-acp --setup"
     Write-Host "Then start the full-screen agent: glm-acp chat"
