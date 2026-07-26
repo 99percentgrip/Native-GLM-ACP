@@ -4124,15 +4124,18 @@ class NativeGlmTui(App[int]):
 
         for widget in self.query("#mobile-qr"):
             await widget.remove()
-        code = qrcode.QRCode(border=1)
+        # Phone cameras need a high-contrast quiet zone; terminal theme colors
+        # and a one-module border are not sufficiently reliable for scanning.
+        code = qrcode.QRCode(border=4)
         code.add_data(approval_url)
         code.make(fit=True)
-        rendered = "\n".join(
-            "".join("██" if bit else "  " for bit in row) for row in code.get_matrix()
-        )
+        rendered = Text("Scan to pair your phone for approvals:\n")
+        for row in code.get_matrix():
+            rendered.append("".join("  " if bit else "██" for bit in row), style="black on white")
+            rendered.append("\n")
         await self.query_one("#transcript", VerticalScroll).mount(
             Static(
-                f"Scan to pair your phone for approvals:\n{rendered}",
+                rendered,
                 id="mobile-qr",
                 classes="system-message",
                 markup=False,
