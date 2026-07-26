@@ -78,6 +78,7 @@ from .config import (
 from .glm_client import PlanUsage
 from .memory import list_learned_skills, read_memory, read_user_profile
 from .mobile_server import MobileServer, MobileServerError
+from .plugin_runtime import PluginRuntime
 from .terminal_image import detect_graphics_protocol, path_link, render_inline
 from .worktree_session import WorktreeSessionError, create_worktree_session
 
@@ -2234,6 +2235,7 @@ class NativeGlmTui(App[int]):
         # The shared agent remains the source of truth for actual sessions.
         self._worktree_sessions: dict[str, dict[str, str]] = {}
         self._mobile_server: MobileServer | None = None
+        self._plugin_runtime = PluginRuntime()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -2523,6 +2525,9 @@ class NativeGlmTui(App[int]):
             return True
         if text == "/mobile":
             await self.action_mobile()
+            return True
+        if text == "/plugins":
+            await self.action_open_plugins()
             return True
         if text == "/context":
             await self.action_open_context()
@@ -4039,8 +4044,7 @@ class NativeGlmTui(App[int]):
             code.add_data(server.url)
             code.make(fit=True)
             qr += "\n" + "\n".join(
-                "".join("██" if bit else "  " for bit in row)
-                for row in code.get_matrix()
+                "".join("██" if bit else "  " for bit in row) for row in code.get_matrix()
             )
         except ImportError:
             qr += "\nInstall qrcode for a terminal QR code."
@@ -4048,6 +4052,27 @@ class NativeGlmTui(App[int]):
             Static(qr, id="mobile-qr", classes="system-message", markup=False)
         )
         self.notify(f"Mobile companion running at {server.url}", severity="success")
+
+    async def action_open_plugins(self) -> None:
+        """Load verified declarative plugins and expose their commands."""
+        entries = self._plugin_runtime.registry.list()
+        loaded: list[str] = []
+        for entry in entries:
+            if not entry.get("verified"):
+                continue
+            name = str(entry["id"])
+            try:
+                manifest = self._plugin_runtime.load(
+                    self._plugin_runtime.registry.base_dir / name / "plugin.json"
+                )
+                self._plugin_runtime.register_commands(manifest, self)
+                loaded.append(name)
+            except Exception as error:  # noqa: BLE001 - plugin boundaries fail closed
+                await self._append_system(f"Plugin {name} disabled: {error}")
+        await self._append_system(
+            "Plugins: "
+            + (", ".join(loaded) if loaded else "no verified declarative plugins installed")
+        )
 
     async def action_annotate(self) -> None:
         """Open the line-anchored diff annotator and prefill its follow-up."""
