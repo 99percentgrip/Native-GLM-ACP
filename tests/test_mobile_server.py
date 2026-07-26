@@ -6,7 +6,7 @@ import urllib.request
 
 import pytest
 
-from glm_acp.mobile_server import MobileServer, MobileServerError
+from glm_acp.mobile_server import MobileServer, MobileServerError, _lan_address
 
 
 def _request(server: MobileServer, path: str, data: bytes | None = None):
@@ -25,6 +25,28 @@ def test_mobile_server_defaults_to_loopback():
 def test_mobile_server_refuses_public_bind_without_acknowledgement():
     with pytest.raises(MobileServerError, match="Refusing"):
         MobileServer("0.0.0.0:8765")
+
+
+def test_lan_address_prefers_active_route_over_stale_hostname(monkeypatch):
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def connect(self, _address):
+            return None
+
+        def getsockname(self):
+            return ("192.168.254.125", 12345)
+
+    monkeypatch.setattr("glm_acp.mobile_server.socket.socket", lambda *_args: Probe())
+    monkeypatch.setattr(
+        "glm_acp.mobile_server.socket.getaddrinfo",
+        lambda *_args: [(None, None, None, None, ("192.168.254.103", 0))],
+    )
+    assert _lan_address() == "192.168.254.125"
 
 
 def test_mobile_server_public_bind_advertises_lan_address(monkeypatch):

@@ -27,6 +27,17 @@ class MobileServerError(RuntimeError):
 def _lan_address() -> str | None:
     """Best-effort local IPv4 address selection without mDNS/discovery traffic."""
     try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            # Connecting a UDP socket only asks the OS for its current preferred
+            # route. Prefer it over hostname resolution, which may retain a stale
+            # DHCP address and produce an unreachable QR URL.
+            probe.connect(("192.0.2.1", 9))
+            address = probe.getsockname()[0]
+    except OSError:
+        address = ""
+    if address and not address.startswith("127."):
+        return address
+    try:
         candidates = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
     except OSError:
         candidates = []
@@ -34,14 +45,7 @@ def _lan_address() -> str | None:
         address = candidate[4][0]
         if not address.startswith("127."):
             return address
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            # Connecting a UDP socket only asks the OS for its preferred route.
-            probe.connect(("192.0.2.1", 9))
-            address = probe.getsockname()[0]
-    except OSError:
-        return None
-    return address if not address.startswith("127.") else None
+    return None
 
 
 class MobileServer:
