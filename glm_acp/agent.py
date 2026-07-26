@@ -5419,6 +5419,36 @@ class GlmAcpAgent(acp.Agent):
                 + "\n```"
             )
 
+        elif command == "/rename" or command.startswith("/rename "):
+            name = command.partition(" ")[2].strip()
+            if not name:
+                return f"Current session title: {session.title or '(untitled)'}"
+            session.title = name[:80]
+            await self._save_session(session)
+            return f"🏷️ Session renamed to: {name[:80]}"
+
+        elif command == "/branch" or command.startswith("/branch "):
+            name = command.partition(" ")[2].strip()
+            try:
+                response = await self.fork_session(
+                    cwd=session.cwd,
+                    session_id=session.id,
+                )
+                new_id = response.session_id
+                if name:
+                    new_session = self._sessions.get(new_id)
+                    if new_session:
+                        new_session.title = name[:80]
+                        await self._save_session(new_session)
+                short_id = new_id[:8] + "…"
+                return (
+                    f"🌿 Branched session to {short_id}"
+                    + (f" ({name})" if name else "")
+                    + ".\nUse F6 (History) to resume it later."
+                )
+            except Exception as e:
+                return f"❌ Branch failed: {e}"
+
         elif command == "/goal" or command.startswith("/goal "):
             argument = command.partition(" ")[2].strip()
             if not argument:

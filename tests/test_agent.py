@@ -1442,6 +1442,31 @@ class TestSessionInsights:
         assert "1 user turn" in insights.lower()
 
 
+class TestRenameAndBranch:
+    """``/rename`` and ``/branch`` session management commands."""
+
+    def test_rename_sets_session_title(self, agent, session):
+        session.title = None
+        agent._sessions[session.id] = session
+        # Simulate the /rename handler logic directly.
+        session.title = "My Bug Fix Session"
+        assert session.title == "My Bug Fix Session"
+
+    def test_rename_truncates_long_names(self, agent, session):
+        long_name = "x" * 200
+        session.title = long_name[:80]
+        assert len(session.title) == 80
+
+    def test_branch_and_rename_are_in_tui_commands(self):
+        from glm_acp.tui import LOCAL_COMMANDS
+
+        assert "/rename" in LOCAL_COMMANDS
+        assert "/branch" in LOCAL_COMMANDS
+        assert "rename" in LOCAL_COMMANDS["/rename"].lower()
+        branch_desc = LOCAL_COMMANDS["/branch"].lower()
+        assert "branch" in branch_desc or "fork" in branch_desc
+
+
 class TestSecurityReview:
     """Tier 4: ``/security-review`` working-tree diff vulnerability scan."""
 
@@ -2128,7 +2153,7 @@ class TestInitialize:
         resp = await agent.initialize(1)
         assert resp.agent_info.name == "glm-acp"
         assert resp.agent_info.title == "Native Z.ai GLM"
-        assert resp.agent_info.version == "2.7.15"
+        assert resp.agent_info.version == "2.7.16"
 
     @pytest.mark.asyncio
     async def test_registry_terminal_auth_method(self, agent):

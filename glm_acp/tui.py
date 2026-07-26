@@ -100,6 +100,8 @@ LOCAL_COMMANDS = {
     "/rewind": "Alias for /rollback — rewind conversation to a prior checkpoint",
     "/smart": "Expand a smart-prompt template with git context (/smart pr, review, commit, fix-ci)",
     "/sound": "Toggle notification sounds on/off for this session",
+    "/rename": "Rename the current session (/rename <name>)",
+    "/branch": "Fork the current session to try a different direction (/branch [name])",
     # Agent-side commands (implemented in the shared runtime; listed here so
     # they appear in the /-menu and the Ctrl+P command palette for discovery).
     "/status": "Show session, model, permissions, context, and live evidence",
