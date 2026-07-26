@@ -15,7 +15,16 @@ from acp.schema import AvailableCommand, PermissionOption
 from textual import events
 from textual._xterm_parser import XTermParser
 from textual.containers import VerticalScroll
-from textual.widgets import ContentSwitcher, Footer, Input, ListView, OptionList, Select, Static
+from textual.widgets import (
+    ContentSwitcher,
+    Footer,
+    Input,
+    ListView,
+    OptionList,
+    Select,
+    Static,
+    TabbedContent,
+)
 from textual.widgets._footer import FooterKey
 
 from glm_acp.cli import build_parser
@@ -48,6 +57,7 @@ class FakeAgent:
         self.config_calls = []
         self.mode_calls = []
         self.usage_calls = 0
+        self._session_number = 0
 
     def on_connect(self, conn) -> None:
         self.conn = conn
@@ -75,9 +85,16 @@ class FakeAgent:
             generation_profile="balanced",
             auxiliary_model="main",
             mixture_mode="off",
+            cwd=str(cwd),
         )
-        self._sessions["tui-session"] = session
-        return SimpleNamespace(session_id="tui-session")
+        self._session_number += 1
+        session_id = (
+            "tui-session"
+            if self._session_number == 1
+            else f"tui-session-{self._session_number}"
+        )
+        self._sessions[session_id] = session
+        return SimpleNamespace(session_id=session_id)
 
     async def set_config_option(self, config_id, session_id, value, **kwargs):
         self.config_calls.append((config_id, value))
@@ -2801,4 +2818,78 @@ async def test_tui_attach_rejects_non_image_file(tmp_path):
         await _wait_for_agent_ready(app, pilot)
         await app.action_attach(str(text_file))
         assert app._pending_images == []
+        app.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Parallel worktree sessions (Tier 3.2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tui_worktree_session_creates_tab_and_binds_new_cwd(tmp_path, monkeypatch):
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+    worktree = tmp_path / ".glm-acp-worktrees" / "feature-a"
+    worktree.mkdir(parents=True)
+    monkeypatch.setattr("glm_acp.tui.create_worktree_session", lambda *_args: worktree)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await app.action_new_worktree_session("feature-a")
+        await pilot.pause()
+        tabs = app.query_one("#session-tabs", TabbedContent)
+        assert len(list(tabs.query("TabPane"))) == 2
+        assert app._session_cwd() == str(worktree)
+        assert app._worktree_sessions[app.session_id]["name"] == "feature-a"
+        app.exit(0)
+
+
+def test_tui_worktree_session_status_dot_states(tmp_path):
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    app._worktree_sessions["one"] = {"cwd": str(tmp_path), "name": "one", "state": "idle"}
+    assert app._session_tab_title("one") == "● one"
+    app._worktree_sessions["one"]["state"] = "working"
+    assert app._session_tab_title("one") == "◐ one"
+    app._worktree_sessions["one"]["state"] = "awaiting"
+    assert app._session_tab_title("one") == "? one"
+    app._worktree_sessions["one"]["state"] = "error"
+    assert app._session_tab_title("one") == "! one"
+
+
+def test_tui_ctrl_t_binding_present_for_worktree_sessions():
+    binding = next(item for item in NativeGlmTui.BINDINGS if str(item.key) == "ctrl+t")
+    assert binding.action == "new_worktree_session"
+
+
+@pytest.mark.asyncio
+async def test_tui_sessions_new_command_routes_to_worktree_action(tmp_path):
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+    received: list[str] = []
+
+    async def fake_new_session(name=""):
+        received.append(name)
+
+    app.action_new_worktree_session = fake_new_session  # type: ignore[method-assign]
+    assert await app._handle_local_command("/sessions-new feature-a") is True
+    assert received == ["feature-a"]
+
+
+@pytest.mark.asyncio
+async def test_tui_worktree_tabs_switch_between_shared_sessions(tmp_path, monkeypatch):
+    agent = FakeAgent()
+    app = NativeGlmTui(_args(tmp_path), agent_factory=lambda: agent)
+    worktree = tmp_path / ".glm-acp-worktrees" / "feature-a"
+    worktree.mkdir(parents=True)
+    monkeypatch.setattr("glm_acp.tui.create_worktree_session", lambda *_args: worktree)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        first_session = app.session_id
+        await app.action_new_worktree_session("feature-a")
+        second_session = app.session_id
+        await app._activate_worktree_session(first_session)
+        assert app.session_id == first_session
+        assert app.session_id != second_session
+        assert app._session_cwd() == str(tmp_path)
         app.exit(0)

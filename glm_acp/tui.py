@@ -45,6 +45,8 @@ from textual.widgets import (
     RichLog,
     Select,
     Static,
+    TabbedContent,
+    TabPane,
 )
 from textual.widgets.option_list import Option
 from textual.worker import Worker
@@ -76,6 +78,7 @@ from .config import (
 from .glm_client import PlanUsage
 from .memory import list_learned_skills, read_memory, read_user_profile
 from .terminal_image import detect_graphics_protocol, path_link, render_inline
+from .worktree_session import WorktreeSessionError, create_worktree_session
 
 LOCAL_COMMANDS = {
     "/plan": "Switch between Coding Plan, Standard API, and BigModel (CN)",
@@ -116,6 +119,7 @@ LOCAL_COMMANDS = {
     "/image-render": "Render the last image inline (/image-render kitty|sixel|iterm2)",
     "/screenshot": "Capture a screenshot and queue it for the next prompt",
     "/attach": "Queue an image file for the next prompt (/attach <path>)",
+    "/sessions-new": "Create and switch to a parallel Git worktree session (/sessions-new <name>)",
     "/rename": "Rename the current session (/rename <name>)",
     "/branch": "Fork the current session to try a different direction (/branch [name])",
     # Agent-side commands (implemented in the shared runtime; listed here so
@@ -1932,6 +1936,44 @@ class GlmCommandProvider(Provider):
             yield DiscoveryHit(name, callback, help=help_text)
 
 
+class NewWorktreeSessionScreen(ModalScreen[str | None]):
+    """Ask for a short managed-worktree session name."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+    CSS = """
+    NewWorktreeSessionScreen { align: center middle; }
+    #new-worktree-dialog { width: 60; height: auto; padding: 1 2; border: round $accent; }
+    #new-worktree-name { margin: 1 0; }
+    #new-worktree-actions { height: auto; align: right middle; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="new-worktree-dialog"):
+            yield Label("New parallel worktree session", markup=False)
+            yield Static("Creates <repo>/.glm-acp-worktrees/<name> from HEAD.", markup=False)
+            yield Input(placeholder="feature-name", id="new-worktree-name")
+            with Horizontal(id="new-worktree-actions"):
+                yield Button("Create", id="create", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#new-worktree-name", Input).focus()
+
+    @on(Input.Submitted, "#new-worktree-name")
+    def submit_name(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    @on(Button.Pressed)
+    def press_button(self, event: Button.Pressed) -> None:
+        if event.button.id == "create":
+            self.dismiss(self.query_one("#new-worktree-name", Input).value.strip() or None)
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class NativeGlmTui(App[int]):
     """Full-screen coding-agent interface backed by one ``GlmAcpAgent``."""
 
@@ -2012,12 +2054,21 @@ class NativeGlmTui(App[int]):
             id="toggle_screen_reader",
         ),
         Binding("f9", "toggle_vim", "Vim mode", show=False, priority=True),
+        Binding(
+            "ctrl+t",
+            "new_worktree_session",
+            "New worktree session",
+            show=False,
+            priority=True,
+        ),
     ]
 
     CSS = """
     Screen { layout: vertical; background: #0b1017; }
     Header { background: #111a24; color: #d7e3f4; }
     #workspace { height: 1fr; }
+    #session-tabs { height: 4; margin: 0 1; }
+    #session-tabs TabPane { padding: 0 1; color: #aebdca; }
     #conversation { width: 1fr; }
     #working-tree-panel {
         width: 34; min-width: 24; border: round #4a9ee6; padding: 0 1;
@@ -2168,6 +2219,9 @@ class NativeGlmTui(App[int]):
         self._loop_timer: Timer | None = None
         self._loop_prompt: str = ""
         self._loop_interval_seconds: float = 0.0
+        # Maps ACP session IDs to their durable worktree/session metadata.
+        # The shared agent remains the source of truth for actual sessions.
+        self._worktree_sessions: dict[str, dict[str, str]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -2200,6 +2254,7 @@ class NativeGlmTui(App[int]):
                 yield Static("Starting…", id="session", markup=False)
                 yield RichLog(id="tools", wrap=True, markup=True, auto_scroll=True)
                 yield Static("No active plan", id="plan", markup=False)
+        yield TabbedContent(id="session-tabs")
         yield OptionList(id="command-menu", compact=True)
         yield Static(
             "↑↓ navigate  ·  Enter run/select  ·  Tab complete  ·  Esc close",
@@ -2295,6 +2350,11 @@ class NativeGlmTui(App[int]):
                 self.session_id = response.session_id
             await _configure(self.agent, self.session_id, self.args)
             self._agent_ready = True
+            await self._register_worktree_session(
+                self.session_id,
+                self._session_cwd(),
+                name=Path(self._session_cwd()).name or "main",
+            )
             self.query_one("#composer", Input).disabled = False
             self.query_one("#composer", Input).focus()
             self._refresh_session_panel("Ready")
@@ -2445,6 +2505,9 @@ class NativeGlmTui(App[int]):
             return True
         if text.startswith("/attach "):
             await self.action_attach(text.partition(" ")[2].strip())
+            return True
+        if text == "/sessions-new" or text.startswith("/sessions-new "):
+            await self.action_new_worktree_session(text.partition(" ")[2].strip())
             return True
         if text == "/context":
             await self.action_open_context()
@@ -3066,6 +3129,9 @@ class NativeGlmTui(App[int]):
         transcript.scroll_end(animate=False)
 
     def _refresh_session_panel(self, state: str, *, used: int = 0, size: int = 0) -> None:
+        if self.session_id in self._worktree_sessions:
+            tab_state = "working" if state.lower().startswith("running") else "idle"
+            self._set_worktree_session_state(tab_state)
         session = getattr(self.agent, "_sessions", {}).get(self.session_id)
         model = getattr(session, "model", self.args.model or "default")
         reasoning = getattr(session, "thought_level", "default")
@@ -3814,6 +3880,121 @@ class NativeGlmTui(App[int]):
             self.notify("Working tree panel closed", severity="information")
         else:
             await self._switch_wt_view(self._wt_view)
+
+    @staticmethod
+    def _session_tab_id(session_id: str) -> str:
+        """Return a Textual-safe, stable pane ID for an ACP session."""
+        return "worktree-session-" + re.sub(r"[^A-Za-z0-9_-]", "-", session_id)
+
+    def _session_tab_title(self, session_id: str) -> str:
+        info = self._worktree_sessions.get(session_id, {})
+        name = info.get("name", "session")
+        state = info.get("state", "idle")
+        dot = {"idle": "●", "working": "◐", "awaiting": "?", "error": "!"}.get(state, "●")
+        return f"{dot} {name}"
+
+    async def _register_worktree_session(self, session_id: str, cwd: str, *, name: str) -> None:
+        """Create or refresh the visual tab for a shared ACP session."""
+        self._worktree_sessions.setdefault(
+            session_id,
+            {"cwd": str(Path(cwd)), "name": name, "state": "idle"},
+        )
+        tabs = self.query_one("#session-tabs", TabbedContent)
+        pane_id = self._session_tab_id(session_id)
+        try:
+            tabs.get_pane(pane_id)
+        except Exception:
+            await tabs.add_pane(
+                TabPane(
+                    self._session_tab_title(session_id),
+                    Static(f"Workspace: {cwd}", markup=False),
+                    id=pane_id,
+                )
+            )
+        tabs.active = pane_id
+
+    async def _activate_worktree_session(self, session_id: str) -> None:
+        """Switch the visible shared-agent session when its tab is selected."""
+        if session_id == self.session_id:
+            return
+        if self._prompt_worker is not None:
+            self.notify(
+                "Finish or cancel the active turn before switching sessions", severity="warning"
+            )
+            return
+        info = self._worktree_sessions.get(session_id)
+        if info is None:
+            return
+        self.session_id = session_id
+        self.args.cwd = info["cwd"]
+        await self.action_clear_transcript()
+        self._agent_responses.clear()
+        self._current_agent = None
+        self._current_agent_text = ""
+        self._refresh_session_panel("Ready")
+        self.query_one("#composer", Input).focus()
+        self.notify(f"Switched to {info['name']}", severity="success")
+
+    def _set_worktree_session_state(self, state: str) -> None:
+        """Keep the active session's tab pane status in sync with TUI state."""
+        info = self._worktree_sessions.get(self.session_id)
+        if info is None:
+            return
+        info["state"] = state
+        try:
+            tabs = self.query_one("#session-tabs", TabbedContent)
+            pane_id = self._session_tab_id(self.session_id)
+            pane = tabs.get_pane(pane_id)
+            pane.query_one(Static).update(f"Workspace: {info['cwd']}  ·  Status: {state}")
+            for tab in tabs.query("ContentTab"):
+                if tab.id == f"--content-tab-{pane_id}":
+                    tab.label = self._session_tab_title(self.session_id)
+                    break
+        except Exception:
+            return
+
+    @on(TabbedContent.TabActivated, "#session-tabs")
+    async def session_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        pane_id = event.pane.id
+        if pane_id is None:
+            return
+        for session_id in self._worktree_sessions:
+            if self._session_tab_id(session_id) == pane_id:
+                await self._activate_worktree_session(session_id)
+                return
+
+    async def action_new_worktree_session(self, name: str = "") -> None:
+        """Create a managed Git worktree, then bind a fresh ACP session to it."""
+        requested = name.strip()
+        if not requested:
+            result = await self.push_screen_wait(NewWorktreeSessionScreen())
+            if not result:
+                return
+            requested = result
+        try:
+            path = await asyncio.to_thread(
+                create_worktree_session, "HEAD", requested, self._session_cwd()
+            )
+        except WorktreeSessionError as error:
+            self.notify(str(error), severity="warning")
+            return
+        try:
+            from .terminal_cli import _configure
+
+            response = await self.agent.new_session(
+                cwd=str(path), additional_directories=self.args.additional_dir
+            )
+            await _configure(self.agent, response.session_id, self.args)
+        except Exception as error:  # pragma: no cover - shared-agent defensive path
+            self.notify(f"Worktree created but session startup failed: {error}", severity="error")
+            return
+        await self._register_worktree_session(response.session_id, str(path), name=requested)
+        self.session_id = response.session_id
+        self.args.cwd = str(path)
+        await self.action_clear_transcript()
+        self._refresh_session_panel("Ready")
+        self.query_one("#composer", Input).focus()
+        self.notify(f"Worktree session ready: {requested}", severity="success")
 
     async def action_annotate(self) -> None:
         """Open the line-anchored diff annotator and prefill its follow-up."""
