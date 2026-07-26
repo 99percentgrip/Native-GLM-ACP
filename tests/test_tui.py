@@ -1563,6 +1563,77 @@ async def test_tui_statusline_command_opens_modal_and_persists(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_tui_keybinds_command_routes_to_modal_and_persists(tmp_path, monkeypatch):
+    """``/keybinds`` opens the picker and updates the live Textual keymap."""
+    from glm_acp.config import load_keybinds_config
+    from glm_acp.tui import KeybindsScreen
+
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+
+    async def fake_push(screen):
+        assert isinstance(screen, KeybindsScreen)
+        return {"toggle_thinking": "ctrl+alt+t"}
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        app.push_screen_wait = fake_push  # type: ignore[method-assign]
+        assert await app._handle_local_command("/keybinds") is True
+        assert load_keybinds_config() == {"toggle_thinking": "ctrl+alt+t"}
+        binding = app._bindings.get_bindings_for_key("ctrl+alt+t")[0]
+        assert binding.action == "toggle_thinking"
+        app.exit(0)
+
+
+@pytest.mark.asyncio
+async def test_tui_keybinds_unknown_action_is_rejected_with_warning(tmp_path, monkeypatch):
+    """Malformed/old config actions never become live bindings."""
+    from glm_acp.config import save_keybinds_config
+
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+    save_keybinds_config({"not_a_tui_action": "ctrl+alt+x"})
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        await pilot.pause(0.05)
+        transcript = app.query_one("#transcript", VerticalScroll)
+        rendered = "\n".join(str(child.render()) for child in transcript.children)
+        assert "Ignored unknown keybinding action(s): not_a_tui_action" in rendered
+        app.exit(0)
+
+
+def test_tui_keybinds_screen_reset_and_command_are_discoverable():
+    """The slash menu exposes the feature and Reset has a dedicated action."""
+    from glm_acp.tui import KEYBINDABLE_ACTION_IDS, LOCAL_COMMANDS
+
+    assert "/keybinds" in LOCAL_COMMANDS
+    assert {"toggle_thinking", "open_history", "copy_last_response"} <= KEYBINDABLE_ACTION_IDS
+
+
+@pytest.mark.asyncio
+async def test_tui_keybinds_reset_removes_persisted_mapping(tmp_path, monkeypatch):
+    """Reset-to-defaults removes the config and restores the primary key."""
+    from glm_acp.config import keybinds_path, save_keybinds_config
+
+    monkeypatch.setenv("GLM_ACP_CONFIG_DIR", str(tmp_path / "glm-acp"))
+    save_keybinds_config({"toggle_thinking": "ctrl+alt+t"})
+    app = NativeGlmTui(_args(tmp_path), agent_factory=FakeAgent)
+
+    async def fake_push(_screen):
+        return {}
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _wait_for_agent_ready(app, pilot)
+        assert app._bindings.get_bindings_for_key("ctrl+alt+t")[0].action == "toggle_thinking"
+        app.push_screen_wait = fake_push  # type: ignore[method-assign]
+        await app.action_open_keybinds()
+        assert not keybinds_path().exists()
+        assert app._bindings.get_bindings_for_key("f2")[0].action == "toggle_thinking"
+        app.exit(0)
+
+
+@pytest.mark.asyncio
 async def test_tui_context_command_routes_to_breakdown_screen(tmp_path):
     """Tier 2.2: ``/context`` opens the ContextBudgetScreen with a real
     per-segment breakdown of the live session."""

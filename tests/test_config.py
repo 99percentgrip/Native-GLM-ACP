@@ -187,6 +187,52 @@ class TestScreenReaderConfig:
         assert load_screen_reader_config() is False
 
 
+class TestKeybindsConfig:
+    """Tier 4: persistent TUI keybinding overrides."""
+
+    def test_default_is_empty_when_file_missing(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_keybinds_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        assert load_keybinds_config() == {}
+
+    def test_save_then_load_round_trip(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_keybinds_config, save_keybinds_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        chosen = {"toggle_thinking": "ctrl+alt+t", "open_history": "ctrl+h"}
+        assert save_keybinds_config(chosen) == chosen
+        assert load_keybinds_config() == chosen
+
+    def test_save_overrides_previous_mapping(self, monkeypatch, tmp_path):
+        from glm_acp.config import load_keybinds_config, save_keybinds_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        save_keybinds_config({"toggle_thinking": "f2"})
+        assert save_keybinds_config({"toggle_thinking": "ctrl+t"}) == {
+            "toggle_thinking": "ctrl+t"
+        }
+        assert load_keybinds_config() == {"toggle_thinking": "ctrl+t"}
+
+    def test_corrupt_file_falls_back_to_empty_mapping(self, monkeypatch, tmp_path):
+        from glm_acp.config import keybinds_path, load_keybinds_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        keybinds_path().parent.mkdir(parents=True, exist_ok=True)
+        keybinds_path().write_text("not json {{{", encoding="utf-8")
+        assert load_keybinds_config() == {}
+
+    def test_wrong_schema_falls_back_to_empty_mapping(self, monkeypatch, tmp_path):
+        from glm_acp.config import keybinds_path, load_keybinds_config
+
+        monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path))
+        keybinds_path().parent.mkdir(parents=True, exist_ok=True)
+        keybinds_path().write_text('["toggle_thinking", "f2"]', encoding="utf-8")
+        assert load_keybinds_config() == {}
+        keybinds_path().write_text('{"toggle_thinking": 2}', encoding="utf-8")
+        assert load_keybinds_config() == {}
+
+
 class TestModelRegistry:
     def test_all_models_have_context_window(self):
         for model_id in MODELS:

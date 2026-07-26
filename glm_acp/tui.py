@@ -59,9 +59,12 @@ from .config import (
     STATUSLINE_SEGMENTS,
     THOUGHT_LEVELS,
     VISION_MODELS,
+    keybinds_path,
+    load_keybinds_config,
     load_screen_reader_config,
     load_statusline_config,
     load_theme_config,
+    save_keybinds_config,
     save_screen_reader_config,
     save_statusline_config,
     save_theme_config,
@@ -103,6 +106,7 @@ LOCAL_COMMANDS = {
     "/smart": "Expand a smart-prompt template with git context (/smart pr, review, commit, fix-ci)",
     "/sound": "Toggle notification sounds on/off for this session",
     "/screen-reader": "Toggle screen-reader mode (plain text, no animations, F8)",
+    "/keybinds": "Customize TUI F-key and Ctrl-key bindings",
     "/rename": "Rename the current session (/rename <name>)",
     "/branch": "Fork the current session to try a different direction (/branch [name])",
     # Agent-side commands (implemented in the shared runtime; listed here so
@@ -146,6 +150,29 @@ LOCAL_COMMANDS = {
     "/image": "Queue an image for the next prompt",
     "/exit": "Close the terminal agent",
 }
+
+
+# These are the user-customizable application bindings. Stable action IDs on
+# ``NativeGlmTui.BINDINGS`` let Textual replace a default binding instead of
+# layering a second copy of the same action over it.
+KEYBINDABLE_ACTIONS: tuple[tuple[str, str, str], ...] = (
+    ("quit_agent", "Quit terminal agent", "ctrl+x"),
+    ("cancel_turn", "Cancel active turn", "ctrl+c"),
+    ("clear_transcript", "Clear transcript", "ctrl+l"),
+    ("show_help", "Show help", "f1"),
+    ("toggle_thinking", "Toggle reasoning panel", "f2"),
+    ("settings", "Open settings", "f3"),
+    ("toggle_working_tree", "Cycle working-tree panel", "f4"),
+    ("toggle_voice", "Toggle push-to-talk", "f5"),
+    ("open_history", "Open session history", "f6"),
+    ("toggle_native_mouse", "Toggle native mouse", "f7"),
+    ("toggle_screen_reader", "Toggle screen-reader mode", "f8"),
+    ("open_search", "Search conversation", "ctrl+f"),
+    ("copy_last_response", "Copy last response", "ctrl+y"),
+    ("copy_selection", "Copy current selection", "ctrl+shift+c"),
+)
+KEYBINDABLE_ACTION_IDS = frozenset(action for action, _label, _key in KEYBINDABLE_ACTIONS)
+DEFAULT_KEYBINDS = {action: key for action, _label, key in KEYBINDABLE_ACTIONS}
 
 # Smart prompt templates: one-click actions with auto-resolved git context.
 # Variables: {branch}, {diff}, {commit_log}, {cwd}.
@@ -1082,6 +1109,80 @@ class StatusLineScreen(ModalScreen[set[str] | None]):
         self.dismiss(None)
 
 
+class KeybindsScreen(ModalScreen[dict[str, str] | None]):
+    """Edit the persisted application keybinding overrides.
+
+    ``{}`` is the explicit Reset-to-defaults result. A non-empty result maps
+    stable Textual binding IDs to the requested key sequence.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    CSS = """
+    KeybindsScreen { align: center middle; background: $background 70%; }
+    #keybinds-dialog {
+        width: 88; max-width: 96%; height: 34; max-height: 92%;
+        border: thick $accent; background: $surface; padding: 1 2;
+    }
+    #keybinds-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    #keybinds-list { height: 1fr; }
+    .keybind-row { height: 3; }
+    .keybind-label { width: 1fr; padding-top: 1; }
+    .keybind-input { width: 24; }
+    #keybinds-buttons { height: 3; align-horizontal: right; margin-top: 1; }
+    #keybinds-buttons Button { margin-left: 1; }
+    #keybinds-hint { color: $text-muted; margin-top: 1; }
+    """
+
+    def __init__(self, overrides: dict[str, str]) -> None:
+        super().__init__()
+        self._overrides = {
+            action: keys
+            for action, keys in overrides.items()
+            if action in KEYBINDABLE_ACTION_IDS
+        }
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="keybinds-dialog"):
+            yield Label("Custom keybindings", id="keybinds-title")
+            with VerticalScroll(id="keybinds-list"):
+                for action, label, default_key in KEYBINDABLE_ACTIONS:
+                    with Horizontal(classes="keybind-row"):
+                        yield Label(label, classes="keybind-label")
+                        yield Input(
+                            self._overrides.get(action, default_key),
+                            id=f"keybind-{action}",
+                            classes="keybind-input",
+                        )
+            yield Label(
+                "Use Textual key names (for example f2, ctrl+shift+k, or ctrl+j,space).",
+                id="keybinds-hint",
+                markup=False,
+            )
+            with Horizontal(id="keybinds-buttons"):
+                yield Button("Reset defaults", id="keybinds-reset", variant="warning")
+                yield Button("Save", id="keybinds-save", variant="primary")
+                yield Button("Cancel", id="keybinds-cancel")
+
+    @on(Button.Pressed)
+    def button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "keybinds-reset":
+            self.dismiss({})
+            return
+        if event.button.id == "keybinds-save":
+            mapping = {
+                action: self.query_one(f"#keybind-{action}", Input).value.strip()
+                for action, _label, _default_key in KEYBINDABLE_ACTIONS
+            }
+            self.dismiss(mapping)
+            return
+        if event.button.id == "keybinds-cancel":
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ContextBudgetScreen(ModalScreen[None]):
     """Visualize the per-segment context-window breakdown.
 
@@ -1574,33 +1675,66 @@ class NativeGlmTui(App[int]):
     # background is too subtle on dark themes).
     selection_style = Style(color="#ffffff", bgcolor="#1e4a82", bold=True)
     BINDINGS = [
-        Binding("ctrl+x", "quit_agent", "Quit", priority=True),
+        Binding("ctrl+x", "quit_agent", "Quit", priority=True, id="quit_agent"),
         Binding("f10", "quit_agent", "Quit", show=False, priority=True),
         # Ctrl-Q is swallowed by XON/XOFF flow control in many POSIX terminals.
         # Keep it as a hidden compatibility alias for terminals that deliver it.
         Binding("ctrl+q", "quit_agent", "Quit", show=False, priority=True),
-        Binding("ctrl+c", "cancel_turn", "Cancel turn", priority=True),
-        Binding("ctrl+l", "clear_transcript", "Clear view", priority=True),
-        Binding("f1", "show_help", "Help", priority=True),
-        Binding("f2", "toggle_thinking", "Reasoning view", priority=True),
-        Binding("f3", "settings", "Settings", priority=True),
-        Binding("f4", "toggle_working_tree", "Working tree", priority=True),
-        Binding("f5", "toggle_voice", "Push to talk", priority=True),
-        Binding("f6", "open_history", "History", priority=True),
-        Binding("ctrl+f", "open_search", "Search", priority=True),
-        Binding("ctrl+y", "copy_last_response", "Copy response", priority=True),
-        Binding("ctrl+shift+c", "copy_selection", "Copy selection", show=False, priority=True),
+        Binding("ctrl+c", "cancel_turn", "Cancel turn", priority=True, id="cancel_turn"),
+        Binding("ctrl+l", "clear_transcript", "Clear view", priority=True, id="clear_transcript"),
+        Binding("f1", "show_help", "Help", priority=True, id="show_help"),
+        Binding("f2", "toggle_thinking", "Reasoning view", priority=True, id="toggle_thinking"),
+        Binding("f3", "settings", "Settings", priority=True, id="settings"),
+        Binding(
+            "f4",
+            "toggle_working_tree",
+            "Working tree",
+            priority=True,
+            id="toggle_working_tree",
+        ),
+        Binding("f5", "toggle_voice", "Push to talk", priority=True, id="toggle_voice"),
+        Binding("f6", "open_history", "History", priority=True, id="open_history"),
+        Binding("ctrl+f", "open_search", "Search", priority=True, id="open_search"),
+        Binding(
+            "ctrl+y",
+            "copy_last_response",
+            "Copy response",
+            priority=True,
+            id="copy_last_response",
+        ),
+        Binding(
+            "ctrl+shift+c",
+            "copy_selection",
+            "Copy selection",
+            show=False,
+            priority=True,
+            id="copy_selection",
+        ),
         # Native mouse mode toggle. When ON, Textual releases mouse capture
         # back to the terminal emulator so the user's native right-click
         # context menu and click-drag selection work (Codex/Claude-Code
         # approach). When OFF (default), Textual handles all mouse events.
-        Binding("f7", "toggle_native_mouse", "Native mouse", show=False, priority=True),
+        Binding(
+            "f7",
+            "toggle_native_mouse",
+            "Native mouse",
+            show=False,
+            priority=True,
+            id="toggle_native_mouse",
+        ),
         # Screen-reader mode toggle. When ON, agent messages render as plain
         # text instead of Rich Markdown (avoiding ANSI/styling sequences that
         # trip up screen readers), the activity status line stops animating,
         # and the preference persists across sessions. Toggle via F8 or
         # ``/screen-reader``; force on at startup via GLM_ACP_SCREEN_READER=1.
-        Binding("f8", "toggle_screen_reader", "Screen reader", show=False, priority=True),
+        Binding(
+            "f8",
+            "toggle_screen_reader",
+            "Screen reader",
+            show=False,
+            priority=True,
+            id="toggle_screen_reader",
+        ),
     ]
 
     CSS = """
@@ -1676,6 +1810,10 @@ class NativeGlmTui(App[int]):
         agent_factory: Callable[[], GlmAcpAgent] = GlmAcpAgent,
     ) -> None:
         super().__init__()
+        # Textual builds the application binding map during ``App.__init__``.
+        # Keep an untouched copy so Reset defaults can take effect immediately
+        # without waiting for the next process launch.
+        self._default_keybindings = self._bindings.copy()
         self.args = args
         self.agent = agent_factory()
         self.client = TuiClient(self)
@@ -1699,6 +1837,7 @@ class NativeGlmTui(App[int]):
         self._thinking_text = ""
         self._pending_images = list(args.image)
         self._slash_commands = dict(LOCAL_COMMANDS)
+        self._keybind_overrides = load_keybinds_config()
         self._command_values: list[str] = []
         self._provider_usage: PlanUsage | None = None
         self._provider_usage_error = ""
@@ -1804,6 +1943,7 @@ class NativeGlmTui(App[int]):
         self.query_one("#tools").border_title = "Activity"
         self.query_one("#command-menu").border_title = "Commands"
         self.query_one("#tools", RichLog).write("[dim]Waiting for tool activity…[/dim]")
+        self._apply_keybind_overrides(self._keybind_overrides)
         # Apply persisted theme (if any) now that the App is running.
         if self._saved_theme and self._saved_theme in self.available_themes:
             try:
@@ -2008,6 +2148,9 @@ class NativeGlmTui(App[int]):
             return True
         if text == "/statusline":
             await self.action_open_statusline()
+            return True
+        if text == "/keybinds":
+            await self.action_open_keybinds()
             return True
         if text == "/context":
             await self.action_open_context()
@@ -3008,6 +3151,62 @@ class NativeGlmTui(App[int]):
             title="Statusline updated",
             severity="success",
         )
+
+    def _apply_keybind_overrides(self, overrides: dict[str, str]) -> None:
+        """Overlay persisted keybinding overrides on the default Textual map.
+
+        Textual's documented keymap API replaces bindings by their stable
+        binding IDs. It avoids the duplicate-old-key behavior of repeatedly
+        calling the lower-level runtime ``bind`` helper.
+        """
+        valid: dict[str, str] = {}
+        unknown: list[str] = []
+        for action, keys in overrides.items():
+            if action not in KEYBINDABLE_ACTION_IDS:
+                unknown.append(action)
+            else:
+                valid[action] = keys
+        # Rebuild from the original map on every save/reset, then apply the
+        # requested overlay. This makes Reset defaults immediate.
+        self._bindings = self._default_keybindings.copy()
+        try:
+            self._bindings.apply_keymap(valid)
+        except Exception as error:  # noqa: BLE001 - malformed user config
+            self._bindings = self._default_keybindings.copy()
+            self.call_later(
+                self._append_system,
+                f"Keybinding overrides ignored: {error}",
+            )
+            self.notify("Invalid keybinding override — using defaults", severity="warning")
+            return
+        if unknown:
+            names = ", ".join(sorted(unknown))
+            message = f"Ignored unknown keybinding action(s): {names}"
+            self.call_later(self._append_system, message)
+            self.notify(message, severity="warning")
+
+    async def action_open_keybinds(self) -> None:
+        """``/keybinds``: edit persistent F-key and chord binding overrides."""
+        result = await self.push_screen_wait(KeybindsScreen(self._keybind_overrides))
+        if result is None:
+            return
+        if not result:
+            try:
+                keybinds_path().unlink(missing_ok=True)
+            except OSError as error:
+                self.notify(f"Could not reset keybindings: {error}", severity="warning")
+                return
+            self._keybind_overrides = {}
+            self._apply_keybind_overrides({})
+            self.notify("Keybindings reset to defaults", severity="success")
+            return
+        try:
+            self._keybind_overrides = save_keybinds_config(result)
+        except OSError as error:
+            self.notify(f"Could not save keybindings: {error}", severity="warning")
+            return
+        self._apply_keybind_overrides(self._keybind_overrides)
+        self.notify("Keybindings updated", severity="success")
 
     async def action_open_context(self) -> None:
         """``/context``: visualize context-window usage by message-role segment."""

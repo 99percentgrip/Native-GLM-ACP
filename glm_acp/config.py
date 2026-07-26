@@ -215,6 +215,63 @@ def screen_reader_path() -> Path:
     return config_dir() / "screen-reader.json"
 
 
+def keybinds_path() -> Path:
+    """Return the path to the persistent TUI keybinding overrides."""
+    return config_dir() / "keybinds.json"
+
+
+def load_keybinds_config() -> dict[str, str]:
+    """Return persisted TUI keybinding overrides, or an empty mapping.
+
+    The mapping is deliberately framework-agnostic: action names and key
+    sequences are validated by the TUI when it applies them. A missing,
+    malformed, or wrong-schema file is best-effort and simply means no
+    overrides.
+    """
+    try:
+        payload = json.loads(keybinds_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    if not all(
+        isinstance(action, str)
+        and bool(action.strip())
+        and isinstance(keys, str)
+        and bool(keys.strip())
+        for action, keys in payload.items()
+    ):
+        return {}
+    return {action.strip(): keys.strip() for action, keys in payload.items()}
+
+
+def save_keybinds_config(mapping: dict[str, str]) -> dict[str, str]:
+    """Atomically persist TUI keybinding overrides and return the cleaned map."""
+    cleaned = {
+        str(action).strip(): str(keys).strip()
+        for action, keys in mapping.items()
+        if isinstance(action, str)
+        and action.strip()
+        and isinstance(keys, str)
+        and keys.strip()
+    }
+    path = keybinds_path()
+    _secure_dir(path.parent)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(cleaned, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _secure_file(temporary)
+        os.replace(temporary, path)
+        _secure_file(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return cleaned
+
+
 def load_screen_reader_config() -> bool:
     """Return whether the TUI should start in screen-reader (plain-text) mode.
 
