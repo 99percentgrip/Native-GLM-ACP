@@ -107,7 +107,13 @@ from .failure_corpus import FailureCorpus
 from .glm_client import GlmClient, PlanQuota, PlanUsage
 from .guardrails import ToolLoopGuard
 from .hooks import LifecycleHooks
-from .mcp import MCP_TOOL_DEFINITIONS, McpError, McpManager
+from .jit_tools import (
+    SEARCH_TOOLS_DEFINITION,
+    SEARCH_TOOLS_NAME,
+    DeferredToolRegistry,
+    ToolSearchError,
+)
+from .mcp import DEFAULT_SERVERS, MCP_TOOL_DEFINITIONS, McpError, McpManager
 from .memory import (
     list_learned_skills,
     project_knowledge,
@@ -412,6 +418,8 @@ class Session:
         self.goal_turns = 0
         self.mixture_mode = "off"
         self.scheduled_run = False
+        # Ordered model-facing schemas loaded through the JIT gateway.
+        self.loaded_tool_names: list[str] = []
         # Per-session tool-call iteration cap. The user can change this live
         # via the ``/max-iterations [N]`` slash command (routed through
         # ``set_config_option("max_tool_iterations", N)``). Defaults to the
@@ -587,6 +595,7 @@ class Session:
             "goal_paused": self.goal_paused,
             "goal_turns": self.goal_turns,
             "mixture_mode": self.mixture_mode,
+            "loaded_tool_names": self.loaded_tool_names,
             "last_checkpoint_id": self.last_checkpoint_id,
         }
 
@@ -648,6 +657,11 @@ class Session:
         session.goal_paused = bool(data.get("goal_paused", False))
         session.goal_turns = int(data.get("goal_turns", 0))
         session.mixture_mode = str(data.get("mixture_mode", "off"))
+        session.loaded_tool_names = [
+            str(value)
+            for value in data.get("loaded_tool_names", [])
+            if isinstance(value, str) and value != SEARCH_TOOLS_NAME
+        ][:100]
         session.last_checkpoint_id = str(data.get("last_checkpoint_id", ""))
         messages = data.get("messages")
         if messages:
@@ -666,6 +680,12 @@ class GlmAcpAgent(acp.Agent):
         self._store = SessionStore()
         self._tool_io_semaphore = asyncio.Semaphore(4)
         self._mcp = McpManager()
+        self._tool_registry = DeferredToolRegistry(
+            [*TOOL_DEFINITIONS, *MCP_TOOL_DEFINITIONS]
+        )
+        self._deferred_mcp_servers: set[str] = set()
+        self._deferred_mcp_lock = asyncio.Lock()
+        self._deferred_mcp_task: asyncio.Task[None] | None = None
         self._diagnostics = DiagnosticsManager()
         self._hooks = LifecycleHooks()
         self._telemetry = TrajectoryRecorder()
@@ -1799,6 +1819,10 @@ class GlmAcpAgent(acp.Agent):
 
     async def aclose(self) -> None:
         """Close pooled HTTP clients without deleting persisted sessions."""
+        if self._deferred_mcp_task is not None:
+            self._deferred_mcp_task.cancel()
+            await asyncio.gather(self._deferred_mcp_task, return_exceptions=True)
+            self._deferred_mcp_task = None
         if self._cron_task is not None:
             if self._cron_stop is not None:
                 self._cron_stop.set()
@@ -1822,6 +1846,16 @@ class GlmAcpAgent(acp.Agent):
         client_info: Any = None,
         **kwargs: Any,
     ) -> InitializeResponse:
+        if self._deferred_mcp_task is None and any(
+            name not in DEFAULT_SERVERS for name in self._mcp.servers
+        ):
+            # Populate custom MCP descriptors in the background so ACP/TUI boot
+            # remains responsive. The gateway waits on the same lock if the
+            # model searches before discovery completes.
+            self._deferred_mcp_task = asyncio.create_task(
+                self._refresh_deferred_mcp_tools(),
+                name="glm-acp-jit-mcp-discovery",
+            )
         if self._cron_task is None and os.environ.get("GLM_ACP_CRON_DISABLE") != "1":
             from .cron_scheduler import CallbackDelivery, daemon
 
@@ -2536,6 +2570,41 @@ class GlmAcpAgent(acp.Agent):
             )
         return None
 
+    async def _refresh_deferred_mcp_tools(self) -> None:
+        """Discover not-yet-indexed custom MCP servers through the JIT gateway."""
+        async with self._deferred_mcp_lock:
+            pending = [
+                name
+                for name in self._mcp.servers
+                if name not in DEFAULT_SERVERS and name not in self._deferred_mcp_servers
+            ]
+            if not pending:
+                return
+            results = await asyncio.gather(
+                *(self._mcp.list_tools(name) for name in pending),
+                return_exceptions=True,
+            )
+            for server, result in zip(pending, results):
+                if isinstance(result, BaseException):
+                    logger.warning("Deferred MCP discovery failed for %s: %s", server, result)
+                    continue
+                self._tool_registry.register_mcp_tools(server, result)
+                self._deferred_mcp_servers.add(server)
+
+    async def _prime_deferred_mcp_tools(self) -> None:
+        """Give background MCP discovery a bounded chance to finish."""
+        if self._deferred_mcp_task is None or self._deferred_mcp_task.done():
+            self._deferred_mcp_task = asyncio.create_task(
+                self._refresh_deferred_mcp_tools(),
+                name="glm-acp-jit-mcp-discovery",
+            )
+        try:
+            await asyncio.wait_for(asyncio.shield(self._deferred_mcp_task), timeout=0.025)
+        except asyncio.TimeoutError:
+            # Registry matching itself stays local and sub-50ms. A slow MCP
+            # server continues discovery in the background for the next search.
+            pass
+
     @staticmethod
     def _guard_tool_output(tool_name: str, output: str) -> str:
         """Keep external/file/recalled content visibly outside agent authority."""
@@ -2774,7 +2843,7 @@ class GlmAcpAgent(acp.Agent):
         all_tools = TOOL_DEFINITIONS + MCP_TOOL_DEFINITIONS
         if session.scheduled_run:
             all_tools = [tool for tool in all_tools if tool["function"]["name"] != "cronjob"]
-        tools = (
+        eligible_tools = (
             all_tools
             if session.mode == "code"
             else [
@@ -2799,6 +2868,25 @@ class GlmAcpAgent(acp.Agent):
                     "update_deliberation",
                 )
             ]
+        )
+        allowed_tool_names = {
+            tool["function"]["name"] for tool in eligible_tools
+        } | {
+            name
+            for name in self._tool_registry.names()
+            if (
+                (record := self._tool_registry.get(name)) is not None
+                and record.source == "mcp"
+                and session.mode == "code"
+            )
+        }
+        # Keep the gateway first and append newly selected schemas after the
+        # stable conversation prefix/provider payload fields.
+        tools = [copy.deepcopy(SEARCH_TOOLS_DEFINITION)]
+        tools.extend(
+            self._tool_registry.schemas_for(
+                session.loaded_tool_names, allowed_names=allowed_tool_names
+            )
         )
         await self._prepare_diagnostic_hypotheses(session)
 
@@ -2858,7 +2946,9 @@ class GlmAcpAgent(acp.Agent):
                 tools=tools,
                 on_reasoning=lambda chunk: self._send_thought(session.id, chunk),
                 on_content=lambda chunk: self._send_message(session.id, chunk),
-                on_tool_call_started=lambda tc_id, name: self._start_tool(session.id, tc_id, name),
+                on_tool_call_started=lambda tc_id, name: self._start_visible_tool(
+                    session.id, tc_id, name
+                ),
             )
 
             # --- Update token estimates and notify Zed ---
@@ -3268,6 +3358,98 @@ class GlmAcpAgent(acp.Agent):
             for tc in result.tool_calls:
                 tool_name = tc["function"]["name"]
                 tool_args = tc["function"]["arguments"]
+                if tool_name == SEARCH_TOOLS_NAME:
+                    await self._prime_deferred_mcp_tools()
+                    search_started = time.monotonic()
+                    if not isinstance(tool_args, dict) or "_raw" in tool_args:
+                        output = "Error: Tool search requires a valid JSON object."
+                        self._telemetry.record(
+                            "jit_tool_search",
+                            session.id,
+                            mode="invalid",
+                            success=False,
+                            duration_ms=0,
+                            matches=0,
+                            newly_loaded=0,
+                            loaded_total=len(session.loaded_tool_names),
+                            registry_tools=len(self._tool_registry.names()),
+                        )
+                        session.messages.append(
+                            {"role": "tool", "tool_call_id": tc["id"], "content": output}
+                        )
+                        continue
+                    allowed_tool_names = {
+                        tool["function"]["name"] for tool in eligible_tools
+                    } | {
+                        name
+                        for name in self._tool_registry.names()
+                        if (
+                            (record := self._tool_registry.get(name)) is not None
+                            and record.source == "mcp"
+                            and session.mode == "code"
+                        )
+                    }
+                    mode = str(tool_args.get("mode", "bm25")).strip().lower() or "bm25"
+                    try:
+                        matches = self._tool_registry.search(
+                            str(tool_args.get("intent", "")),
+                            mode=mode,
+                            allowed_names=allowed_tool_names,
+                        )
+                    except ToolSearchError as error:
+                        duration_ms = int((time.monotonic() - search_started) * 1000)
+                        self._telemetry.record(
+                            "jit_tool_search",
+                            session.id,
+                            mode=mode if mode in {"bm25", "regex"} else "invalid",
+                            success=False,
+                            duration_ms=duration_ms,
+                            matches=0,
+                            newly_loaded=0,
+                            loaded_total=len(session.loaded_tool_names),
+                            registry_tools=len(allowed_tool_names),
+                        )
+                        session.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": f"Error: {error}",
+                            }
+                        )
+                        continue
+                    newly_loaded = [
+                        match.name
+                        for match in matches
+                        if match.name not in session.loaded_tool_names
+                    ]
+                    session.loaded_tool_names.extend(newly_loaded)
+                    tools = [
+                        *tools,
+                        *self._tool_registry.schemas_for(
+                            newly_loaded, allowed_names=allowed_tool_names
+                        ),
+                    ]
+                    self._telemetry.record(
+                        "jit_tool_search",
+                        session.id,
+                        mode=mode,
+                        success=True,
+                        duration_ms=int((time.monotonic() - search_started) * 1000),
+                        matches=len(matches),
+                        newly_loaded=len(newly_loaded),
+                        loaded_total=len(session.loaded_tool_names),
+                        registry_tools=len(allowed_tool_names),
+                    )
+                    names = [match.name for match in matches]
+                    output = (
+                        "Tools loaded successfully: " + ", ".join(names)
+                        if names
+                        else "No matching tools found. Refine the intent with capability keywords."
+                    )
+                    session.messages.append(
+                        {"role": "tool", "tool_call_id": tc["id"], "content": output}
+                    )
+                    continue
                 recommendation = session.deliberation.recommendation
                 if (
                     not voi_selection_recorded
@@ -3501,7 +3683,17 @@ class GlmAcpAgent(acp.Agent):
                 tool_result: ToolResult | None = None
                 tool_started = time.monotonic()
                 try:
-                    if tool_name == "delegate_task":
+                    deferred_tool = self._tool_registry.get(tool_name)
+                    if deferred_tool is not None and deferred_tool.source == "mcp":
+                        value = await self._mcp.call(
+                            str(deferred_tool.server),
+                            str(deferred_tool.remote_name),
+                            tool_args,
+                        )
+                        tool_result = ToolResult(
+                            output=json.dumps(value, ensure_ascii=False)[:MAX_TOOL_OUTPUT_CHARS]
+                        )
+                    elif tool_name == "delegate_task":
                         if tool_args.get("background"):
                             status = self._spawn_background_worker(session, tool_args)
                             tool_result = ToolResult(output=status)
@@ -4597,6 +4789,12 @@ class GlmAcpAgent(acp.Agent):
             )
             or (tool_name == "failure_corpus" and str(tool_args.get("action", "")) == "list")
         )
+        deferred_tool = self._tool_registry.get(tool_name)
+        if (
+            deferred_tool is not None
+            and deferred_tool.source == "mcp"
+        ):
+            destructive = True
         raw_paths = self._tool_paths(tool_name, tool_args)
         resolved_paths: list[str] = []
         for raw in raw_paths:
@@ -5862,6 +6060,8 @@ class GlmAcpAgent(acp.Agent):
                 f"- **Latest checkpoint:** {session.last_checkpoint_id or 'none'}\n"
                 f"- **Verified plugins:** "
                 f"{sum(bool(item.get('verified')) for item in PluginRegistry().list())}\n"
+                f"- **JIT tools:** active · {len(session.loaded_tool_names)} loaded / "
+                f"{len(self._tool_registry.names())} deferred\n"
                 f"- **Project root:** {facts.root}\n"
                 f"- **Detected verification:** "
                 f"{'; '.join(facts.verify_commands) or 'none'}\n"
@@ -6638,6 +6838,13 @@ class GlmAcpAgent(acp.Agent):
         )
         await self._conn.session_update(session_id=session_id, update=chunk)
 
+    async def _start_visible_tool(
+        self, session_id: str, tool_call_id: str, name: str
+    ) -> None:
+        """Keep the internal JIT gateway out of the user-facing tool timeline."""
+        if name != SEARCH_TOOLS_NAME:
+            await self._start_tool(session_id, tool_call_id, name)
+
     async def _start_tool_with_location(
         self, session_id: str, tool_call_id: str, name: str, args: dict[str, Any]
     ) -> None:
@@ -6841,6 +7048,7 @@ class GlmAcpAgent(acp.Agent):
             "browser_ui": "Testing browser UI",
             "mcp_list_tools": "Listing MCP tools",
             "mcp_call": "Calling MCP tool",
+            SEARCH_TOOLS_NAME: "Loading tools",
             "update_plan": "Updating plan",
             "update_awareness": "Updating evidence and uncertainty",
             "update_deliberation": "Testing diagnostic hypotheses",

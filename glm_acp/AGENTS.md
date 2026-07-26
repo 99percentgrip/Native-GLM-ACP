@@ -18,6 +18,7 @@ streaming, 1M context, and auto-continuation for long generations.
 - **ACP protocol**: `agent.py` — implements `acp.Agent` (initialize, new_session, load_session, resume_session, close_session, list_sessions, prompt, set_config_option, set_session_mode)
 - **GLM API client**: `glm_client.py` — SSE/tool streaming, preserved thinking, cancellation, retry, cache usage, auto-continuation
 - **MCP**: `mcp.py` — official Z.ai remote/local services and configured HTTP/stdio servers
+- **Deferred tool loading**: `jit_tools.py` — the `search_tools` gateway, argument-aware BM25/safe-regex ranking, ordered schema injection, and MCP route metadata
 - **Project knowledge and learning**: `memory.py` — scoped memory, relevant skills/bundles, telemetry, curation, and evaluated candidates
 - **Project discovery**: `project_context.py` — repository roots, progressive instruction files, manifests, package managers, git state, and canonical verification commands
 - **Verification evidence**: `verification.py` — persistent edit generations and bounded canonical command outcomes
@@ -448,6 +449,24 @@ Concurrent MCP discovery initializes each server once. HTTP 404/410 session
 expiry performs one clean reinitialize-and-retry, while dead or timed-out stdio
 processes discard stale protocol state before restart.
 
+Model-facing tools are deferred by default. Each session starts with only
+`search_tools`; its local BM25 and safe case-insensitive Python-style regex modes
+search names, descriptions, argument names, and argument descriptions, then return
+at most five eligible schemas. BM25 accepts at most 500 natural-language characters;
+regex accepts at most 200 characters and rejects malformed or common catastrophic
+backtracking constructs because Python's standard regex engine has no portable
+timeout. Newly selected definitions append after the stable provider message
+prefix. Native schemas are indexed in memory at agent construction. Configured
+custom MCP schemas are discovered in the background at initialization; a slow
+server never holds gateway search beyond 25 ms and remains eligible on a later
+search after discovery completes. MCP names and object `inputSchema` values are
+preserved, collisions receive a deterministic `mcp__<server>__<tool>` model name,
+and execution maps back to the exact server/name. All discovered MCP execution
+uses the normal destructive MCP permission gate; MCP annotations are metadata,
+not authority. `jit_tool_search` telemetry excludes queries, schemas, arguments,
+and results; `/observability` reports aggregate mode/count/latency/load metrics and
+`/status` reports active, loaded, and deferred counts.
+
 `.hermes.md`, `HERMES.md`, `AGENTS.md`, `CLAUDE.md`, `GLM.md`, `.cursorrules`,
 and `.cursor/rules/*.mdc` files are discovered progressively from the
 project root toward accessed paths. When a direct mutation first reveals a
@@ -510,7 +529,9 @@ from close.
 Forks persist `parent_session_id` plus `branch_root_id`; `/lineage` exposes direct
 children and identifies the parent session as the rollback path.
 Instruction targets, verification ledger, epistemic ledger, metacognitive assessment,
-grounded-deliberation conclusions, persistent goal/subgoals, judge budget, and Mixture-of-Agents selection are serialized with the session; read
+grounded-deliberation conclusions, persistent goal/subgoals, judge budget,
+Mixture-of-Agents selection, and ordered JIT-loaded tool names are serialized
+with the session; read
 fingerprints, active checkpoint state, and reference-response caches remain runtime-only.
 
 **Critical:** The ACP `LoadSessionResponse` and `ResumeSessionResponse` only

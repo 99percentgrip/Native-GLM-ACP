@@ -62,6 +62,7 @@ def observability_snapshot(
     events = _events(path or trajectory_path(), min(max(1, max_events), MAX_OBSERVABILITY_EVENTS))
     tools = [event for event in events if event.get("event") == "tool_call"]
     llm = [event for event in events if event.get("event") == "llm_call"]
+    jit_searches = [event for event in events if event.get("event") == "jit_tool_search"]
     turns = [event for event in events if event.get("event") == "turn_complete"]
     certificates = [event for event in events if event.get("event") == "completion_certificate"]
     capability = [event for event in events if event.get("event") == "capability_outcome"]
@@ -80,6 +81,7 @@ def observability_snapshot(
     meta_candidates = [event for event in events if event.get("event") == "metacognitive_candidate"]
     durations = [_safe_int(event.get("duration_ms")) for event in tools]
     llm_durations = [_safe_int(event.get("duration_ms")) for event in llm]
+    jit_durations = [_safe_int(event.get("duration_ms")) for event in jit_searches]
     tool_counts = Counter(str(event.get("tool", "unknown")) for event in tools)
     tool_failures = Counter(
         str(event.get("tool", "unknown")) for event in tools if not event.get("success", False)
@@ -191,6 +193,23 @@ def observability_snapshot(
             "latency_ms_p50": int(statistics.median(llm_durations)) if llm_durations else 0,
             "latency_ms_p95": _percentile(llm_durations, 0.95),
         },
+        "jit_tool_loading": {
+            "searches": len(jit_searches),
+            "failures": sum(not bool(event.get("success")) for event in jit_searches),
+            "matches": sum(_safe_int(event.get("matches")) for event in jit_searches),
+            "newly_loaded": sum(
+                _safe_int(event.get("newly_loaded")) for event in jit_searches
+            ),
+            "max_loaded": max(
+                (_safe_int(event.get("loaded_total")) for event in jit_searches),
+                default=0,
+            ),
+            "latency_ms_p50": int(statistics.median(jit_durations)) if jit_durations else 0,
+            "latency_ms_p95": _percentile(jit_durations, 0.95),
+            "by_mode": dict(
+                Counter(str(event.get("mode", "unknown")) for event in jit_searches).most_common(3)
+            ),
+        },
         "tools": {
             "calls": len(tools),
             "failures": sum(tool_failures.values()),
@@ -221,6 +240,7 @@ def observability_snapshot(
 def render_observability(snapshot: dict[str, Any]) -> str:
     tools = snapshot["tools"]
     llm = snapshot["llm"]
+    jit = snapshot["jit_tool_loading"]
     turns = snapshot["turns"]
     safety = snapshot["safety"]
     awareness = snapshot["awareness"]
@@ -246,6 +266,9 @@ def render_observability(snapshot: dict[str, Any]) -> str:
         f"p95 {llm['latency_ms_p95']} ms\n"
         f"- Tools: {tools['calls']} calls · {tools['success_rate']:.1%} success · "
         f"p95 {tools['latency_ms_p95']} ms\n"
+        f"- JIT tools: active · {jit['searches']} searches · "
+        f"{jit['newly_loaded']} schemas loaded · p95 {jit['latency_ms_p95']} ms · "
+        f"modes {json.dumps(jit['by_mode'], sort_keys=True)}\n"
         f"- Safety: {safety['rollbacks']} rollbacks ({safety['rollback_conflicts']} conflicts) · "
         f"{safety['worker_promotions']} worker promotions\n\n"
         f"- Awareness: {awareness['complete']}/{awareness['certificates']} certificates complete · "
